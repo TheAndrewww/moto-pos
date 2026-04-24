@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react';
 import { useAuthStore } from './store/authStore';
 import Login from './pages/Login';
 import Dashboard from './pages/Dashboard';
+import UpdateChecker from './lib/UpdateChecker';
 
 export default function App() {
   const { usuario } = useAuthStore();
@@ -30,11 +31,21 @@ export default function App() {
     );
   }
 
-  // Si no hay usuario autenticado → Login
+  // Si no hay usuario autenticado → Login (con checker arriba para no bloquear)
   if (!usuario) {
-    return <Login />;
+    return (
+      <>
+        <UpdateChecker />
+        <Login />
+      </>
+    );
   }
 
   // Si hay usuario → Dashboard principal
-  return <Dashboard />;
+  return (
+    <>
+      <UpdateChecker />
+      <Dashboard />
+    </>
+  );
 }

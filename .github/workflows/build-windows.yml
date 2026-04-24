@@ -1,14 +1,19 @@
-name: Build Windows x64
+name: Build & Release Windows
 
 on:
   push:
     branches: [main]
-  workflow_dispatch: # Permite ejecutar manualmente desde GitHub
+    tags:
+      - 'v*'           # Cualquier tag tipo v0.1.1, v1.0.0 → crea release
+  workflow_dispatch:
 
 jobs:
   build-windows:
     runs-on: windows-latest
-    
+
+    permissions:
+      contents: write   # necesario para que tauri-action cree el GitHub Release
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -23,23 +28,49 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
       - name: Install frontend dependencies
         run: npm ci
 
-      - name: Build Tauri app
+      - name: Build & sign Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Llaves de firma del updater — DEBEN existir como secrets del repo:
+          #   TAURI_SIGNING_PRIVATE_KEY            (contenido de ~/.tauri/moto-pos-updater.key)
+          #   TAURI_SIGNING_PRIVATE_KEY_PASSWORD   (la pass que se imprimió al generar)
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tauriScript: npx tauri
+          # Si el evento es un tag vX.Y.Z → crea release con ese nombre.
+          # En push a main (sin tag) solo compila como artifact, sin publicar.
+          tagName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+          releaseName: ${{ startsWith(github.ref, 'refs/tags/') && format('Moto POS {0}', github.ref_name) || '' }}
+          releaseBody: |
+            Instalador y archivos de actualización automática.
 
-      - name: Upload MSI installer
+            Los POS instalados se actualizarán solos al detectar esta versión.
+          releaseDraft: false
+          prerelease: false
+          # IMPORTANTE: incluye los archivos del updater (latest.json, .sig)
+          includeUpdaterJson: true
+
+      # Solo cuando NO es un tag (push a main): subir installers como artifact
+      # para descargar e instalar manualmente la primera vez.
+      - name: Upload MSI installer (artifact)
+        if: "!startsWith(github.ref, 'refs/tags/')"
         uses: actions/upload-artifact@v4
         with:
-          name: moto-pos-windows-x64
+          name: moto-pos-windows-x64-msi
           path: src-tauri/target/release/bundle/msi/*.msi
 
-      - name: Upload EXE installer  
+      - name: Upload NSIS installer (artifact)
+        if: "!startsWith(github.ref, 'refs/tags/')"
         uses: actions/upload-artifact@v4
         with:
           name: moto-pos-windows-x64-exe

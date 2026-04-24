@@ -26,6 +26,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "resources": [
       "resources/mobile-dist/**/*"
     ],
@@ -36,5 +37,16 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/TheAndrewww/moto-pos/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDc5RDU5NDcwQjY5MzQ0M0IKUldRN1JKTzJjSlRWZVh1bFgzQkVjZkVBVzJUaFZJODY5UVk3UFdPY2ExSnE1bHNMeWcvNkdlcWoK",
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }
