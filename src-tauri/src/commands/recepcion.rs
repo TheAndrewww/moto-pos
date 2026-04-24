@@ -36,6 +36,8 @@ pub struct ItemRecepcion {
 pub struct DatosRecepcion {
     pub usuario_id: i64,
     pub proveedor_id: Option<i64>,
+    #[serde(default)]
+    pub orden_id: Option<i64>,
     pub notas: Option<String>,
     pub items: Vec<ItemRecepcion>,
 }
@@ -50,10 +52,10 @@ pub fn crear_recepcion(
 
     // Insertar cabecera
     db.execute(
-        r#"INSERT INTO recepciones (usuario_id, proveedor_id, fecha, notas)
-           VALUES (?, ?, ?, ?)"#,
+        r#"INSERT INTO recepciones (orden_id, usuario_id, proveedor_id, fecha, notas)
+           VALUES (?, ?, ?, ?, ?)"#,
         rusqlite::params![
-            recepcion.usuario_id, recepcion.proveedor_id, now, recepcion.notas
+            recepcion.orden_id, recepcion.usuario_id, recepcion.proveedor_id, now, recepcion.notas
         ],
     ).map_err(|e| e.to_string())?;
 
@@ -77,6 +79,35 @@ pub fn crear_recepcion(
                WHERE id = ?"#,
             rusqlite::params![item.cantidad, item.precio_costo, now, item.producto_id],
         ).map_err(|e| e.to_string())?;
+
+        // Si es contra una orden, actualizar cantidad_recibida del detalle correspondiente
+        if let Some(orden_id) = recepcion.orden_id {
+            let _ = db.execute(
+                r#"UPDATE orden_pedido_detalle
+                   SET cantidad_recibida = cantidad_recibida + ?
+                   WHERE orden_id = ? AND producto_id = ?"#,
+                rusqlite::params![item.cantidad, orden_id, item.producto_id],
+            );
+        }
+    }
+
+    // Si es contra una orden: calcular si ya está totalmente recibida y actualizar estado
+    if let Some(orden_id) = recepcion.orden_id {
+        let faltante: f64 = db.query_row(
+            r#"SELECT COALESCE(SUM(
+                   CASE WHEN cantidad_pedida > cantidad_recibida
+                        THEN cantidad_pedida - cantidad_recibida ELSE 0 END
+               ), 0)
+               FROM orden_pedido_detalle WHERE orden_id = ?"#,
+            rusqlite::params![orden_id],
+            |row| row.get(0),
+        ).unwrap_or(0.0);
+
+        let nuevo_estado = if faltante <= 0.0 { "recibida_completa" } else { "recibida_parcial" };
+        let _ = db.execute(
+            "UPDATE ordenes_pedido SET estado = ?, fecha_recepcion = ? WHERE id = ?",
+            rusqlite::params![nuevo_estado, now, orden_id],
+        );
     }
 
     // Bitácora

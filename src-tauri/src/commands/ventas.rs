@@ -30,6 +30,8 @@ pub struct NuevaVenta {
     pub monto_recibido: f64,
     pub cambio: f64,
     pub items: Vec<ItemVenta>,
+    #[serde(default)]
+    pub presupuesto_origen_id: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -207,6 +209,14 @@ pub fn crear_venta(
         );
     }
 
+    // Si la venta viene de un presupuesto, marcarlo como convertido
+    if let Some(presup_id) = venta.presupuesto_origen_id {
+        let _ = db.execute(
+            "UPDATE presupuestos SET estado = 'convertido', venta_id = ? WHERE id = ? AND estado != 'cancelado'",
+            rusqlite::params![venta_id, presup_id],
+        );
+    }
+
     db.execute("COMMIT", []).map_err(|e| e.to_string())?;
 
     Ok(VentaCreada {
@@ -322,10 +332,10 @@ pub fn anular_venta(
     let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
     // Verificar que la venta existe, no está anulada y es del mismo día
-    let (folio, fecha_venta): (String, String) = db.query_row(
-        "SELECT folio, fecha FROM ventas WHERE id = ? AND anulada = 0",
+    let (folio, fecha_venta, metodo_pago, total_venta): (String, String, String, f64) = db.query_row(
+        "SELECT folio, fecha, metodo_pago, total FROM ventas WHERE id = ? AND anulada = 0",
         rusqlite::params![venta_id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
     ).map_err(|_| "Venta no encontrada o ya anulada".to_string())?;
 
     let hoy = Local::now().format("%Y-%m-%d").to_string();
@@ -369,6 +379,16 @@ pub fn anular_venta(
         "UPDATE ventas SET anulada = 1, anulada_por = ?, motivo_anulacion = ? WHERE id = ?",
         rusqlite::params![usuario_id, motivo, venta_id],
     ).map_err(|e| { let _ = db.execute("ROLLBACK", []); e.to_string() })?;
+
+    // Compensar caja: si fue venta en efectivo, registrar RETIRO por el monto devuelto al cliente
+    if metodo_pago == "efectivo" && total_venta > 0.0 {
+        let concepto = format!("Anulación venta {} — {}", folio, motivo);
+        let _ = db.execute(
+            r#"INSERT INTO movimientos_caja (tipo, usuario_id, monto, concepto, fecha)
+               VALUES ('RETIRO', ?, ?, ?, ?)"#,
+            rusqlite::params![usuario_id, total_venta, concepto, now],
+        );
+    }
 
     // Bitácora
     let _ = db.execute(

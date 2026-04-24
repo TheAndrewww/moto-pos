@@ -2,10 +2,16 @@
 // Múltiples pestañas simultáneas (cada pestaña es una venta independiente)
 
 import { create } from 'zustand';
-import { invoke } from '@tauri-apps/api/core';
+import { invoke } from '../lib/invokeCompat';
 import type { Producto } from './productStore';
 
 export type MetodoPago = 'efectivo' | 'tarjeta' | 'transferencia';
+export type ModoTab = 'venta' | 'presupuesto';
+
+export interface PresupuestoOrigen {
+  id: number;
+  folio: string;
+}
 
 export interface ItemCarrito {
   producto: Producto;
@@ -53,6 +59,10 @@ export interface TabVenta {
   clienteSeleccionado: Cliente | null;
   metodoPago: MetodoPago;
   montoRecibido: number;
+  modo: ModoTab;
+  presupuestoOrigen: PresupuestoOrigen | null;
+  notasPresupuesto: string;
+  vigenciaPresupuesto: number;
 }
 
 function generarId(): string {
@@ -62,7 +72,7 @@ function generarId(): string {
   return `t-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
 }
 
-function nuevaTabVacia(nombre: string): TabVenta {
+function nuevaTabVacia(nombre: string, modo: ModoTab = 'venta'): TabVenta {
   return {
     id: generarId(),
     nombre,
@@ -70,6 +80,10 @@ function nuevaTabVacia(nombre: string): TabVenta {
     clienteSeleccionado: null,
     metodoPago: 'efectivo',
     montoRecibido: 0,
+    modo,
+    presupuestoOrigen: null,
+    notasPresupuesto: '',
+    vigenciaPresupuesto: 7,
   };
 }
 
@@ -111,6 +125,23 @@ interface VentaState {
   setMontoRecibido: (monto: number) => void;
   procesarVenta: (usuarioId: number) => Promise<VentaCreada>;
   cerrarVentaExitosa: () => void;
+
+  // Modo Presupuesto (pestaña activa)
+  setModo: (modo: ModoTab) => void;
+  setNotasPresupuesto: (notas: string) => void;
+  setVigenciaPresupuesto: (dias: number) => void;
+  guardarComoPresupuesto: (usuarioId: number) => Promise<{ id: number; folio: string }>;
+  cargarPresupuestoEnNuevaTab: (
+    presupuestoId: number,
+    folio: string,
+    items: {
+      producto: Producto;
+      cantidad: number;
+      precio_unitario: number;
+      descuento_porcentaje: number;
+    }[],
+    cliente: Cliente | null,
+  ) => string;
 }
 
 const tabInicial = nuevaTabVacia('Venta 1');
@@ -298,6 +329,7 @@ export const useVentaStore = create<VentaState>((set, get) => {
             subtotal: i.subtotal,
             autorizado_por: i.autorizadoPor,
           })),
+          presupuesto_origen_id: activa.presupuestoOrigen?.id || null,
         };
 
         const result = await invoke<VentaCreada>('crear_venta', { venta });
@@ -307,6 +339,67 @@ export const useVentaStore = create<VentaState>((set, get) => {
         set({ procesando: false });
         throw new Error(e?.toString() || 'Error al procesar la venta');
       }
+    },
+
+    setModo: (modo) => updateActiva(t => ({ ...t, modo })),
+    setNotasPresupuesto: (notas) => updateActiva(t => ({ ...t, notasPresupuesto: notas })),
+    setVigenciaPresupuesto: (dias) => updateActiva(t => ({ ...t, vigenciaPresupuesto: dias })),
+
+    guardarComoPresupuesto: async (usuarioId) => {
+      const activa = getActiva();
+      if (activa.items.length === 0) throw new Error('Agrega al menos un producto');
+      set({ procesando: true });
+      try {
+        const total = activa.items.reduce((acc, i) => acc + i.subtotal, 0);
+        const result = await invoke<{ id: number; folio: string }>('crear_presupuesto', {
+          presupuesto: {
+            usuario_id: usuarioId,
+            cliente_id: activa.clienteSeleccionado?.id || null,
+            notas: activa.notasPresupuesto || null,
+            vigencia_dias: activa.vigenciaPresupuesto,
+            total,
+            items: activa.items.map(i => ({
+              producto_id: i.producto.id,
+              descripcion: i.producto.nombre,
+              cantidad: i.cantidad,
+              precio_unitario: i.precioOriginal,
+              descuento_porcentaje: i.descuentoPorcentaje,
+              subtotal: i.subtotal,
+            })),
+          },
+        });
+        set({ procesando: false });
+        return result;
+      } catch (e: any) {
+        set({ procesando: false });
+        throw new Error(e?.toString() || 'Error al crear presupuesto');
+      }
+    },
+
+    cargarPresupuestoEnNuevaTab: (presupuestoId, folio, itemsBase, cliente) => {
+      const s = get();
+      const itemsCarrito: ItemCarrito[] = itemsBase.map(i => {
+        const descMonto = i.precio_unitario * (i.descuento_porcentaje / 100);
+        const precioFinal = i.precio_unitario - descMonto;
+        return {
+          producto: i.producto,
+          cantidad: i.cantidad,
+          precioOriginal: i.precio_unitario,
+          descuentoPorcentaje: i.descuento_porcentaje,
+          descuentoMonto: descMonto,
+          precioFinal,
+          subtotal: precioFinal * i.cantidad,
+          autorizadoPor: null,
+        };
+      });
+      const nueva: TabVenta = {
+        ...nuevaTabVacia(folio, 'venta'),
+        items: itemsCarrito,
+        clienteSeleccionado: cliente,
+        presupuestoOrigen: { id: presupuestoId, folio },
+      };
+      set({ tabs: [...s.tabs, nueva], tabActivaId: nueva.id, ventaExitosa: null });
+      return nueva.id;
     },
 
     cerrarVentaExitosa: () => {

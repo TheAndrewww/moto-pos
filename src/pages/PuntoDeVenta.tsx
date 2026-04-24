@@ -5,8 +5,8 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { useProductStore } from '../store/productStore';
 import { useVentaStore, useVentaActiva, type MetodoPago } from '../store/ventaStore';
 import { useAuthStore } from '../store/authStore';
-import { Search, X, Minus, Plus, Trash2, CreditCard, Banknote, ArrowRightLeft, CheckCircle2, User, Percent, Lock, Plus as PlusIcon, Printer } from 'lucide-react';
-import { invoke } from '@tauri-apps/api/core';
+import { Search, X, Minus, Plus, Trash2, CreditCard, Banknote, ArrowRightLeft, CheckCircle2, User, Percent, Lock, Plus as PlusIcon, Printer, FileText, Save } from 'lucide-react';
+import { invoke } from '../lib/invokeCompat';
 import { imprimirTicket, type ConfigNegocio, type TicketData } from '../utils/ticket';
 
 export default function PuntoDeVenta() {
@@ -18,8 +18,10 @@ export default function PuntoDeVenta() {
     procesarVenta, ventaExitosa, cerrarVentaExitosa, procesando,
     clientes, cargarClientes, seleccionarCliente,
     tabs, tabActivaId, nuevaTab, cerrarTab, activarTab,
+    setModo, setNotasPresupuesto, setVigenciaPresupuesto, guardarComoPresupuesto,
   } = useVentaStore();
-  const { items, clienteSeleccionado, metodoPago, montoRecibido } = useVentaActiva();
+  const activa = useVentaActiva();
+  const { items, clienteSeleccionado, metodoPago, montoRecibido, modo, presupuestoOrigen, notasPresupuesto, vigenciaPresupuesto } = activa;
   const { usuario } = useAuthStore();
 
   const [showCobro, setShowCobro] = useState(false);
@@ -30,6 +32,7 @@ export default function PuntoDeVenta() {
   const [pinAuth, setPinAuth] = useState('');
   const [pinError, setPinError] = useState(false);
   const [confirmCerrarTab, setConfirmCerrarTab] = useState<string | null>(null);
+  const [presupGuardado, setPresupGuardado] = useState<{ folio: string } | null>(null);
   const [maxDescVendedor, setMaxDescVendedor] = useState(15);
   const [configNegocio, setConfigNegocio] = useState<ConfigNegocio | null>(null);
   const [ultimoTicket, setUltimoTicket] = useState<TicketData | null>(null);
@@ -54,6 +57,8 @@ export default function PuntoDeVenta() {
   // Focus automático en el campo de escaneo
   useEffect(() => {
     if (!showCobro && !showBusqueda && !ventaExitosa && scanRef.current) {
+      // Limpiar el campo siempre que vuelve a tener el foco, para evitar que queden letras de una búsqueda previa
+      scanRef.current.value = '';
       scanRef.current.focus();
     }
   }, [showCobro, showBusqueda, ventaExitosa, items]);
@@ -104,14 +109,14 @@ export default function PuntoDeVenta() {
         const idx = Number(e.key) - 1;
         if (tabs[idx]) { e.preventDefault(); activarTab(tabs[idx].id); }
       }
-      // F10 = cobrar
-      if (e.key === 'F10' && items.length > 0) { e.preventDefault(); setShowCobro(true); setMontoRecibido(0); }
+      // F10 = cobrar (solo en modo venta)
+      if (e.key === 'F10' && items.length > 0 && modo === 'venta') { e.preventDefault(); setShowCobro(true); setMontoRecibido(0); }
       // Escape = cerrar overlay
       if (e.key === 'Escape') { setShowCobro(false); setShowBusqueda(false); }
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [items, ventaExitosa, tabs, tabActivaId]);
+  }, [items, ventaExitosa, tabs, tabActivaId, modo]);
 
   const handleCobrar = async () => {
     if (!usuario) return;
@@ -157,6 +162,19 @@ export default function PuntoDeVenta() {
       if (configNegocio) imprimirTicket(configNegocio, ticket);
     } catch (err: any) {
       alert(err.message);
+    }
+  };
+
+  const handleGuardarPresupuesto = async () => {
+    if (!usuario) return;
+    if (items.length === 0) return;
+    try {
+      const result = await guardarComoPresupuesto(usuario.id);
+      setPresupGuardado({ folio: result.folio });
+      // Cerrar la pestaña actual (ya se guardó)
+      cerrarTab(tabActivaId);
+    } catch (err: any) {
+      alert(err?.message || 'Error al guardar presupuesto');
     }
   };
 
@@ -267,23 +285,25 @@ export default function PuntoDeVenta() {
         borderBottom: '1px solid var(--color-border)', overflowX: 'auto',
       }}>
         {tabs.map(t => {
-          const activa = t.id === tabActivaId;
+          const isActiva = t.id === tabActivaId;
           const count = t.items.reduce((a, i) => a + i.cantidad, 0);
+          const isPresup = t.modo === 'presupuesto';
           return (
             <div key={t.id}
               onClick={() => activarTab(t.id)}
               style={{
                 display: 'flex', alignItems: 'center', gap: 6,
                 padding: '6px 10px', borderRadius: '6px 6px 0 0',
-                background: activa ? 'var(--color-bg)' : 'transparent',
-                border: '1px solid ' + (activa ? 'var(--color-border)' : 'transparent'),
-                borderBottom: activa ? '1px solid var(--color-bg)' : '1px solid transparent',
+                background: isActiva ? 'var(--color-bg)' : 'transparent',
+                border: '1px solid ' + (isActiva ? 'var(--color-border)' : 'transparent'),
+                borderBottom: isActiva ? '1px solid var(--color-bg)' : '1px solid transparent',
                 marginBottom: -1, cursor: 'pointer', fontSize: 13,
-                fontWeight: activa ? 700 : 500,
-                color: activa ? 'var(--color-text)' : 'var(--color-text-muted)',
+                fontWeight: isActiva ? 700 : 500,
+                color: isActiva ? 'var(--color-text)' : 'var(--color-text-muted)',
                 whiteSpace: 'nowrap',
               }}
             >
+              {isPresup && <FileText size={12} style={{ color: '#e6a817' }} />}
               <span>{t.nombre}</span>
               {count > 0 && (
                 <span style={{
@@ -313,6 +333,52 @@ export default function PuntoDeVenta() {
         >
           <PlusIcon size={14} />
         </button>
+
+        {/* Toggle Venta/Presupuesto para la pestaña activa */}
+        <div style={{ marginLeft: 'auto', marginRight: 6, marginBottom: 4, display: 'flex', gap: 4, alignItems: 'center' }}>
+          {presupuestoOrigen && (
+            <span style={{
+              fontSize: 11, fontWeight: 700, padding: '3px 10px', borderRadius: 10,
+              background: 'rgba(108,117,246,0.12)', color: '#6c75f6',
+              display: 'flex', alignItems: 'center', gap: 4,
+            }} title="Esta venta convertirá el presupuesto original">
+              <FileText size={11} /> Convirtiendo {presupuestoOrigen.folio}
+            </span>
+          )}
+          <div style={{
+            display: 'flex', background: 'var(--color-surface-2)',
+            borderRadius: 6, padding: 2, fontSize: 12,
+          }}>
+            <button
+              onClick={() => setModo('venta')}
+              disabled={!!presupuestoOrigen}
+              style={{
+                padding: '4px 10px', border: 'none', borderRadius: 4, cursor: presupuestoOrigen ? 'not-allowed' : 'pointer',
+                background: modo === 'venta' ? 'var(--color-primary)' : 'transparent',
+                color: modo === 'venta' ? '#fff' : 'var(--color-text-muted)',
+                fontWeight: 600, display: 'flex', alignItems: 'center', gap: 4,
+                opacity: presupuestoOrigen ? 0.6 : 1,
+              }}
+              title="Venta (F10 para cobrar)"
+            >
+              <Banknote size={12} /> Venta
+            </button>
+            <button
+              onClick={() => setModo('presupuesto')}
+              disabled={!!presupuestoOrigen}
+              style={{
+                padding: '4px 10px', border: 'none', borderRadius: 4, cursor: presupuestoOrigen ? 'not-allowed' : 'pointer',
+                background: modo === 'presupuesto' ? '#e6a817' : 'transparent',
+                color: modo === 'presupuesto' ? '#fff' : 'var(--color-text-muted)',
+                fontWeight: 600, display: 'flex', alignItems: 'center', gap: 4,
+                opacity: presupuestoOrigen ? 0.6 : 1,
+              }}
+              title="Presupuesto (guardar cotización sin cobrar)"
+            >
+              <FileText size={12} /> Presupuesto
+            </button>
+          </div>
+        </div>
       </div>
 
     <div style={{ display: 'grid', gridTemplateColumns: '1fr 360px', flex: 1, minHeight: 0, gap: 0 }}>
@@ -474,34 +540,36 @@ export default function PuntoDeVenta() {
           padding: 20,
         }}>
           <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--color-text-muted)', textTransform: 'uppercase', letterSpacing: 1 }}>
-            TOTAL
+            {modo === 'presupuesto' ? 'TOTAL COTIZACIÓN' : 'TOTAL'}
           </span>
-          <div className="price-display" style={{ fontSize: 48 }}>
+          <div className="price-display" style={{ fontSize: 48, color: modo === 'presupuesto' ? '#e6a817' : undefined }}>
             {fmt(total())}
           </div>
           <span style={{ fontSize: 13, color: 'var(--color-text-dim)' }}>
             {numItems()} artículo{numItems() !== 1 ? 's' : ''} en el carrito
           </span>
 
-          {/* Método de pago */}
-          <div style={{ display: 'flex', gap: 6, marginTop: 12 }}>
-            {(['efectivo', 'tarjeta', 'transferencia'] as MetodoPago[]).map((m) => (
-              <button
-                key={m}
-                className={`btn ${metodoPago === m ? 'btn-primary' : 'btn-ghost'} btn-sm`}
-                onClick={() => setMetodoPago(m)}
-              >
-                {m === 'efectivo' && <Banknote size={14} />}
-                {m === 'tarjeta' && <CreditCard size={14} />}
-                {m === 'transferencia' && <ArrowRightLeft size={14} />}
-                {m.charAt(0).toUpperCase() + m.slice(1)}
-              </button>
-            ))}
-          </div>
+          {/* Método de pago — solo en modo venta */}
+          {modo === 'venta' && (
+            <div style={{ display: 'flex', gap: 6, marginTop: 12 }}>
+              {(['efectivo', 'tarjeta', 'transferencia'] as MetodoPago[]).map((m) => (
+                <button
+                  key={m}
+                  className={`btn ${metodoPago === m ? 'btn-primary' : 'btn-ghost'} btn-sm`}
+                  onClick={() => setMetodoPago(m)}
+                >
+                  {m === 'efectivo' && <Banknote size={14} />}
+                  {m === 'tarjeta' && <CreditCard size={14} />}
+                  {m === 'transferencia' && <ArrowRightLeft size={14} />}
+                  {m.charAt(0).toUpperCase() + m.slice(1)}
+                </button>
+              ))}
+            </div>
+          )}
         </div>
 
-        {/* Campo monto recibido (efectivo) */}
-        {metodoPago === 'efectivo' && items.length > 0 && (
+        {/* Campo monto recibido (efectivo, solo venta) */}
+        {modo === 'venta' && metodoPago === 'efectivo' && items.length > 0 && (
           <div style={{ padding: '0 16px 12px', display: 'flex', flexDirection: 'column', gap: 6 }}>
             <label style={{ fontSize: 11, fontWeight: 600, color: 'var(--color-text-muted)' }}>
               MONTO RECIBIDO
@@ -526,19 +594,61 @@ export default function PuntoDeVenta() {
           </div>
         )}
 
-        {/* Botón cobrar */}
+        {/* Campos extra en modo presupuesto */}
+        {modo === 'presupuesto' && (
+          <div style={{ padding: '0 16px 12px', display: 'flex', flexDirection: 'column', gap: 10 }}>
+            <div>
+              <label style={{ fontSize: 11, fontWeight: 600, color: 'var(--color-text-muted)' }}>
+                VIGENCIA (DÍAS)
+              </label>
+              <input
+                className="input mono"
+                type="number"
+                min={1}
+                value={vigenciaPresupuesto}
+                onChange={(e) => setVigenciaPresupuesto(parseInt(e.target.value) || 7)}
+                style={{ textAlign: 'center' }}
+              />
+            </div>
+            <div>
+              <label style={{ fontSize: 11, fontWeight: 600, color: 'var(--color-text-muted)' }}>
+                NOTAS
+              </label>
+              <input
+                className="input"
+                placeholder="Notas opcionales..."
+                value={notasPresupuesto}
+                onChange={(e) => setNotasPresupuesto(e.target.value)}
+              />
+            </div>
+          </div>
+        )}
+
+        {/* Botón principal */}
         <div style={{ padding: 16 }}>
-          <button
-            className="btn btn-success btn-xl"
-            style={{ width: '100%', justifyContent: 'center' }}
-            disabled={
-              items.length === 0 || procesando ||
-              (metodoPago === 'efectivo' && montoRecibido < total())
-            }
-            onClick={handleCobrar}
-          >
-            {procesando ? 'Procesando...' : `Cobrar ${fmt(total())} (F10)`}
-          </button>
+          {modo === 'venta' ? (
+            <button
+              className="btn btn-success btn-xl"
+              style={{ width: '100%', justifyContent: 'center' }}
+              disabled={
+                items.length === 0 || procesando ||
+                (metodoPago === 'efectivo' && montoRecibido < total())
+              }
+              onClick={handleCobrar}
+            >
+              {procesando ? 'Procesando...' : `Cobrar ${fmt(total())} (F10)`}
+            </button>
+          ) : (
+            <button
+              className="btn btn-xl"
+              style={{ width: '100%', justifyContent: 'center', background: '#e6a817', color: '#fff' }}
+              disabled={items.length === 0 || procesando}
+              onClick={handleGuardarPresupuesto}
+            >
+              <Save size={18} />
+              {procesando ? 'Guardando...' : 'Guardar Presupuesto'}
+            </button>
+          )}
         </div>
       </div>
 
@@ -725,6 +835,26 @@ export default function PuntoDeVenta() {
                 </button>
               </>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* ─── Toast Presupuesto Guardado ─── */}
+      {presupGuardado && (
+        <div style={{
+          position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 200,
+        }} onClick={() => setPresupGuardado(null)}>
+          <div className="card animate-fade-in" style={{ width: 360, padding: 28, textAlign: 'center' }}
+            onClick={e => e.stopPropagation()}>
+            <CheckCircle2 size={48} style={{ color: '#e6a817', marginBottom: 10 }} />
+            <h3 style={{ fontSize: 18, fontWeight: 700, marginBottom: 4 }}>Presupuesto Guardado</h3>
+            <p className="mono" style={{ fontSize: 15, color: 'var(--color-text-muted)', marginBottom: 16 }}>
+              {presupGuardado.folio}
+            </p>
+            <button className="btn btn-primary" onClick={() => setPresupGuardado(null)} autoFocus>
+              Continuar
+            </button>
           </div>
         </div>
       )}

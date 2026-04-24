@@ -1,0 +1,9 @@
+# Configuración Railway.
+# Asume plugin Postgres agregado (DATABASE_URL inyectado).
+
+[build]
+builder = "nixpacks"
+
+[deploy]
+startCommand = "./target/release/moto-server"
+restartPolicyType = "always"

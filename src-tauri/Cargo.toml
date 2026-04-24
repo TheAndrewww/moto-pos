@@ -29,7 +29,11 @@ rusqlite = { version = "0.31", features = ["bundled", "backup"] }
 chrono = { version = "0.4", features = ["serde"] }
 
 # IDs únicos
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v7"] }
+
+# HTTP client (para sync con servidor remoto, Fase 3.2)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 # Seguridad / contraseñas
 bcrypt = "0.15"
@@ -47,4 +51,23 @@ env_logger = "0.11"
 
 # Abrir archivos en el sistema
 open = "5"
+
+# === Servidor LAN para PWA móvil (Fase 3.1) ===
+# HTTP server async
+axum = { version = "0.7", features = ["macros"] }
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["fs", "cors", "trace", "limit"] }
+# JWT para autenticación
+jsonwebtoken = "9"
+# Certificado HTTPS auto-firmado
+rcgen = "0.13"
+# Detección de IP LAN
+local-ip-address = "0.6"
+# Generación de QR
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+# Base64 (para devolver QR como data URL)
+base64 = "0.22"
+# Random tokens
+rand = "0.8"
 

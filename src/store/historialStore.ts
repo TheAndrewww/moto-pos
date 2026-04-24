@@ -1,7 +1,7 @@
 // store/historialStore.ts — Historial de ventas + anulaciones + devoluciones
 
 import { create } from 'zustand';
-import { invoke } from '@tauri-apps/api/core';
+import { invoke } from '../lib/invokeCompat';
 
 // ─── Tipos ────────────────────────────────────────────────
 

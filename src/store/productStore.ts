@@ -1,7 +1,7 @@
 // store/productStore.ts — Estado global de productos (Zustand)
 
 import { create } from 'zustand';
-import { invoke } from '@tauri-apps/api/core';
+import { invoke } from '../lib/invokeCompat';
 import MiniSearch from 'minisearch';
 
 export interface Producto {

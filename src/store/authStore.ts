@@ -1,7 +1,7 @@
 // store/authStore.ts — Estado global de autenticación (Zustand)
 
 import { create } from 'zustand';
-import { invoke } from '@tauri-apps/api/core';
+import { invoke, setAuthToken } from '../lib/invokeCompat';
 
 export interface Permiso {
   modulo: string;
@@ -59,10 +59,12 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   loginPin: async (pin) => {
     set({ cargando: true, error: null });
     try {
-      const result = await invoke<{ ok: boolean; usuario?: UsuarioSesion; error?: string }>(
-        'login_pin', { pin }
-      );
+      // En web mode el backend devuelve `token`; en Tauri viene undefined.
+      const result = await invoke<{
+        ok: boolean; usuario?: UsuarioSesion; error?: string; token?: string;
+      }>('login_pin', { pin });
       if (result.ok && result.usuario) {
+        if (result.token) setAuthToken(result.token);
         set({ usuario: result.usuario, cargando: false, error: null });
         return true;
       } else {
@@ -78,10 +80,11 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   loginPassword: async (nombre_usuario, password) => {
     set({ cargando: true, error: null });
     try {
-      const result = await invoke<{ ok: boolean; usuario?: UsuarioSesion; error?: string }>(
-        'login_password', { nombreUsuario: nombre_usuario, password }
-      );
+      const result = await invoke<{
+        ok: boolean; usuario?: UsuarioSesion; error?: string; token?: string;
+      }>('login_password', { nombreUsuario: nombre_usuario, password });
       if (result.ok && result.usuario) {
+        if (result.token) setAuthToken(result.token);
         set({ usuario: result.usuario, cargando: false, error: null });
         return true;
       } else {
@@ -103,6 +106,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
         nombreUsuario: usuario.nombre_usuario,
       }).catch(() => {});
     }
+    setAuthToken(null);  // limpia token en web (no-op en Tauri si nunca se setteó)
     set({ usuario: null, error: null });
   },
 

@@ -302,6 +302,13 @@ pub fn actualizar_producto(
 ) -> Result<bool, String> {
     let db = state.db.lock().unwrap();
 
+    // Obtener precio anterior para detectar cambios
+    let precio_anterior: f64 = db.query_row(
+        "SELECT precio_venta FROM productos WHERE id = ?",
+        rusqlite::params![producto.id],
+        |row| row.get(0),
+    ).unwrap_or(0.0);
+
     // Obtener datos anteriores para bitácora
     let datos_ant: Option<String> = db.query_row(
         "SELECT nombre || ' | costo:' || precio_costo || ' | venta:' || precio_venta FROM productos WHERE id = ?",
@@ -343,7 +350,86 @@ pub fn actualizar_producto(
         ],
     );
 
+    // Log dedicado de cambio de precio (para historial_precios_producto)
+    if (producto.precio_venta - precio_anterior).abs() > 0.001 {
+        let json_ant = format!("{{\"precio_venta\":{:.2}}}", precio_anterior);
+        let json_new = format!("{{\"precio_venta\":{:.2}}}", producto.precio_venta);
+        let _ = db.execute(
+            r#"INSERT INTO audit_log (usuario_id, accion, tabla_afectada, registro_id,
+               datos_anteriores, datos_nuevos, descripcion_legible, origen)
+               VALUES (?, 'PRECIO_ACTUALIZADO', 'productos', ?, ?, ?, ?, 'POS')"#,
+            rusqlite::params![
+                usuario_id, producto.id, json_ant, json_new,
+                format!("Precio de '{}' cambió de ${:.2} a ${:.2}",
+                    producto.nombre, precio_anterior, producto.precio_venta)
+            ],
+        );
+    }
+
     Ok(true)
+}
+
+// ─── Historial de precios ─────────────────────────────────
+
+#[derive(Serialize, Debug)]
+pub struct HistorialPrecio {
+    pub fecha: String,
+    pub precio_anterior: f64,
+    pub precio_nuevo: f64,
+    pub usuario_nombre: String,
+}
+
+/// Lista los cambios de precio de un producto (descendente por fecha).
+#[tauri::command]
+pub fn historial_precios_producto(
+    producto_id: i64,
+    state: State<'_, AppState>,
+) -> Result<Vec<HistorialPrecio>, String> {
+    let db = state.db.lock().unwrap();
+    let mut stmt = db.prepare(
+        r#"SELECT a.fecha, a.datos_anteriores, a.datos_nuevos,
+                  COALESCE(u.nombre_completo, 'Desconocido')
+           FROM audit_log a
+           LEFT JOIN usuarios u ON u.id = a.usuario_id
+           WHERE a.accion = 'PRECIO_ACTUALIZADO'
+             AND a.tabla_afectada = 'productos'
+             AND a.registro_id = ?
+           ORDER BY a.fecha DESC"#,
+    ).map_err(|e| e.to_string())?;
+
+    let rows = stmt.query_map(rusqlite::params![producto_id], |row| {
+        let fecha: String = row.get(0)?;
+        let ant: Option<String> = row.get(1)?;
+        let new_: Option<String> = row.get(2)?;
+        let usuario: String = row.get(3)?;
+        Ok((fecha, ant, new_, usuario))
+    }).map_err(|e| e.to_string())?;
+
+    let mut resultado = Vec::new();
+    for r in rows {
+        let (fecha, ant, new_, usuario) = r.map_err(|e| e.to_string())?;
+        let precio_anterior = extraer_precio(&ant.unwrap_or_default());
+        let precio_nuevo = extraer_precio(&new_.unwrap_or_default());
+        resultado.push(HistorialPrecio {
+            fecha,
+            precio_anterior,
+            precio_nuevo,
+            usuario_nombre: usuario,
+        });
+    }
+    Ok(resultado)
+}
+
+/// Parser simple de `{"precio_venta":12.50}` → 12.50
+fn extraer_precio(json: &str) -> f64 {
+    let key = "\"precio_venta\":";
+    if let Some(i) = json.find(key) {
+        let rest = &json[i + key.len()..];
+        let end = rest.find(|c: char| c == ',' || c == '}').unwrap_or(rest.len());
+        rest[..end].trim().parse::<f64>().unwrap_or(0.0)
+    } else {
+        0.0
+    }
 }
 
 /// Productos con stock ≤ stock_minimo (alerta de reorden)
@@ -528,13 +614,21 @@ pub struct ConfigNegocio {
     pub telefono: String,
     pub rfc: String,
     pub mensaje_pie: String,
+    pub respaldo_auto_activo: bool,
+    pub respaldo_auto_hora: String,
+    /// Nombre del sistema de la impresora térmica ESC/POS.
+    /// Si está vacío, el ticket cae al fallback HTML (navegador del sistema).
+    #[serde(default)]
+    pub impresora_termica: String,
 }
 
 #[tauri::command]
 pub fn obtener_config_negocio(state: State<'_, AppState>) -> ConfigNegocio {
     let db = state.db.lock().unwrap();
     db.query_row(
-        "SELECT nombre, direccion, telefono, rfc, mensaje_pie FROM config_negocio WHERE id = 1",
+        "SELECT nombre, direccion, telefono, rfc, mensaje_pie,
+                respaldo_auto_activo, respaldo_auto_hora, impresora_termica
+         FROM config_negocio WHERE id = 1",
         [],
         |row| Ok(ConfigNegocio {
             nombre: row.get(0)?,
@@ -542,6 +636,9 @@ pub fn obtener_config_negocio(state: State<'_, AppState>) -> ConfigNegocio {
             telefono: row.get(2)?,
             rfc: row.get(3)?,
             mensaje_pie: row.get(4)?,
+            respaldo_auto_activo: row.get::<_, i64>(5)? != 0,
+            respaldo_auto_hora: row.get(6)?,
+            impresora_termica: row.get(7)?,
         }),
     ).unwrap_or(ConfigNegocio {
         nombre: "Moto Refaccionaria".into(),
@@ -549,6 +646,9 @@ pub fn obtener_config_negocio(state: State<'_, AppState>) -> ConfigNegocio {
         telefono: String::new(),
         rfc: String::new(),
         mensaje_pie: "¡Gracias por su compra!".into(),
+        respaldo_auto_activo: true,
+        respaldo_auto_hora: "23:00".into(),
+        impresora_termica: String::new(),
     })
 }
 
@@ -559,8 +659,15 @@ pub fn actualizar_config_negocio(
 ) -> Result<ConfigNegocio, String> {
     let db = state.db.lock().unwrap();
     db.execute(
-        "UPDATE config_negocio SET nombre = ?, direccion = ?, telefono = ?, rfc = ?, mensaje_pie = ?, updated_at = datetime('now') WHERE id = 1",
-        rusqlite::params![datos.nombre, datos.direccion, datos.telefono, datos.rfc, datos.mensaje_pie],
+        "UPDATE config_negocio SET nombre = ?, direccion = ?, telefono = ?, rfc = ?,
+         mensaje_pie = ?, respaldo_auto_activo = ?, respaldo_auto_hora = ?,
+         impresora_termica = ?, updated_at = datetime('now') WHERE id = 1",
+        rusqlite::params![
+            datos.nombre, datos.direccion, datos.telefono, datos.rfc, datos.mensaje_pie,
+            if datos.respaldo_auto_activo { 1 } else { 0 },
+            datos.respaldo_auto_hora,
+            datos.impresora_termica,
+        ],
     ).map_err(|e| e.to_string())?;
     Ok(datos)
 }

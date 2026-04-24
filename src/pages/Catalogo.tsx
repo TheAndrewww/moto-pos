@@ -4,8 +4,8 @@
 import { useState, useEffect, useRef } from 'react';
 import { useProductStore, type Producto, type NuevoProducto } from '../store/productStore';
 import { useAuthStore } from '../store/authStore';
-import { Package, Plus, Search, Edit2, X, AlertTriangle, Tag, Hash, LayoutGrid, List, Upload } from 'lucide-react';
-import { invoke } from '@tauri-apps/api/core';
+import { Package, Plus, Search, Edit2, X, AlertTriangle, Tag, Hash, LayoutGrid, List, Upload, History } from 'lucide-react';
+import { invoke } from '../lib/invokeCompat';
 import { useVirtualizer } from '@tanstack/react-virtual';
 
 export default function Catalogo() {
@@ -94,6 +94,28 @@ export default function Catalogo() {
     });
     const [guardando, setGuardando] = useState(false);
     const [error, setError] = useState('');
+    const [tabActiva, setTabActiva] = useState<'datos' | 'historial'>('datos');
+
+    // Historial de precios
+    interface HistorialPrecio {
+      fecha: string;
+      precio_anterior: number;
+      precio_nuevo: number;
+      usuario_nombre: string;
+    }
+    const [historial, setHistorial] = useState<HistorialPrecio[]>([]);
+    const [cargandoHistorial, setCargandoHistorial] = useState(false);
+
+    // Cargar historial cuando se cambia a la pestaña
+    useEffect(() => {
+      if (tabActiva === 'historial' && editando) {
+        setCargandoHistorial(true);
+        invoke<HistorialPrecio[]>('historial_precios_producto', { productoId: editando.id })
+          .then(data => setHistorial(data))
+          .catch(() => setHistorial([]))
+          .finally(() => setCargandoHistorial(false));
+      }
+    }, [tabActiva, editando]);
 
     const handleSubmit = async (e: React.FormEvent) => {
       e.preventDefault();
@@ -146,7 +168,7 @@ export default function Catalogo() {
       }} onClick={() => { setShowForm(false); setEditando(null); }}>
         <div className="card animate-fade-in" style={{ width: 520, maxHeight: '85vh', overflow: 'auto', padding: 24 }}
           onClick={(e) => e.stopPropagation()}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
             <h2 style={{ fontSize: 18, fontWeight: 700 }}>
               {editando ? '✏️ Editar Producto' : '➕ Nuevo Producto'}
             </h2>
@@ -155,6 +177,102 @@ export default function Catalogo() {
             </button>
           </div>
 
+          {/* Pestañas — solo visibles en modo edición */}
+          {editando && (
+            <div style={{
+              display: 'flex', gap: 0, marginBottom: 16,
+              borderBottom: '2px solid var(--color-border)',
+            }}>
+              <button
+                onClick={() => setTabActiva('datos')}
+                style={{
+                  padding: '8px 16px', border: 'none', background: 'transparent', cursor: 'pointer',
+                  fontSize: 13, fontWeight: 600,
+                  color: tabActiva === 'datos' ? 'var(--color-primary)' : 'var(--color-text-muted)',
+                  borderBottom: tabActiva === 'datos' ? '2px solid var(--color-primary)' : '2px solid transparent',
+                  marginBottom: -2,
+                  transition: 'all 0.15s',
+                }}
+              >
+                Datos del producto
+              </button>
+              <button
+                onClick={() => setTabActiva('historial')}
+                style={{
+                  padding: '8px 16px', border: 'none', background: 'transparent', cursor: 'pointer',
+                  fontSize: 13, fontWeight: 600,
+                  display: 'flex', alignItems: 'center', gap: 6,
+                  color: tabActiva === 'historial' ? 'var(--color-primary)' : 'var(--color-text-muted)',
+                  borderBottom: tabActiva === 'historial' ? '2px solid var(--color-primary)' : '2px solid transparent',
+                  marginBottom: -2,
+                  transition: 'all 0.15s',
+                }}
+              >
+                <History size={14} /> Historial de precios
+              </button>
+            </div>
+          )}
+
+          {/* Tab: Historial de precios */}
+          {tabActiva === 'historial' && editando ? (
+            <div style={{ minHeight: 200 }}>
+              {cargandoHistorial ? (
+                <div style={{ padding: 40, textAlign: 'center', color: 'var(--color-text-dim)' }}>
+                  Cargando historial...
+                </div>
+              ) : historial.length === 0 ? (
+                <div style={{
+                  padding: 40, textAlign: 'center', color: 'var(--color-text-dim)',
+                  display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 8,
+                }}>
+                  <History size={32} strokeWidth={1.2} />
+                  <p style={{ fontSize: 14, fontWeight: 600 }}>Sin cambios de precio registrados</p>
+                  <p style={{ fontSize: 12 }}>Los cambios de precio aparecerán aquí cuando se modifiquen.</p>
+                </div>
+              ) : (
+                <div style={{ maxHeight: 340, overflow: 'auto' }}>
+                  <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+                    <thead>
+                      <tr style={{ borderBottom: '2px solid var(--color-border)' }}>
+                        <th style={{ textAlign: 'left', padding: '8px 10px', fontSize: 11, color: 'var(--color-text-muted)', fontWeight: 600 }}>FECHA</th>
+                        <th style={{ textAlign: 'right', padding: '8px 10px', fontSize: 11, color: 'var(--color-text-muted)', fontWeight: 600 }}>ANTERIOR</th>
+                        <th style={{ textAlign: 'right', padding: '8px 10px', fontSize: 11, color: 'var(--color-text-muted)', fontWeight: 600 }}>NUEVO</th>
+                        <th style={{ textAlign: 'right', padding: '8px 10px', fontSize: 11, color: 'var(--color-text-muted)', fontWeight: 600 }}>CAMBIO</th>
+                        <th style={{ textAlign: 'left', padding: '8px 10px', fontSize: 11, color: 'var(--color-text-muted)', fontWeight: 600 }}>USUARIO</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {historial.map((h, i) => {
+                        const diff = h.precio_nuevo - h.precio_anterior;
+                        const pct = h.precio_anterior > 0 ? ((diff / h.precio_anterior) * 100) : 0;
+                        const esSuba = diff > 0;
+                        return (
+                          <tr key={i} style={{ borderBottom: '1px solid var(--color-border)' }}>
+                            <td style={{ padding: '8px 10px', fontSize: 12, color: 'var(--color-text-muted)' }}>
+                              {h.fecha.substring(0, 16)}
+                            </td>
+                            <td className="mono" style={{ padding: '8px 10px', textAlign: 'right', color: 'var(--color-text-dim)' }}>
+                              ${h.precio_anterior.toFixed(2)}
+                            </td>
+                            <td className="mono" style={{ padding: '8px 10px', textAlign: 'right', fontWeight: 700, color: 'var(--color-text)' }}>
+                              ${h.precio_nuevo.toFixed(2)}
+                            </td>
+                            <td className="mono" style={{
+                              padding: '8px 10px', textAlign: 'right', fontWeight: 600,
+                              color: esSuba ? 'var(--color-success, #22c55e)' : 'var(--color-danger)',
+                            }}>
+                              {esSuba ? '▲' : '▼'} {Math.abs(pct).toFixed(1)}%
+                            </td>
+                            <td style={{ padding: '8px 10px', fontSize: 12 }}>{h.usuario_nombre}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          ) : (
           <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
             {/* Nombre */}
             <div>
@@ -246,6 +364,7 @@ export default function Catalogo() {
               </button>
             </div>
           </form>
+          )}
         </div>
       </div>
     );

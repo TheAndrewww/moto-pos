@@ -1,6 +1,6 @@
 // utils/print.ts — Impresión híbrida: WebView (Windows) → Navegador fallback (macOS)
 
-import { invoke } from '@tauri-apps/api/core';
+import { invoke } from '../lib/invokeCompat';
 
 export async function printHTML(html: string): Promise<void> {
   // Intentar primero con WebView (funciona en Windows/WebView2)

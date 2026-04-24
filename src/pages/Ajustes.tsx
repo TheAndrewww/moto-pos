@@ -1,9 +1,17 @@
 // pages/Ajustes.tsx — Configuración del negocio (datos para tickets)
 
 import { useState, useEffect } from 'react';
-import { invoke } from '@tauri-apps/api/core';
-import { Settings, Save, Printer, CheckCircle2, Database, Download, Upload, RefreshCw, AlertTriangle } from 'lucide-react';
+import { invoke } from '../lib/invokeCompat';
+import { Settings, Save, Printer, CheckCircle2, Database, Download, Upload, RefreshCw, AlertTriangle, Clock, ToggleLeft, ToggleRight } from 'lucide-react';
 import { imprimirTicket, type ConfigNegocio } from '../utils/ticket';
+
+// Extensión local de ConfigNegocio con campos de respaldo automático
+// Estos campos se persisten vía actualizar_config_negocio una vez que Track A los agregue al struct Rust.
+// Mientras tanto, se manejan con fallback local.
+interface ConfigNegocioExtended extends ConfigNegocio {
+  respaldo_auto_activo?: boolean;
+  respaldo_auto_hora?: string;
+}
 
 interface Respaldo {
   nombre: string;
@@ -12,10 +20,18 @@ interface Respaldo {
   created_at: string;
 }
 
+interface ImpresoraInfo {
+  nombre: string;
+  default: boolean;
+}
+
 export default function Ajustes() {
-  const [config, setConfig] = useState<ConfigNegocio>({
+  const [config, setConfig] = useState<ConfigNegocioExtended>({
     nombre: '', direccion: '', telefono: '', rfc: '', mensaje_pie: '',
+    respaldo_auto_activo: false, respaldo_auto_hora: '23:00',
+    impresora_termica: '',
   });
+  const [impresoras, setImpresoras] = useState<ImpresoraInfo[]>([]);
   const [cargando, setCargando] = useState(true);
   const [guardando, setGuardando] = useState(false);
   const [guardado, setGuardado] = useState(false);
@@ -33,11 +49,18 @@ export default function Ajustes() {
   };
 
   useEffect(() => {
-    invoke<ConfigNegocio>('obtener_config_negocio')
-      .then(c => setConfig(c))
+    invoke<ConfigNegocioExtended>('obtener_config_negocio')
+      .then(c => setConfig(prev => ({
+        ...prev,
+        ...c,
+        respaldo_auto_activo: (c as any).respaldo_auto_activo ?? prev.respaldo_auto_activo,
+        respaldo_auto_hora: (c as any).respaldo_auto_hora ?? prev.respaldo_auto_hora,
+        impresora_termica: (c as any).impresora_termica ?? '',
+      })))
       .catch(() => {})
       .finally(() => setCargando(false));
     cargarRespaldos();
+    invoke<ImpresoraInfo[]>('listar_impresoras').then(setImpresoras).catch(() => {});
   }, []);
 
   const handleCrearRespaldo = async () => {
@@ -75,8 +98,8 @@ export default function Ajustes() {
   const handleGuardar = async () => {
     setGuardando(true);
     try {
-      const actualizado = await invoke<ConfigNegocio>('actualizar_config_negocio', { datos: config });
-      setConfig(actualizado);
+      const actualizado = await invoke<ConfigNegocioExtended>('actualizar_config_negocio', { datos: config });
+      setConfig(prev => ({ ...prev, ...actualizado }));
       setGuardado(true);
       setTimeout(() => setGuardado(false), 2000);
     } catch (e: any) {
@@ -109,7 +132,7 @@ export default function Ajustes() {
     return <div style={{ padding: 40, textAlign: 'center', color: 'var(--color-text-dim)' }}>Cargando...</div>;
   }
 
-  const setField = <K extends keyof ConfigNegocio>(k: K, v: ConfigNegocio[K]) =>
+  const setField = <K extends keyof ConfigNegocioExtended>(k: K, v: ConfigNegocioExtended[K]) =>
     setConfig(prev => ({ ...prev, [k]: v }));
 
   return (
@@ -133,7 +156,7 @@ export default function Ajustes() {
             <Campo label="Nombre del negocio *"
               value={config.nombre}
               onChange={v => setField('nombre', v)}
-              placeholder="Moto Refaccionaria" />
+              placeholder="Moto Refaccionaria LB" />
 
             <Campo label="Dirección"
               value={config.direccion}
@@ -154,6 +177,41 @@ export default function Ajustes() {
               value={config.mensaje_pie}
               onChange={v => setField('mensaje_pie', v)}
               placeholder="¡Gracias por su compra!" />
+          </section>
+
+          <section className="card" style={{ padding: 20 }}>
+            <h3 style={{ fontSize: 14, fontWeight: 700, marginBottom: 4, display: 'flex', alignItems: 'center', gap: 6 }}>
+              <Printer size={14} /> Impresora térmica
+            </h3>
+            <p style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 16 }}>
+              Al cobrar, el ticket se enviará directo a esta impresora (sin abrir ventana del navegador).
+              Dejar en blanco para usar la impresión HTML en el navegador.
+            </p>
+
+            <label style={{ display: 'block', fontSize: 12, fontWeight: 600, color: 'var(--color-text)', marginBottom: 6 }}>
+              Impresora del sistema
+            </label>
+            <select
+              value={config.impresora_termica || ''}
+              onChange={e => setField('impresora_termica', e.target.value)}
+              style={{
+                width: '100%', padding: '8px 10px', fontSize: 13,
+                border: '1px solid var(--color-border)', borderRadius: 6,
+                background: 'var(--color-surface)', color: 'var(--color-text)',
+              }}
+            >
+              <option value="">— Ninguna (usar HTML en navegador) —</option>
+              {impresoras.map(i => (
+                <option key={i.nombre} value={i.nombre}>
+                  {i.nombre}{i.default ? ' (predeterminada)' : ''}
+                </option>
+              ))}
+            </select>
+            {impresoras.length === 0 && (
+              <p style={{ fontSize: 11, color: 'var(--color-text-muted)', marginTop: 8 }}>
+                No se detectaron impresoras instaladas en el sistema.
+              </p>
+            )}
           </section>
 
           <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
@@ -221,6 +279,73 @@ export default function Ajustes() {
                 ))}
               </div>
             )}
+          </section>
+
+          {/* ─── Sección: Respaldo Automático ─── */}
+          <section className="card" style={{ padding: 20, marginTop: 8 }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+              <h3 style={{ fontSize: 14, fontWeight: 700, display: 'flex', alignItems: 'center', gap: 6 }}>
+                <Clock size={14} /> Respaldo Automático
+              </h3>
+            </div>
+            <p style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 14 }}>
+              Se ejecutará al iniciar la app si han pasado 24h del último respaldo.
+            </p>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+              {/* Toggle activar/desactivar */}
+              <div
+                style={{
+                  display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                  padding: '10px 14px', borderRadius: 8,
+                  background: config.respaldo_auto_activo ? 'rgba(34,197,94,0.08)' : 'var(--color-surface-2)',
+                  border: `1px solid ${config.respaldo_auto_activo ? 'rgba(34,197,94,0.3)' : 'var(--color-border)'}`,
+                  cursor: 'pointer',
+                  transition: 'all 0.2s',
+                }}
+                onClick={() => setField('respaldo_auto_activo', !config.respaldo_auto_activo)}
+              >
+                <div>
+                  <p style={{ fontSize: 13, fontWeight: 600, color: 'var(--color-text)' }}>
+                    Activar respaldo automático diario
+                  </p>
+                  <p style={{ fontSize: 11, color: 'var(--color-text-dim)', marginTop: 2 }}>
+                    {config.respaldo_auto_activo ? 'El respaldo se ejecutará automáticamente' : 'El respaldo está desactivado'}
+                  </p>
+                </div>
+                {config.respaldo_auto_activo
+                  ? <ToggleRight size={28} style={{ color: 'var(--color-success, #22c55e)', flexShrink: 0 }} />
+                  : <ToggleLeft size={28} style={{ color: 'var(--color-text-dim)', flexShrink: 0 }} />
+                }
+              </div>
+
+              {/* Hora preferida */}
+              {config.respaldo_auto_activo && (
+                <div style={{
+                  padding: '10px 14px', borderRadius: 8,
+                  background: 'var(--color-surface-2)',
+                  border: '1px solid var(--color-border)',
+                }}>
+                  <label style={{
+                    display: 'block', fontSize: 11, fontWeight: 600,
+                    color: 'var(--color-text-muted)', marginBottom: 6,
+                    textTransform: 'uppercase', letterSpacing: 0.4,
+                  }}>Hora preferida</label>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                    <input
+                      type="time"
+                      className="input mono"
+                      value={config.respaldo_auto_hora || '23:00'}
+                      onChange={e => setField('respaldo_auto_hora', e.target.value)}
+                      style={{ width: 140 }}
+                    />
+                    <span style={{ fontSize: 12, color: 'var(--color-text-dim)' }}>
+                      El respaldo se intentará a esta hora o al abrir la app.
+                    </span>
+                  </div>
+                </div>
+              )}
+            </div>
           </section>
         </div>
       </div>

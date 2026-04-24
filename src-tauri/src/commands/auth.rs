@@ -3,13 +3,13 @@
 
 use serde::{Deserialize, Serialize};
 use tauri::State;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use rusqlite::Connection;
 use chrono::Utc;
 
 /// Estado compartido de la aplicación
 pub struct AppState {
-    pub db: Mutex<Connection>,
+    pub db: Arc<Mutex<Connection>>,
 }
 
 /// Datos del usuario autenticado

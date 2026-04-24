@@ -1,7 +1,7 @@
 // pages/HistorialVentas.tsx — Historial de ventas + anulación + devoluciones parciales
 
 import { useState, useEffect } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import { invoke } from '../lib/invokeCompat';
 import { useAuthStore } from '../store/authStore';
 import {
   useHistorialStore,

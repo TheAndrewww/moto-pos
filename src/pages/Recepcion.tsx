@@ -1,14 +1,15 @@
-// pages/Recepcion.tsx — Recepción de mercancía (entrada de stock)
+// pages/Recepcion.tsx — Recepción de mercancía (página completa + escaneo)
 
-import { useState, useEffect } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
+import { invoke } from '../lib/invokeCompat';
 import { useProductStore, type Producto } from '../store/productStore';
 import { useAuthStore } from '../store/authStore';
 import {
-  TruckIcon, Plus, X, Search, Eye, RefreshCw, Trash2, PackagePlus,
+  TruckIcon, Plus, Search, Eye, RefreshCw, Trash2, PackagePlus,
+  ArrowLeft, Minus, PlusIcon, Barcode, ClipboardList,
 } from 'lucide-react';
 
-interface Recepcion {
+interface RecepcionRow {
   id: number;
   usuario_nombre: string;
   proveedor_nombre: string | null;
@@ -26,25 +27,48 @@ interface RecepcionDetalle {
   precio_costo: number;
 }
 
+interface OrdenPedido {
+  id: number;
+  proveedor_nombre: string | null;
+  usuario_nombre: string;
+  estado: string;
+  notas: string | null;
+  fecha: string;
+  total_items: number;
+}
+
+interface OrdenDetalle {
+  id: number;
+  producto_id: number;
+  producto_nombre: string;
+  producto_codigo: string;
+  cantidad_pedida: number;
+  cantidad_recibida: number;
+  precio_costo: number;
+}
+
 interface ItemForm {
   producto: Producto;
   cantidad: number;
   precio_costo: number;
+  pedido_cantidad?: number; // cantidad pendiente de la orden, si aplica
 }
+
+type Vista = 'lista' | 'crear' | 'detalle';
 
 export default function Recepcion() {
   const { productos, cargarTodo, proveedores } = useProductStore();
   const { usuario } = useAuthStore();
 
-  const [recepciones, setRecepciones] = useState<Recepcion[]>([]);
+  const [vista, setVista] = useState<Vista>('lista');
+  const [recepciones, setRecepciones] = useState<RecepcionRow[]>([]);
   const [cargando, setCargando] = useState(true);
-  const [showCrear, setShowCrear] = useState(false);
-  const [detalle, setDetalle] = useState<{ recep: Recepcion; items: RecepcionDetalle[] } | null>(null);
+  const [detalle, setDetalle] = useState<{ recep: RecepcionRow; items: RecepcionDetalle[] } | null>(null);
 
   const cargarDatos = async () => {
     setCargando(true);
     try {
-      const data = await invoke<Recepcion[]>('listar_recepciones');
+      const data = await invoke<RecepcionRow[]>('listar_recepciones');
       setRecepciones(data);
     } catch {}
     setCargando(false);
@@ -54,7 +78,6 @@ export default function Recepcion() {
   useEffect(() => { cargarDatos(); }, []);
 
   const fmt = (n: number) => `$${n.toFixed(2)}`;
-
   const formatFecha = (fecha: string) => {
     try {
       const d = new Date(fecha + 'Z');
@@ -62,52 +85,121 @@ export default function Recepcion() {
     } catch { return fecha; }
   };
 
-  const verDetalle = async (r: Recepcion) => {
+  const verDetalle = async (r: RecepcionRow) => {
     try {
       const items = await invoke<RecepcionDetalle[]>('obtener_detalle_recepcion', { recepcionId: r.id });
       setDetalle({ recep: r, items });
+      setVista('detalle');
     } catch {}
   };
 
-  // ─── Form crear recepción ────
+  // ─── Vista: CREAR ────────────────────────────────────────────
 
-  const FormCrear = () => {
+  const VistaCrear = () => {
     const [items, setItems] = useState<ItemForm[]>([]);
     const [proveedorId, setProveedorId] = useState<number | ''>('');
+    const [ordenId, setOrdenId] = useState<number | ''>('');
+    const [ordenes, setOrdenes] = useState<OrdenPedido[]>([]);
     const [notas, setNotas] = useState('');
-    const [busqueda, setBusqueda] = useState('');
     const [guardando, setGuardando] = useState(false);
     const [error, setError] = useState('');
+    const [flash, setFlash] = useState<{ nombre: string; cantidad: number } | null>(null);
+    const [buscarTexto, setBuscarTexto] = useState('');
+    const scanRef = useRef<HTMLInputElement>(null);
 
-    const filtrados = busqueda.length >= 2
-      ? productos.filter(p =>
-          p.nombre.toLowerCase().includes(busqueda.toLowerCase()) ||
-          p.codigo.toLowerCase().includes(busqueda.toLowerCase())
-        ).slice(0, 20)
-      : [];
+    // Cargar órdenes enviadas / parciales
+    useEffect(() => {
+      (async () => {
+        try {
+          const enviadas = await invoke<OrdenPedido[]>('listar_ordenes_pedido', { estadoFiltro: 'enviada' });
+          const parciales = await invoke<OrdenPedido[]>('listar_ordenes_pedido', { estadoFiltro: 'recibida_parcial' });
+          setOrdenes([...enviadas, ...parciales]);
+        } catch {}
+      })();
+    }, []);
 
-    const agregarItem = (prod: Producto) => {
-      const existente = items.findIndex(i => i.producto.id === prod.id);
-      if (existente >= 0) {
-        const n = [...items]; n[existente].cantidad += 1; setItems(n);
-      } else {
-        setItems([...items, { producto: prod, cantidad: 1, precio_costo: prod.precio_costo }]);
-      }
-      setBusqueda('');
+    // Foco permanente en escaneo
+    useEffect(() => {
+      scanRef.current?.focus();
+    }, [items.length]);
+
+    // Al elegir orden: cargar detalle y pre-llenar items con cantidad pendiente
+    const cargarOrden = async (oid: number) => {
+      try {
+        const detalleOrden = await invoke<OrdenDetalle[]>('obtener_detalle_orden', { ordenId: oid });
+        const orden = ordenes.find(o => o.id === oid);
+        const nuevosItems: ItemForm[] = [];
+        for (const d of detalleOrden) {
+          const pendiente = Math.max(0, d.cantidad_pedida - d.cantidad_recibida);
+          if (pendiente <= 0) continue;
+          const prod = productos.find(p => p.id === d.producto_id);
+          if (!prod) continue;
+          nuevosItems.push({
+            producto: prod,
+            cantidad: pendiente,
+            precio_costo: d.precio_costo,
+            pedido_cantidad: pendiente,
+          });
+        }
+        setItems(nuevosItems);
+        // Auto-seleccionar proveedor de la orden
+        if (orden?.proveedor_nombre) {
+          const prov = proveedores.find(p => p.nombre === orden.proveedor_nombre);
+          if (prov) setProveedorId(prov.id);
+        }
+      } catch {}
     };
 
-    const quitarItem = (idx: number) => setItems(items.filter((_, i) => i !== idx));
+    const buscarResultados = useMemo(() => {
+      if (buscarTexto.length < 2) return [];
+      const q = buscarTexto.toLowerCase();
+      return productos.filter(p =>
+        p.nombre.toLowerCase().includes(q) ||
+        p.codigo.toLowerCase().includes(q)
+      ).slice(0, 15);
+    }, [buscarTexto, productos]);
+
+    const agregarProducto = useCallback((prod: Producto, cantidad = 1) => {
+      setItems(prev => {
+        const idx = prev.findIndex(i => i.producto.id === prod.id);
+        if (idx >= 0) {
+          const n = [...prev];
+          n[idx] = { ...n[idx], cantidad: n[idx].cantidad + cantidad };
+          return n;
+        }
+        return [...prev, { producto: prod, cantidad, precio_costo: prod.precio_costo }];
+      });
+      setFlash({ nombre: prod.nombre, cantidad });
+      setTimeout(() => setFlash(null), 1200);
+    }, []);
+
+    const handleScan = (e: React.KeyboardEvent<HTMLInputElement>) => {
+      if (e.key !== 'Enter') return;
+      const code = (e.target as HTMLInputElement).value.trim();
+      if (!code) return;
+      (e.target as HTMLInputElement).value = '';
+      const prod = productos.find(p => p.codigo === code);
+      if (prod) {
+        agregarProducto(prod);
+      } else {
+        setError(`Código no encontrado: ${code}`);
+        setTimeout(() => setError(''), 2500);
+      }
+    };
+
+    const totalCosto = items.reduce((a, i) => a + i.cantidad * i.precio_costo, 0);
+    const totalUnidades = items.reduce((a, i) => a + i.cantidad, 0);
 
     const handleSubmit = async () => {
       if (!usuario) return;
       if (items.length === 0) return setError('Agrega al menos un producto');
-      setGuardando(true);
-      setError('');
+      setGuardando(true); setError('');
       try {
         await invoke('crear_recepcion', {
           recepcion: {
             usuario_id: usuario.id,
             proveedor_id: proveedorId || null,
+            orden_id: ordenId || null,
             notas: notas || null,
             items: items.map(i => ({
               producto_id: i.producto.id,
@@ -116,196 +208,342 @@ export default function Recepcion() {
             })),
           },
         });
-        setShowCrear(false);
-        cargarDatos();
-        cargarTodo(); // Refrescar stock
+        await cargarDatos();
+        await cargarTodo();
+        setVista('lista');
       } catch (err: any) {
-        setError(err?.toString() || 'Error al crear recepción');
+        setError(err?.toString() || 'Error al guardar recepción');
       }
       setGuardando(false);
     };
 
     return (
-      <div style={{
-        position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)',
-        display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 100,
-      }} onClick={() => setShowCrear(false)}>
-        <div className="card animate-fade-in" style={{ width: 650, maxHeight: '90vh', overflow: 'auto', padding: 24 }}
-          onClick={e => e.stopPropagation()}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
-            <h2 style={{ fontSize: 18, fontWeight: 700 }}>📦 Nueva Recepción de Mercancía</h2>
-            <button className="btn btn-ghost btn-sm" onClick={() => setShowCrear(false)}><X size={18} /></button>
-          </div>
-
-          {/* Proveedor */}
-          <div style={{ marginBottom: 16 }}>
-            <label style={labelStyle}>PROVEEDOR</label>
-            <select className="input" value={proveedorId} onChange={e => setProveedorId(e.target.value ? Number(e.target.value) : '')}>
-              <option value="">Sin proveedor</option>
-              {proveedores.map(p => <option key={p.id} value={p.id}>{p.nombre}</option>)}
-            </select>
-          </div>
-
-          {/* Buscar productos */}
-          <div style={{ position: 'relative', marginBottom: 12 }}>
-            <Search size={16} style={{ position: 'absolute', left: 12, top: '50%', transform: 'translateY(-50%)', color: 'var(--color-text-dim)' }} />
-            <input className="input" placeholder="Buscar producto para agregar..."
-              value={busqueda} onChange={e => setBusqueda(e.target.value)}
-              style={{ paddingLeft: 36, width: '100%' }} />
-            {filtrados.length > 0 && (
-              <div className="card" style={{
-                position: 'absolute', top: '100%', left: 0, right: 0, zIndex: 10,
-                maxHeight: 200, overflow: 'auto', padding: 0, marginTop: 4,
-              }}>
-                {filtrados.map(p => (
-                  <button key={p.id} style={{
-                    display: 'flex', justifyContent: 'space-between', width: '100%',
-                    padding: '8px 14px', border: 'none', background: 'transparent',
-                    color: 'var(--color-text)', cursor: 'pointer', borderBottom: '1px solid var(--color-border)',
-                    textAlign: 'left', fontSize: 13,
-                  }}
-                    onMouseEnter={e => (e.currentTarget.style.background = 'var(--color-surface-2)')}
-                    onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
-                    onClick={() => agregarItem(p)}
-                  >
-                    <span><span className="mono" style={{ fontSize: 11, color: 'var(--color-text-dim)' }}>{p.codigo}</span> {p.nombre}</span>
-                    <span style={{ fontSize: 12, color: 'var(--color-text-dim)' }}>Stock: {p.stock_actual}</span>
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
-
-          {/* Items */}
-          {items.length > 0 ? (
-            <div style={{ marginBottom: 16 }}>
-              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
-                <thead>
-                  <tr style={{ background: 'var(--color-surface-2)', fontSize: 11, fontWeight: 600, color: 'var(--color-text-dim)', textTransform: 'uppercase' }}>
-                    <th style={{ padding: '6px 10px', textAlign: 'left' }}>Producto</th>
-                    <th style={{ padding: '6px 10px', width: 80 }}>Cantidad</th>
-                    <th style={{ padding: '6px 10px', width: 100 }}>Costo Unit.</th>
-                    <th style={{ padding: '6px 10px', width: 90, textAlign: 'right' }}>Total</th>
-                    <th style={{ padding: '6px 10px', width: 30 }}></th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {items.map((item, idx) => (
-                    <tr key={idx} style={{ borderBottom: '1px solid var(--color-border)' }}>
-                      <td style={{ padding: '6px 10px' }}>
-                        <div style={{ fontWeight: 600 }}>{item.producto.nombre}</div>
-                        <div className="mono" style={{ fontSize: 11, color: 'var(--color-text-dim)' }}>{item.producto.codigo}</div>
-                      </td>
-                      <td style={{ padding: '6px 10px' }}>
-                        <input className="input mono" type="number" min={1} value={item.cantidad}
-                          style={{ width: 65, padding: '2px 6px', textAlign: 'center' }}
-                          onChange={e => {
-                            const n = [...items]; n[idx] = { ...n[idx], cantidad: Number(e.target.value) || 1 }; setItems(n);
-                          }} />
-                      </td>
-                      <td style={{ padding: '6px 10px' }}>
-                        <input className="input mono" type="number" step="0.01" value={item.precio_costo}
-                          style={{ width: 85, padding: '2px 6px', textAlign: 'right' }}
-                          onChange={e => {
-                            const n = [...items]; n[idx] = { ...n[idx], precio_costo: Number(e.target.value) || 0 }; setItems(n);
-                          }} />
-                      </td>
-                      <td className="mono" style={{ padding: '6px 10px', textAlign: 'right', fontWeight: 700 }}>
-                        {fmt(item.cantidad * item.precio_costo)}
-                      </td>
-                      <td style={{ padding: '6px 10px' }}>
-                        <button className="btn btn-ghost btn-sm" onClick={() => quitarItem(idx)}><Trash2 size={12} /></button>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-              <div style={{ display: 'flex', justifyContent: 'space-between', padding: '10px', borderTop: '2px solid var(--color-border)' }}>
-                <span style={{ fontSize: 13, color: 'var(--color-text-muted)' }}>
-                  {items.reduce((a, i) => a + i.cantidad, 0)} unidades en {items.length} productos
-                </span>
-                <span className="mono" style={{ fontSize: 16, fontWeight: 800, color: 'var(--color-primary)' }}>
-                  Costo total: {fmt(items.reduce((a, i) => a + i.cantidad * i.precio_costo, 0))}
-                </span>
-              </div>
-            </div>
-          ) : (
-            <div style={{ padding: 24, textAlign: 'center', color: 'var(--color-text-dim)', borderRadius: 10, border: '1px dashed var(--color-border)', marginBottom: 16 }}>
-              Busca y agrega los productos recibidos
-            </div>
+      <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
+        <div style={{
+          padding: '10px 20px', borderBottom: '1px solid var(--color-border)',
+          background: 'var(--color-surface)', display: 'flex', alignItems: 'center', gap: 10,
+        }}>
+          <button className="btn btn-ghost btn-sm" onClick={() => setVista('lista')}>
+            <ArrowLeft size={16} /> Volver
+          </button>
+          <TruckIcon size={18} style={{ color: 'var(--color-primary)' }} />
+          <h2 style={{ fontSize: 16, fontWeight: 800 }}>Nueva Recepción</h2>
+          {ordenId && (
+            <span style={{
+              fontSize: 11, fontWeight: 700, padding: '3px 10px', borderRadius: 10,
+              background: 'rgba(108,117,246,0.12)', color: '#6c75f6',
+              display: 'flex', alignItems: 'center', gap: 4,
+            }}>
+              <ClipboardList size={11} /> Contra pedido #{ordenId}
+            </span>
           )}
+        </div>
 
-          {/* Notas */}
-          <div style={{ marginBottom: 16 }}>
-            <label style={labelStyle}>NOTAS</label>
-            <input className="input" placeholder="Notas opcionales..." value={notas} onChange={e => setNotas(e.target.value)} />
+        <div style={{ flex: 1, display: 'grid', gridTemplateColumns: '1fr 380px', minHeight: 0 }}>
+          {/* Izquierda — escaneo + lista */}
+          <div style={{ display: 'flex', flexDirection: 'column', minHeight: 0, borderRight: '1px solid var(--color-border)' }}>
+            {/* Barra de escaneo */}
+            <div style={{ padding: '14px 16px', borderBottom: '1px solid var(--color-border)', background: 'var(--color-surface)' }}>
+              <label style={labelStyle}>
+                <Barcode size={12} style={{ display: 'inline', marginRight: 4, verticalAlign: 'middle' }} />
+                ESCANEAR CÓDIGO
+              </label>
+              <input
+                ref={scanRef}
+                className="input mono"
+                placeholder="Escanea el código del producto…"
+                onKeyDown={handleScan}
+                style={{ fontSize: 18, padding: '10px 14px', textAlign: 'center' }}
+                autoFocus
+              />
+              {flash && (
+                <div style={{
+                  marginTop: 8, padding: '6px 10px', borderRadius: 6,
+                  background: 'rgba(34,179,120,0.15)', color: '#22b378',
+                  fontSize: 13, fontWeight: 600, textAlign: 'center',
+                  animation: 'fade-in 0.15s ease',
+                }}>
+                  + {flash.cantidad} · {flash.nombre}
+                </div>
+              )}
+              {error && !flash && (
+                <div style={{
+                  marginTop: 8, padding: '6px 10px', borderRadius: 6,
+                  background: 'rgba(220,53,69,0.12)', color: 'var(--color-danger)',
+                  fontSize: 12, textAlign: 'center',
+                }}>
+                  {error}
+                </div>
+              )}
+            </div>
+
+            {/* Buscador manual (fallback) */}
+            <div style={{ padding: '10px 16px', borderBottom: '1px solid var(--color-border)', position: 'relative' }}>
+              <div style={{ position: 'relative' }}>
+                <Search size={14} style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: 'var(--color-text-dim)' }} />
+                <input className="input"
+                  placeholder="¿No escanea? Buscar por nombre…"
+                  value={buscarTexto}
+                  onChange={e => setBuscarTexto(e.target.value)}
+                  style={{ paddingLeft: 30, fontSize: 12 }} />
+              </div>
+              {buscarResultados.length > 0 && (
+                <div className="card" style={{
+                  position: 'absolute', top: '100%', left: 16, right: 16, zIndex: 10,
+                  maxHeight: 260, overflow: 'auto', padding: 0, marginTop: 2,
+                }}>
+                  {buscarResultados.map(p => (
+                    <button key={p.id}
+                      onClick={() => { agregarProducto(p); setBuscarTexto(''); scanRef.current?.focus(); }}
+                      style={{
+                        display: 'flex', justifyContent: 'space-between', width: '100%',
+                        padding: '8px 12px', border: 'none', background: 'transparent',
+                        color: 'var(--color-text)', cursor: 'pointer',
+                        borderBottom: '1px solid var(--color-border)',
+                        textAlign: 'left', fontSize: 12,
+                      }}
+                      onMouseEnter={e => (e.currentTarget.style.background = 'var(--color-surface-2)')}
+                      onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
+                    >
+                      <span><span className="mono" style={{ fontSize: 10, color: 'var(--color-text-dim)' }}>{p.codigo}</span> {p.nombre}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* Lista de items escaneados */}
+            <div style={{ flex: 1, overflow: 'auto' }}>
+              {items.length === 0 ? (
+                <div style={{ padding: 40, textAlign: 'center', color: 'var(--color-text-dim)' }}>
+                  <PackagePlus size={48} strokeWidth={1.2} style={{ marginBottom: 12 }} />
+                  <p style={{ fontSize: 14, fontWeight: 600 }}>Escanea o busca productos para registrarlos</p>
+                  <p style={{ fontSize: 12 }}>Los productos se sumarán al stock cuando confirmes</p>
+                </div>
+              ) : (
+                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+                  <thead style={{ position: 'sticky', top: 0, background: 'var(--color-surface-2)', zIndex: 1 }}>
+                    <tr style={{ fontSize: 10, fontWeight: 600, color: 'var(--color-text-dim)', textTransform: 'uppercase' }}>
+                      <th style={{ padding: '8px 12px', textAlign: 'left' }}>Producto</th>
+                      <th style={{ padding: '8px 6px', width: 120 }}>Cantidad</th>
+                      {ordenId && <th style={{ padding: '8px 6px', width: 70 }}>Pedido</th>}
+                      <th style={{ padding: '8px 8px', width: 90 }}>Costo</th>
+                      <th style={{ padding: '8px 12px', width: 80, textAlign: 'right' }}>Total</th>
+                      <th style={{ width: 28 }}></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {items.map((item, idx) => {
+                      const excede = item.pedido_cantidad !== undefined && item.cantidad > item.pedido_cantidad;
+                      return (
+                        <tr key={idx} style={{ borderBottom: '1px solid var(--color-border)' }}>
+                          <td style={{ padding: '8px 12px' }}>
+                            <div style={{ fontWeight: 600, fontSize: 13 }}>{item.producto.nombre}</div>
+                            <div className="mono" style={{ fontSize: 11, color: 'var(--color-text-dim)' }}>{item.producto.codigo}</div>
+                          </td>
+                          <td style={{ padding: '4px 6px' }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 2, justifyContent: 'center' }}>
+                              <button className="btn btn-ghost btn-sm" style={{ padding: '2px 4px' }}
+                                onClick={() => {
+                                  const n = [...items]; const c = Math.max(1, n[idx].cantidad - 1);
+                                  n[idx] = { ...n[idx], cantidad: c }; setItems(n);
+                                }}>
+                                <Minus size={12} />
+                              </button>
+                              <input className="input mono" type="number" min={1} value={item.cantidad}
+                                style={{ width: 52, padding: '2px 4px', textAlign: 'center', fontSize: 13 }}
+                                onChange={e => { const n = [...items]; n[idx] = { ...n[idx], cantidad: Number(e.target.value) || 1 }; setItems(n); }} />
+                              <button className="btn btn-ghost btn-sm" style={{ padding: '2px 4px' }}
+                                onClick={() => { const n = [...items]; n[idx] = { ...n[idx], cantidad: n[idx].cantidad + 1 }; setItems(n); }}>
+                                <PlusIcon size={12} />
+                              </button>
+                            </div>
+                          </td>
+                          {ordenId && (
+                            <td className="mono" style={{ padding: '4px 6px', textAlign: 'center', fontSize: 12,
+                              color: excede ? 'var(--color-warning)' : 'var(--color-text-dim)' }}>
+                              {item.pedido_cantidad ?? '—'}
+                            </td>
+                          )}
+                          <td style={{ padding: '4px 8px' }}>
+                            <input className="input mono" type="number" step="0.01" value={item.precio_costo}
+                              style={{ width: 78, padding: '2px 6px', textAlign: 'right', fontSize: 12 }}
+                              onChange={e => { const n = [...items]; n[idx] = { ...n[idx], precio_costo: Number(e.target.value) || 0 }; setItems(n); }} />
+                          </td>
+                          <td className="mono" style={{ padding: '8px 12px', textAlign: 'right', fontWeight: 700, color: 'var(--color-primary)' }}>
+                            {fmt(item.cantidad * item.precio_costo)}
+                          </td>
+                          <td style={{ padding: '4px' }}>
+                            <button className="btn btn-ghost btn-sm" style={{ padding: '2px 4px', color: 'var(--color-danger)' }}
+                              onClick={() => setItems(items.filter((_, i) => i !== idx))}>
+                              <Trash2 size={12} />
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              )}
+            </div>
           </div>
 
-          {error && <p style={{ color: 'var(--color-danger)', fontSize: 13, marginBottom: 8 }}>{error}</p>}
+          {/* Derecha — resumen / metadatos */}
+          <div style={{ display: 'flex', flexDirection: 'column', minHeight: 0, background: 'var(--color-surface)' }}>
+            <div style={{ padding: '14px 16px', display: 'flex', flexDirection: 'column', gap: 12, flex: 1, overflow: 'auto' }}>
+              <div>
+                <label style={labelStyle}>RECIBIR CONTRA PEDIDO (OPCIONAL)</label>
+                <select className="input" value={ordenId}
+                  onChange={e => {
+                    const val = e.target.value ? Number(e.target.value) : '';
+                    if (items.length > 0 && val !== ordenId) {
+                      if (!confirm('Cambiar el pedido vinculado reemplazará los items actuales. ¿Continuar?')) return;
+                      setItems([]);
+                    }
+                    setOrdenId(val);
+                    if (val) cargarOrden(val);
+                  }}>
+                  <option value="">Recepción libre (sin pedido previo)</option>
+                  {ordenes.map(o => (
+                    <option key={o.id} value={o.id}>
+                      #{o.id} · {o.proveedor_nombre || 'Sin proveedor'} · {o.total_items} items
+                    </option>
+                  ))}
+                </select>
+                {ordenId && (
+                  <p style={{ fontSize: 11, color: 'var(--color-text-dim)', marginTop: 4 }}>
+                    Las cantidades pendientes se pre-llenaron. Al confirmar, se marcará el pedido como recibido (total o parcial).
+                  </p>
+                )}
+              </div>
 
-          <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
-            <button className="btn btn-ghost" onClick={() => setShowCrear(false)}>Cancelar</button>
-            <button className="btn btn-primary" disabled={guardando || items.length === 0} onClick={handleSubmit}>
-              <PackagePlus size={16} /> {guardando ? 'Guardando...' : 'Confirmar Recepción'}
-            </button>
+              <div>
+                <label style={labelStyle}>PROVEEDOR</label>
+                <select className="input" value={proveedorId}
+                  onChange={e => setProveedorId(e.target.value ? Number(e.target.value) : '')}
+                  disabled={!!ordenId}>
+                  <option value="">Sin proveedor</option>
+                  {proveedores.map(p => <option key={p.id} value={p.id}>{p.nombre}</option>)}
+                </select>
+              </div>
+
+              <div>
+                <label style={labelStyle}>NOTAS (FACTURA, REMISIÓN…)</label>
+                <input className="input" placeholder="Ej. Factura #123 - 15 cajas" value={notas} onChange={e => setNotas(e.target.value)} />
+              </div>
+
+              {/* Totales */}
+              <div style={{ marginTop: 'auto', display: 'flex', flexDirection: 'column', gap: 6, padding: 12, background: 'var(--color-surface-2)', borderRadius: 8 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12 }}>
+                  <span style={{ color: 'var(--color-text-muted)' }}>Productos</span>
+                  <span className="mono" style={{ fontWeight: 700 }}>{items.length}</span>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12 }}>
+                  <span style={{ color: 'var(--color-text-muted)' }}>Unidades totales</span>
+                  <span className="mono" style={{ fontWeight: 700 }}>{totalUnidades}</span>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 14, fontWeight: 700, marginTop: 4, paddingTop: 6, borderTop: '1px solid var(--color-border)' }}>
+                  <span style={{ color: 'var(--color-text-muted)' }}>Costo total</span>
+                  <span className="mono" style={{ color: 'var(--color-primary)', fontSize: 17 }}>{fmt(totalCosto)}</span>
+                </div>
+              </div>
+            </div>
+
+            {error && !flash && (
+              <p style={{ color: 'var(--color-danger)', fontSize: 12, padding: '0 16px 8px' }}>{error}</p>
+            )}
+
+            <div style={{ padding: '12px 16px', borderTop: '1px solid var(--color-border)' }}>
+              <button className="btn btn-success btn-lg" style={{ width: '100%', justifyContent: 'center' }}
+                disabled={guardando || items.length === 0} onClick={handleSubmit}>
+                <PackagePlus size={16} />
+                {guardando ? 'Guardando…' : `Confirmar Recepción (${totalUnidades} uds)`}
+              </button>
+            </div>
           </div>
         </div>
       </div>
     );
   };
 
-  // ─── Modal detalle ────
+  // ─── Vista: DETALLE ──────────────────────────────────────────
 
-  const ModalDetalle = () => {
+  const VistaDetalle = () => {
     if (!detalle) return null;
     const { recep, items } = detalle;
+    const totalCosto = items.reduce((a, i) => a + i.cantidad * i.precio_costo, 0);
+    const totalUnidades = items.reduce((a, i) => a + i.cantidad, 0);
+
     return (
-      <div style={{
-        position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)',
-        display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 100,
-      }} onClick={() => setDetalle(null)}>
-        <div className="card animate-fade-in" style={{ width: 550, maxHeight: '85vh', overflow: 'auto', padding: 24 }}
-          onClick={e => e.stopPropagation()}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
-            <div>
-              <h2 style={{ fontSize: 18, fontWeight: 700 }}>Recepción #{recep.id}</h2>
-              <p style={{ fontSize: 12, color: 'var(--color-text-dim)' }}>
-                {formatFecha(recep.fecha)} · {recep.usuario_nombre}
-                {recep.proveedor_nombre && ` · ${recep.proveedor_nombre}`}
-              </p>
-            </div>
-            <button className="btn btn-ghost btn-sm" onClick={() => setDetalle(null)}><X size={18} /></button>
+      <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
+        <div style={{
+          padding: '10px 20px', borderBottom: '1px solid var(--color-border)',
+          background: 'var(--color-surface)', display: 'flex', alignItems: 'center', gap: 10,
+        }}>
+          <button className="btn btn-ghost btn-sm" onClick={() => { setDetalle(null); setVista('lista'); }}>
+            <ArrowLeft size={16} /> Volver
+          </button>
+          <TruckIcon size={18} style={{ color: 'var(--color-primary)' }} />
+          <h2 style={{ fontSize: 16, fontWeight: 800 }}>Recepción #{recep.id}</h2>
+        </div>
+
+        <div style={{ flex: 1, overflow: 'auto', padding: 20 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12, marginBottom: 20 }}>
+            <Tile label="Fecha" value={formatFecha(recep.fecha)} />
+            <Tile label="Proveedor" value={recep.proveedor_nombre || '—'} />
+            <Tile label="Recibió" value={recep.usuario_nombre} />
+            <Tile label="Costo total" value={fmt(totalCosto)} highlight />
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 12, marginBottom: 16 }}>
+            <Tile label="Productos" value={String(items.length)} />
+            <Tile label="Unidades" value={String(totalUnidades)} />
           </div>
 
-          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
-            <thead>
-              <tr style={{ background: 'var(--color-surface-2)', fontSize: 11, fontWeight: 600, color: 'var(--color-text-dim)', textTransform: 'uppercase' }}>
-                <th style={{ padding: '6px 10px', textAlign: 'left' }}>Producto</th>
-                <th style={{ padding: '6px 10px' }}>Cantidad</th>
-                <th style={{ padding: '6px 10px', textAlign: 'right' }}>Costo</th>
-              </tr>
-            </thead>
-            <tbody>
-              {items.map(i => (
-                <tr key={i.id} style={{ borderBottom: '1px solid var(--color-border)' }}>
-                  <td style={{ padding: '6px 10px' }}>
-                    <div style={{ fontWeight: 600 }}>{i.producto_nombre}</div>
-                    <div className="mono" style={{ fontSize: 11, color: 'var(--color-text-dim)' }}>{i.producto_codigo}</div>
-                  </td>
-                  <td className="mono" style={{ padding: '6px 10px', textAlign: 'center', fontWeight: 700, color: 'var(--color-success)' }}>+{i.cantidad}</td>
-                  <td className="mono" style={{ padding: '6px 10px', textAlign: 'right' }}>{fmt(i.precio_costo)}</td>
+          <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+              <thead>
+                <tr style={{ background: 'var(--color-surface-2)', fontSize: 11, fontWeight: 600, color: 'var(--color-text-dim)', textTransform: 'uppercase' }}>
+                  <th style={{ padding: '8px 12px', textAlign: 'left' }}>Producto</th>
+                  <th style={{ padding: '8px 12px' }}>Cantidad</th>
+                  <th style={{ padding: '8px 12px' }}>Costo</th>
+                  <th style={{ padding: '8px 12px', textAlign: 'right' }}>Total</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {items.map(i => (
+                  <tr key={i.id} style={{ borderBottom: '1px solid var(--color-border)' }}>
+                    <td style={{ padding: '8px 12px' }}>
+                      <div style={{ fontWeight: 600 }}>{i.producto_nombre}</div>
+                      <div className="mono" style={{ fontSize: 11, color: 'var(--color-text-dim)' }}>{i.producto_codigo}</div>
+                    </td>
+                    <td className="mono" style={{ padding: '8px 12px', textAlign: 'center', fontWeight: 700, color: '#22b378' }}>
+                      +{i.cantidad}
+                    </td>
+                    <td className="mono" style={{ padding: '8px 12px', textAlign: 'center' }}>{fmt(i.precio_costo)}</td>
+                    <td className="mono" style={{ padding: '8px 12px', textAlign: 'right', fontWeight: 700 }}>
+                      {fmt(i.cantidad * i.precio_costo)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
 
-          {recep.notas && <p style={{ fontSize: 12, color: 'var(--color-text-muted)', marginTop: 12 }}>📝 {recep.notas}</p>}
+          {recep.notas && (
+            <div className="card" style={{ padding: 12, marginTop: 14 }}>
+              <div style={labelStyle}>NOTAS</div>
+              <p style={{ fontSize: 13, color: 'var(--color-text-muted)' }}>{recep.notas}</p>
+            </div>
+          )}
         </div>
       </div>
     );
   };
 
-  // ─── Render ────
+  // ─── Vista: LISTA ────────────────────────────────────────────
+
+  if (vista === 'crear') return <VistaCrear />;
+  if (vista === 'detalle') return <VistaDetalle />;
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
@@ -321,7 +559,7 @@ export default function Recepcion() {
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
           <button className="btn btn-ghost" onClick={cargarDatos}><RefreshCw size={14} /></button>
-          <button className="btn btn-primary" onClick={() => setShowCrear(true)}>
+          <button className="btn btn-primary" onClick={() => setVista('crear')}>
             <Plus size={16} /> Nueva Recepción
           </button>
         </div>
@@ -336,7 +574,9 @@ export default function Recepcion() {
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', flexDirection: 'column', gap: 12, color: 'var(--color-text-dim)' }}>
             <TruckIcon size={48} strokeWidth={1.2} />
             <p style={{ fontSize: 16, fontWeight: 600 }}>No hay recepciones</p>
-            <p style={{ fontSize: 13 }}>Registra la primera entrada de mercancía</p>
+            <button className="btn btn-primary" onClick={() => setVista('crear')}>
+              <Plus size={16} /> Registrar primera
+            </button>
           </div>
         ) : (
           <div style={{ display: 'flex', flexDirection: 'column' }}>
@@ -373,14 +613,26 @@ export default function Recepcion() {
           </div>
         )}
       </div>
-
-      {showCrear && <FormCrear />}
-      {detalle && <ModalDetalle />}
     </div>
   );
 }
+
+// ─── helpers ────────────────────────────────────────────────
 
 const labelStyle: React.CSSProperties = {
   fontSize: 11, fontWeight: 600, color: 'var(--color-text-muted)',
   display: 'block', marginBottom: 4, textTransform: 'uppercase', letterSpacing: '0.3px',
 };
+
+function Tile({ label, value, highlight }: { label: string; value: string; highlight?: boolean | 'warn' | 'ok' }) {
+  const color = highlight === true ? 'var(--color-primary)'
+    : highlight === 'warn' ? 'var(--color-warning)'
+    : highlight === 'ok' ? '#22b378'
+    : 'var(--color-text)';
+  return (
+    <div className="card" style={{ padding: 12 }}>
+      <div style={labelStyle}>{label}</div>
+      <div className="mono" style={{ fontSize: 16, fontWeight: 700, color }}>{value}</div>
+    </div>
+  );
+}

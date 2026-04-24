@@ -3,7 +3,7 @@ name: Build Windows x64
 on:
   push:
     branches: [main]
-  workflow_dispatch:
+  workflow_dispatch: # Permite ejecutar manualmente desde GitHub
 
 jobs:
   build-windows:

@@ -1,9 +1,38 @@
 // pages/Etiquetas.tsx — Generador de etiquetas de precio
 
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useMemo } from 'react';
 import { useProductStore, type Producto } from '../store/productStore';
 import { Tag, Search, Printer, X, Trash2 } from 'lucide-react';
 import { printHTML, escapeHTML } from '../utils/print';
+import QRCode from 'qrcode';
+
+const QR_OPTS: QRCode.QRCodeToDataURLOptions = {
+  errorCorrectionLevel: 'M',
+  margin: 0,
+  width: 160,
+  color: { dark: '#000000', light: '#ffffff' },
+};
+
+function useQrCache(codigos: string[]) {
+  const [cache, setCache] = useState<Record<string, string>>({});
+  const key = useMemo(() => codigos.join('|'), [codigos]);
+  useEffect(() => {
+    let cancelado = false;
+    const faltantes = codigos.filter(c => !cache[c]);
+    if (faltantes.length === 0) return;
+    Promise.all(faltantes.map(async c => [c, await QRCode.toDataURL(c, QR_OPTS)] as const))
+      .then(pares => {
+        if (cancelado) return;
+        setCache(prev => {
+          const next = { ...prev };
+          for (const [c, url] of pares) next[c] = url;
+          return next;
+        });
+      });
+    return () => { cancelado = true; };
+  }, [key]);
+  return cache;
+}
 
 export default function Etiquetas() {
   const { productos, cargarTodo } = useProductStore();
@@ -37,27 +66,42 @@ export default function Etiquetas() {
     Array.from({ length: s.cantidad }, () => s.producto)
   );
 
+  const codigosUnicos = useMemo(
+    () => Array.from(new Set(seleccionados.map(s => s.producto.codigo))),
+    [seleccionados],
+  );
+  const qrCache = useQrCache(codigosUnicos);
+
   const handlePrint = async () => {
     if (etiquetas.length === 0) return;
+    const qrMap: Record<string, string> = {};
+    await Promise.all(
+      codigosUnicos.map(async c => { qrMap[c] = await QRCode.toDataURL(c, QR_OPTS); })
+    );
     const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Etiquetas</title>
       <style>
         @page { margin: 2mm; }
         html, body { margin: 0; padding: 0; font-family: Arial, sans-serif; }
         .etiqueta {
           width: 50mm; height: 25mm; border: 0.3mm dashed #ccc;
-          padding: 2mm; display: inline-flex; flex-direction: column;
-          justify-content: center; align-items: center; text-align: center;
+          padding: 2mm; display: inline-flex; align-items: center; gap: 2mm;
           page-break-inside: avoid; box-sizing: border-box;
         }
-        .nombre { font-size: 8pt; font-weight: 700; margin-bottom: 1mm; line-height: 1.2; }
-        .precio { font-size: 14pt; font-weight: 900; }
-        .codigo { font-size: 7pt; color: #666; font-family: monospace; }
+        .qr { width: 20mm; height: 20mm; flex-shrink: 0; }
+        .info { flex: 1; display: flex; flex-direction: column; justify-content: center; text-align: left; overflow: hidden; }
+        .nombre { font-size: 7pt; font-weight: 700; line-height: 1.1; margin-bottom: 0.5mm;
+                  overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+        .precio { font-size: 13pt; font-weight: 900; line-height: 1; }
+        .codigo { font-size: 6pt; color: #666; font-family: monospace; margin-top: 0.5mm; }
       </style></head><body>
       ${etiquetas.map(p => `
         <div class="etiqueta">
-          <div class="nombre">${escapeHTML(p.nombre)}</div>
-          <div class="precio">${fmt(p.precio_venta)}</div>
-          <div class="codigo">${escapeHTML(p.codigo)}</div>
+          <img class="qr" src="${qrMap[p.codigo]}" alt="${escapeHTML(p.codigo)}" />
+          <div class="info">
+            <div class="nombre">${escapeHTML(p.nombre)}</div>
+            <div class="precio">${fmt(p.precio_venta)}</div>
+            <div class="codigo">${escapeHTML(p.codigo)}</div>
+          </div>
         </div>
       `).join('')}
       </body></html>`;
@@ -165,22 +209,29 @@ export default function Etiquetas() {
                 <div key={idx} style={{
                   width: 190, height: 95,
                   border: '1px dashed var(--color-border)',
-                  borderRadius: 6, padding: '8px 10px',
-                  display: 'flex', flexDirection: 'column',
-                  justifyContent: 'center', alignItems: 'center',
-                  textAlign: 'center', background: '#fff',
+                  borderRadius: 6, padding: '6px 8px',
+                  display: 'flex', alignItems: 'center', gap: 8,
+                  background: '#fff',
                 }}>
-                  <div style={{
-                    fontSize: 11, fontWeight: 700, color: '#333',
-                    lineHeight: 1.2, marginBottom: 4,
-                    overflow: 'hidden', display: '-webkit-box',
-                    WebkitLineClamp: 2, WebkitBoxOrient: 'vertical',
-                  }}>{p.nombre}</div>
-                  <div className="mono" style={{ fontSize: 22, fontWeight: 900, color: '#000' }}>
-                    {fmt(p.precio_venta)}
-                  </div>
-                  <div className="mono" style={{ fontSize: 9, color: '#888', marginTop: 2 }}>
-                    {p.codigo}
+                  {qrCache[p.codigo] ? (
+                    <img src={qrCache[p.codigo]} alt={p.codigo}
+                      style={{ width: 76, height: 76, flexShrink: 0 }} />
+                  ) : (
+                    <div style={{ width: 76, height: 76, flexShrink: 0, background: '#f0f0f0' }} />
+                  )}
+                  <div style={{ flex: 1, overflow: 'hidden' }}>
+                    <div style={{
+                      fontSize: 10, fontWeight: 700, color: '#333',
+                      lineHeight: 1.15, marginBottom: 2,
+                      overflow: 'hidden', display: '-webkit-box',
+                      WebkitLineClamp: 2, WebkitBoxOrient: 'vertical',
+                    }}>{p.nombre}</div>
+                    <div className="mono" style={{ fontSize: 18, fontWeight: 900, color: '#000', lineHeight: 1 }}>
+                      {fmt(p.precio_venta)}
+                    </div>
+                    <div className="mono" style={{ fontSize: 8, color: '#888', marginTop: 2, wordBreak: 'break-all' }}>
+                      {p.codigo}
+                    </div>
                   </div>
                 </div>
               ))}

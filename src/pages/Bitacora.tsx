@@ -1,7 +1,7 @@
 // pages/Bitacora.tsx — Visor de auditoría del sistema
 
 import { useState, useEffect } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import { invoke } from '../lib/invokeCompat';
 import { ScrollText, Search, RefreshCw, Filter } from 'lucide-react';
 
 interface EntradaBitacora {

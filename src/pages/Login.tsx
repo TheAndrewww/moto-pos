@@ -85,18 +85,13 @@ export default function Login() {
       <div className="flex flex-col items-center gap-8 animate-fade-in" style={{ width: 380 }}>
 
         {/* Logo */}
-        <div className="text-center">
-          <div className="flex items-center justify-center gap-3 mb-2">
-            <span style={{ fontSize: 36 }}>🏍️</span>
-            <h1 style={{
-              fontSize: 22,
-              fontWeight: 800,
-              color: 'var(--color-text)',
-              letterSpacing: '-0.5px',
-            }}>
-              MOTO REFACCIONARIA
-            </h1>
-          </div>
+        <div className="text-center" style={{ display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
+          <img
+            src="/logo.png"
+            alt="Moto Refaccionaria LB"
+            style={{ width: 180, height: 'auto', marginBottom: 8 }}
+            draggable={false}
+          />
           <p style={{ color: 'var(--color-text-muted)', fontSize: 13 }}>
             Sistema de Punto de Venta
           </p>

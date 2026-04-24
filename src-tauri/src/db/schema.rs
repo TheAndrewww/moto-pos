@@ -386,6 +386,21 @@ CREATE TABLE IF NOT EXISTS devolucion_folio_secuencia (
 );
 
 -- ============================================================
+-- DISPOSITIVOS MÓVILES CONECTADOS (Fase 3.1)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS dispositivos_conectados (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    nombre        TEXT NOT NULL,
+    user_agent    TEXT,
+    usuario_id    INTEGER NOT NULL REFERENCES usuarios(id),
+    jwt_jti       TEXT NOT NULL UNIQUE,
+    ultimo_ping   TEXT,
+    ip_ultima     TEXT,
+    created_at    TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+    revocado      INTEGER NOT NULL DEFAULT 0
+);
+
+-- ============================================================
 -- ÍNDICES (velocidad crítica del POS)
 -- ============================================================
 CREATE INDEX IF NOT EXISTS idx_productos_codigo     ON productos(codigo);
@@ -407,6 +422,8 @@ CREATE INDEX IF NOT EXISTS idx_devoluciones_venta   ON devoluciones(venta_id);
 CREATE INDEX IF NOT EXISTS idx_devoluciones_fecha   ON devoluciones(fecha);
 CREATE INDEX IF NOT EXISTS idx_devdet_devolucion    ON devolucion_detalle(devolucion_id);
 CREATE INDEX IF NOT EXISTS idx_devdet_vdetalle      ON devolucion_detalle(venta_detalle_id);
+CREATE INDEX IF NOT EXISTS idx_disp_jti              ON dispositivos_conectados(jwt_jti);
+CREATE INDEX IF NOT EXISTS idx_disp_usuario          ON dispositivos_conectados(usuario_id);
 "#;
 
 /// Datos iniciales del sistema (roles, permisos, config)

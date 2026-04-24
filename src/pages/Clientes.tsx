@@ -1,7 +1,7 @@
 // pages/Clientes.tsx — Gestión de clientes (CRUD + tipo de precio + estado)
 
 import { useState, useEffect } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import { invoke } from '../lib/invokeCompat';
 import { UserPlus, Plus, Edit2, X, ShieldCheck, ShieldOff, Search } from 'lucide-react';
 
 interface ClienteInfo {

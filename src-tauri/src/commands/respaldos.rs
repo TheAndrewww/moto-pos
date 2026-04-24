@@ -145,12 +145,27 @@ pub fn restaurar_respaldo(
     Ok(())
 }
 
-/// Se llama al iniciar la app. Solo crea respaldo si no hay uno de hoy.
+/// Se llama al iniciar la app. Solo crea respaldo si no hay uno de hoy
+/// y si el respaldo automático está activado en config_negocio.
 #[tauri::command]
 pub fn respaldo_auto_si_necesario(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Option<Respaldo>, String> {
+    // Verificar si el respaldo automático está activado
+    {
+        let db = state.db.lock().unwrap();
+        let activo: i64 = db.query_row(
+            "SELECT respaldo_auto_activo FROM config_negocio WHERE id = 1",
+            [],
+            |r| r.get(0),
+        ).unwrap_or(1);
+        if activo == 0 {
+            log::info!("Respaldo automático desactivado en config_negocio");
+            return Ok(None);
+        }
+    }
+
     let dir = backups_dir(&app)?;
     let hoy = Local::now().format("%Y%m%d").to_string();
     let prefijo_hoy = format!("pos_backup_{hoy}_");
@@ -162,7 +177,38 @@ pub fn respaldo_auto_si_necesario(
     let r = crear_respaldo_en(&dir, &db)?;
     drop(db);
     rotar(&dir);
+    log::info!("Respaldo automático creado: {}", r.nombre);
     Ok(Some(r))
+}
+
+/// Helper llamado desde `setup()` de Tauri al arranque.
+/// Idéntico a `respaldo_auto_si_necesario` pero sin el tipo State (usa la Mutex<Connection> directo).
+pub fn respaldo_auto_startup(app: &AppHandle, db: &Connection, backups_dir_path: &PathBuf) -> Result<(), String> {
+    // Check toggle
+    let activo: i64 = db.query_row(
+        "SELECT respaldo_auto_activo FROM config_negocio WHERE id = 1",
+        [],
+        |r| r.get(0),
+    ).unwrap_or(1);
+    if activo == 0 { return Ok(()); }
+
+    let hoy = Local::now().format("%Y%m%d").to_string();
+    let prefijo_hoy = format!("pos_backup_{hoy}_");
+    let archivos = listar_archivos(backups_dir_path);
+    if archivos.iter().any(|r| r.nombre.starts_with(&prefijo_hoy)) {
+        return Ok(());
+    }
+
+    let r = crear_respaldo_en(backups_dir_path, db)?;
+    rotar(backups_dir_path);
+    log::info!("Respaldo automático de arranque creado: {}", r.nombre);
+    let _ = app; // suprime unused warning si no se usa
+    Ok(())
+}
+
+/// Obtiene la ruta de la carpeta de respaldos (expuesto para `setup`).
+pub fn obtener_backups_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    backups_dir(app)
 }
 
 #[tauri::command]

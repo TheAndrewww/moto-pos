@@ -8,32 +8,32 @@
 
 @layer base {
   :root {
-    /* Colores base — Paleta Moto Refaccionaria */
-    --color-bg:          #faf2f3;
+    /* Colores base — Paleta Moto Refaccionaria LB */
+    --color-bg:          #f5f5f5;
     --color-surface:     #ffffff;
-    --color-surface-2:   #f2e4e6;
-    --color-border:      #ddc3c6;
-    --color-border-2:    #c9a3a7;
+    --color-surface-2:   #ececec;
+    --color-border:      #d4d4d4;
+    --color-border-2:    #a3a3a3;
 
     /* Texto */
-    --color-text:        #0c0204;
-    --color-text-muted:  #5a3337;
-    --color-text-dim:    #8c6266;
+    --color-text:        #171717;
+    --color-text-muted:  #525252;
+    --color-text-dim:    #737373;
 
-    /* Acento principal — Rojo POS */
-    --color-primary:     #d8384d;
-    --color-primary-h:   #c22e42;
-    --color-primary-soft: rgba(216, 56, 77, 0.12);
+    /* Acento principal — Naranja LB (del logo) */
+    --color-primary:     #f47920;
+    --color-primary-h:   #e06810;
+    --color-primary-soft: rgba(244, 121, 32, 0.12);
 
-    /* Secundario — Dorado */
-    --color-secondary:   #e6bb80;
-    --color-secondary-h: #d9a65e;
-    --color-secondary-soft: rgba(230, 187, 128, 0.18);
+    /* Secundario — Grafito oscuro (del logo) */
+    --color-secondary:   #2d2d2d;
+    --color-secondary-h: #1a1a1a;
+    --color-secondary-soft: rgba(45, 45, 45, 0.12);
 
-    /* Acento — Amarillo */
-    --color-accent:      #deca58;
-    --color-accent-h:    #c9b640;
-    --color-accent-soft: rgba(222, 202, 88, 0.18);
+    /* Acento — Dorado */
+    --color-accent:      #f59e0b;
+    --color-accent-h:    #d97706;
+    --color-accent-soft: rgba(245, 158, 11, 0.15);
 
     /* Estados */
     --color-success:     #16a34a;
@@ -44,7 +44,7 @@
     --color-danger-soft:  rgba(220, 38, 38, 0.08);
 
     /* Precios */
-    --color-menudeo:     #d8384d;
+    --color-menudeo:     #f47920;
     --color-mayoreo:     #9333ea;
     --color-especial:    #0d9488;
 
@@ -246,7 +246,7 @@
 /* ============================================================
    BADGES DE PRECIO
    ============================================================ */
-.badge-menudeo  { color: #b12d3e;  background: rgba(216,56,77,0.1); }
+.badge-menudeo  { color: #c45f10;  background: rgba(244,121,32,0.1); }
 .badge-mayoreo  { color: #7e22ce;  background: rgba(147,51,234,0.1); }
 .badge-especial { color: #0f766e; background: rgba(13,148,136,0.1); }
 

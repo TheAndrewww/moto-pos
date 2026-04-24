@@ -10,4 +10,7 @@ pub mod cortes;
 pub mod devoluciones;
 pub mod respaldos;
 pub mod print;
+pub mod print_termico;
 pub mod importar;
+pub mod conexion;
+pub mod sync_remoto;

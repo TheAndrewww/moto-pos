@@ -2,6 +2,8 @@
 
 mod db;
 mod commands;
+mod server;
+mod sync;
 
 use commands::auth::{AppState, login_pin, login_password, logout, verificar_pin_dueno, resolver_dueno_por_pin, crear_usuario_inicial};
 use commands::productos::{
@@ -11,6 +13,7 @@ use commands::productos::{
     listar_clientes, crear_cliente, actualizar_cliente, toggle_cliente_activo,
     obtener_config_descuentos,
     obtener_config_negocio, actualizar_config_negocio,
+    historial_precios_producto,
 };
 use commands::ventas::{
     crear_venta, listar_ventas_dia, obtener_estadisticas_dia, anular_venta,
@@ -46,10 +49,29 @@ use commands::respaldos::{
     respaldo_auto_si_necesario, obtener_info_bd,
 };
 use commands::print::imprimir_html;
+use commands::print_termico::{imprimir_ticket_termico, listar_impresoras};
 use commands::importar::importar_catalogo_csv;
+use commands::conexion::{
+    obtener_info_servidor, generar_qr_emparejamiento,
+    listar_dispositivos, revocar_dispositivo,
+};
+use commands::sync_remoto::{
+    obtener_estado_sync, configurar_sync, desactivar_sync, probar_conexion_sync,
+};
 use db::connection::init_database;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tauri::Manager;
+
+/// Slot compartido donde se publica el ServerState cuando el servidor móvil
+/// termina de arrancar. Los comandos de conexión lo leen con `.read()`.
+pub type ServerSlot = Arc<std::sync::RwLock<Option<server::ServerState>>>;
+
+fn gen_secret() -> Vec<u8> {
+    use rand::RngCore;
+    let mut bytes = vec![0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    bytes
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -73,9 +95,60 @@ pub fn run() {
             let conn = init_database(&db_path)
                 .expect("Error al inicializar la base de datos");
 
-            // Compartir el estado con todos los comandos
-            app.manage(AppState {
-                db: Mutex::new(conn),
+            // Respaldo automático de arranque (si está activado en config)
+            let app_handle = app.handle().clone();
+            if let Ok(backup_dir) = commands::respaldos::obtener_backups_dir(&app_handle) {
+                if let Err(e) = commands::respaldos::respaldo_auto_startup(&app_handle, &conn, &backup_dir) {
+                    log::warn!("Respaldo automático de arranque falló: {}", e);
+                }
+            }
+
+            // Envolver la conexión en Arc<Mutex<>> para compartir con el servidor LAN
+            let db_arc = Arc::new(Mutex::new(conn));
+
+            // Compartir el estado con todos los comandos Tauri
+            app.manage(AppState { db: db_arc.clone() });
+
+            // ========== Servidor LAN (Fase 3.1) ==========
+            // JWT secret persistente (archivo dedicado en app_data_dir)
+            let secret_path = app_data_dir.join("jwt.secret");
+            let jwt_secret: Vec<u8> = if secret_path.exists() {
+                std::fs::read(&secret_path).unwrap_or_else(|_| gen_secret())
+            } else {
+                let s = gen_secret();
+                let _ = std::fs::write(&secret_path, &s);
+                s
+            };
+            let cert_dir = app_data_dir.join("certs");
+            let pwa_dist_dir = {
+                // Los archivos de la PWA se embeben en resources/
+                app.path().resolve("resources/mobile-dist", tauri::path::BaseDirectory::Resource).ok()
+            };
+
+            // Slot para el ServerState (se rellena cuando el servidor termina de arrancar)
+            let server_slot: ServerSlot = Arc::new(std::sync::RwLock::new(None));
+            app.manage(server_slot.clone());
+
+            // ========== Worker de sync remoto (Fase 3.2) ==========
+            sync::worker::arrancar(db_arc.clone());
+
+            let db_for_server = db_arc.clone();
+            tauri::async_runtime::spawn(async move {
+                match server::start_server(
+                    db_for_server,
+                    jwt_secret,
+                    cert_dir,
+                    pwa_dist_dir,
+                    8787,
+                ).await {
+                    Ok(info) => {
+                        log::info!("Servidor móvil activo en puerto {}", info.port);
+                        if let Ok(mut slot) = server_slot.write() {
+                            *slot = Some(info.state);
+                        }
+                    }
+                    Err(e) => log::error!("No se pudo iniciar el servidor móvil: {}", e),
+                }
             });
 
             Ok(())
@@ -95,6 +168,7 @@ pub fn run() {
             crear_producto,
             actualizar_producto,
             listar_productos_stock_bajo,
+            historial_precios_producto,
             listar_categorias,
             listar_proveedores,
             // Clientes
@@ -159,8 +233,20 @@ pub fn run() {
             obtener_info_bd,
             // Impresión
             imprimir_html,
+            imprimir_ticket_termico,
+            listar_impresoras,
             // Importación
             importar_catalogo_csv,
+            // Conexión móvil (Fase 3.1)
+            obtener_info_servidor,
+            generar_qr_emparejamiento,
+            listar_dispositivos,
+            revocar_dispositivo,
+            // Sync remoto (Fase 3.2)
+            obtener_estado_sync,
+            configurar_sync,
+            desactivar_sync,
+            probar_conexion_sync,
         ])
         .run(tauri::generate_context!())
         .expect("Error al iniciar el POS");

@@ -1,7 +1,7 @@
 // store/cortesStore.ts — Estado del módulo de Cortes de Caja
 
 import { create } from 'zustand';
-import { invoke } from '@tauri-apps/api/core';
+import { invoke } from '../lib/invokeCompat';
 
 // ─── Tipos ────────────────────────────────────────────────
 
@@ -56,6 +56,7 @@ export interface NuevoMovimiento {
   monto: number;
   concepto: string;
   autorizado_por?: number | null;
+  pin_autorizacion?: string | null;
 }
 
 export interface NuevoCorte {

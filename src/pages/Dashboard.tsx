@@ -3,7 +3,7 @@
 
 import { useState, useEffect } from 'react';
 import { useAuthStore } from '../store/authStore';
-import { invoke } from '@tauri-apps/api/core';
+import { invoke } from '../lib/invokeCompat';
 import PuntoDeVenta from './PuntoDeVenta';
 import Catalogo from './Catalogo';
 import UsuariosPage from './Usuarios';
@@ -15,14 +15,17 @@ import PedidosPage from './Pedidos';
 import EtiquetasPage from './Etiquetas';
 import CortesCaja, { ModalAperturaCaja } from './CortesCaja';
 import HistorialVentas from './HistorialVentas';
+import Reportes from './Reportes';
 import Ajustes from './Ajustes';
+import ConexionMovil from './ConexionMovil';
 import { useCortesStore } from '../store/cortesStore';
 import {
   ShoppingCart, Package, BarChart3, LogOut, ClipboardList,
-  TruckIcon, Tag, Users, ScrollText, DollarSign, History, Settings, UserPlus,
+  TruckIcon, Tag, Users, ScrollText, DollarSign, History, Settings, UserPlus, TrendingUp,
+  Smartphone,
 } from 'lucide-react';
 
-type Modulo = 'venta' | 'catalogo' | 'dashboard' | 'presupuestos' | 'recepcion' | 'pedidos' | 'etiquetas' | 'bitacora' | 'usuarios' | 'clientes' | 'cortes' | 'historial' | 'ajustes';
+type Modulo = 'venta' | 'catalogo' | 'dashboard' | 'presupuestos' | 'recepcion' | 'pedidos' | 'etiquetas' | 'bitacora' | 'usuarios' | 'clientes' | 'cortes' | 'historial' | 'reportes' | 'ajustes' | 'conexion';
 
 interface EstadisticasDia {
   total_ventas: number;
@@ -91,6 +94,7 @@ export default function Dashboard() {
       if (e.key === 'F7') { e.preventDefault(); setModulo('historial'); }
       if (e.key === 'F11' && !e.shiftKey) { e.preventDefault(); setModulo('cortes'); setTriggerParcial(n => n + 1); }
       if (e.key === 'F11' && e.shiftKey) { e.preventDefault(); setModulo('cortes'); setTriggerDia(n => n + 1); }
+      if (e.key === 'F10') { e.preventDefault(); setModulo('reportes'); }
       if (e.key === 'F12') { e.preventDefault(); logout(); }
     };
     window.addEventListener('keydown', handler);
@@ -122,6 +126,8 @@ export default function Dashboard() {
     { id: 'clientes', label: 'Clientes', icon: <UserPlus size={18} />, key: '', visible: tienePermiso('ventas', 'crear') },
     { id: 'usuarios', label: 'Usuarios', icon: <Users size={18} />, key: '', visible: esAdmin },
     { id: 'cortes', label: 'Cortes de Caja', icon: <DollarSign size={18} />, key: 'F11', visible: true },
+    { id: 'reportes', label: 'Reportes', icon: <TrendingUp size={18} />, key: 'F10', visible: esAdmin },
+    { id: 'conexion', label: 'Conexión móvil', icon: <Smartphone size={18} />, key: '', visible: esAdmin },
     { id: 'ajustes', label: 'Ajustes', icon: <Settings size={18} />, key: '', visible: esAdmin },
   ];
 
@@ -139,9 +145,9 @@ export default function Dashboard() {
       {/* ─── Top Bar ─── */}
       <div className="pos-topbar" style={{ gridColumn: '1 / -1' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-          <span style={{ fontSize: 18 }}>🏍️</span>
+          <img src="/logo.png" alt="LB" style={{ height: 30, width: 'auto' }} draggable={false} />
           <span style={{ fontWeight: 700, fontSize: 14, color: 'var(--color-text)' }}>
-            MOTO REFACCIONARIA POS
+            MOTO REFACCIONARIA LB
           </span>
         </div>
 
@@ -283,11 +289,12 @@ export default function Dashboard() {
           <DashboardHome stats={stats} fmt={fmt} stockBajo={stockBajoCount} onVerInventario={() => setModulo('catalogo')} />
         )}
         {modulo === 'bitacora' && <Bitacora />}
-        {modulo === 'presupuestos' && <Presupuestos />}
+        {modulo === 'presupuestos' && <Presupuestos onIrAVenta={() => setModulo('venta')} />}
         {modulo === 'recepcion' && <RecepcionPage />}
         {modulo === 'pedidos' && <PedidosPage />}
         {modulo === 'etiquetas' && <EtiquetasPage />}
         {modulo === 'historial' && <HistorialVentas />}
+        {modulo === 'reportes' && <Reportes />}
         {modulo === 'cortes' && (
           <CortesCaja
             triggerMovimiento={triggerMovimiento}
@@ -298,6 +305,7 @@ export default function Dashboard() {
           />
         )}
         {modulo === 'ajustes' && <Ajustes />}
+        {modulo === 'conexion' && <ConexionMovil />}
       </div>
     </div>
     </>

@@ -14,7 +14,11 @@ pub struct NuevoMovimiento {
     pub monto: f64,
     pub concepto: String,
     pub autorizado_por: Option<i64>,
+    pub pin_autorizacion: Option<String>,  // PIN del dueño para retiros > $500
 }
+
+/// Monto de retiro a partir del cual se requiere PIN del dueño.
+const RETIRO_LIMITE_SIN_PIN: f64 = 500.0;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct MovimientoCajaRs {
@@ -130,6 +134,52 @@ pub fn crear_movimiento_caja(
     }
 
     let db = state.db.lock().unwrap();
+
+    // ─── Validación de autorización para retiros grandes ───
+    // Si es RETIRO y el monto excede el límite, exigir PIN del dueño válido
+    // y resolver el usuario_id del dueño autorizado (no aceptar el claim del cliente).
+    // Excepción: si el usuario que hace el retiro es admin, él mismo se autoriza
+    // (ya autenticó con PIN al iniciar sesión).
+    let solicitante_es_admin: bool = db.query_row(
+        "SELECT COALESCE(r.es_admin, 0) FROM usuarios u JOIN roles r ON r.id = u.rol_id WHERE u.id = ?",
+        rusqlite::params![datos.usuario_id],
+        |row| row.get::<_, i64>(0),
+    ).map(|v| v == 1).unwrap_or(false);
+
+    let autorizado_por_validado: Option<i64> = if datos.tipo == "RETIRO"
+        && datos.monto > RETIRO_LIMITE_SIN_PIN
+        && !solicitante_es_admin
+    {
+        let pin = datos.pin_autorizacion.as_deref().unwrap_or("").trim();
+        if pin.is_empty() {
+            return Err(format!(
+                "Retiros mayores a ${:.0} requieren PIN del dueño",
+                RETIRO_LIMITE_SIN_PIN
+            ));
+        }
+
+        // Buscar dueño cuyo PIN (bcrypt hash) coincida
+        let mut stmt = db.prepare(
+            "SELECT u.id, u.pin FROM usuarios u JOIN roles r ON r.id = u.rol_id
+             WHERE r.es_admin = 1 AND u.activo = 1"
+        ).map_err(|e| e.to_string())?;
+        let rows: Vec<(i64, String)> = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        }).map_err(|e| e.to_string())?
+          .filter_map(|r| r.ok())
+          .collect();
+
+        match rows.into_iter().find(|(_, hash)| bcrypt::verify(pin, hash).unwrap_or(false)) {
+            Some((id, _)) => Some(id),
+            None => return Err("PIN del dueño incorrecto".to_string()),
+        }
+    } else if datos.tipo == "RETIRO" && datos.monto > RETIRO_LIMITE_SIN_PIN && solicitante_es_admin {
+        // Admin auto-autorizado
+        Some(datos.usuario_id)
+    } else {
+        datos.autorizado_por
+    };
+
     let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
     db.execute(
@@ -137,7 +187,7 @@ pub fn crear_movimiento_caja(
            VALUES (?, ?, ?, ?, ?, ?)"#,
         rusqlite::params![
             datos.tipo, datos.usuario_id, datos.monto,
-            datos.concepto, datos.autorizado_por, now
+            datos.concepto, autorizado_por_validado, now
         ],
     ).map_err(|e| e.to_string())?;
 
@@ -167,7 +217,7 @@ pub fn crear_movimiento_caja(
         usuario_nombre,
         monto: datos.monto,
         concepto: datos.concepto,
-        autorizado_por: datos.autorizado_por,
+        autorizado_por: autorizado_por_validado,
         corte_id: None,
         fecha: now,
     })

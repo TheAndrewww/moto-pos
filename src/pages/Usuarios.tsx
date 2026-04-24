@@ -1,7 +1,7 @@
 // pages/Usuarios.tsx — Gestión de usuarios (solo dueño)
 
 import { useState, useEffect } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import { invoke } from '../lib/invokeCompat';
 import { useAuthStore } from '../store/authStore';
 import { Users, Plus, Edit2, X, ShieldCheck, ShieldOff, Eye, EyeOff } from 'lucide-react';
 

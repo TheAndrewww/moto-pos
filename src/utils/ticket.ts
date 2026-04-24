@@ -1,6 +1,7 @@
-// utils/ticket.ts — Plantilla de ticket térmico 80mm
+// utils/ticket.ts — Impresión de ticket (térmica ESC/POS o HTML fallback)
 
 import { printHTML, escapeHTML } from './print';
+import { invoke } from '../lib/invokeCompat';
 
 export interface ConfigNegocio {
   nombre: string;
@@ -8,6 +9,9 @@ export interface ConfigNegocio {
   telefono: string;
   rfc: string;
   mensaje_pie: string;
+  /** Nombre de la impresora térmica ESC/POS en el sistema.
+   *  Si está vacía → fallback a impresión HTML (navegador). */
+  impresora_termica?: string;
 }
 
 export interface TicketItem {
@@ -60,23 +64,32 @@ export function buildTicketHTML(negocio: ConfigNegocio, t: TicketData): string {
   .bold { font-weight: 700; }
   .big { font-size: 12pt; }
   .xl { font-size: 14pt; }
-  .muted { font-size: 8pt; }
-  .sep { border-top: 1px dashed #000; margin: 4px 0; }
+  .muted { font-size: 8pt; color: #333; }
+  .sep { border-top: 1px dashed #000; margin: 5px 0; }
+  .sep-thick { border-top: 2px solid #000; margin: 6px 0; }
   .row { display: flex; justify-content: space-between; gap: 4px; }
   .item { margin-bottom: 3px; }
   .item-nom { font-size: 9pt; }
   .item-row { display: flex; justify-content: space-between; font-size: 9pt; }
-  .item-qty { }
   .item-sub { font-weight: 700; }
-  .total-row { font-size: 13pt; font-weight: 900; }
+  .total-row { font-size: 13pt; font-weight: 900; color: #000; }
   .reprint { border: 1px solid #000; padding: 2px 6px; display: inline-block; font-size: 8pt; margin-bottom: 3px; }
+  .logo { width: 50mm; max-width: 80%; height: auto; margin: 3px auto; display: block; }
+  .brand-name { font-size: 13pt; font-weight: 900; letter-spacing: 0.5px; margin: 2px 0; color: #000; }
+  .brand-sub { font-size: 8pt; color: #000; font-weight: 700; letter-spacing: 1px; margin-bottom: 2px; }
+  .footer-msg { font-size: 9pt; font-weight: 600; margin: 4px 0 2px; }
+  .footer-brand { font-size: 7pt; color: #000; font-weight: 700; letter-spacing: 0.5px; margin-top: 4px; }
 </style></head><body>
   ${t.reimpresion ? '<div class="center"><span class="reprint">*** REIMPRESIÓN ***</span></div>' : ''}
-  <div class="center bold xl">${escapeHTML(negocio.nombre)}</div>
+  <div class="center">
+    <img class="logo" src="${window.location.origin}/logo-ticket.png" alt="Moto Refaccionaria LB" onerror="this.style.display='none'" />
+    <div class="brand-name">${escapeHTML(negocio.nombre || 'MOTO REFACCIONARIA LB')}</div>
+    <div class="brand-sub">ABASOLO, GUANAJUATO</div>
+  </div>
   ${negocio.direccion ? `<div class="center muted">${escapeHTML(negocio.direccion)}</div>` : ''}
   ${negocio.telefono ? `<div class="center muted">Tel: ${escapeHTML(negocio.telefono)}</div>` : ''}
   ${negocio.rfc ? `<div class="center muted">RFC: ${escapeHTML(negocio.rfc)}</div>` : ''}
-  <div class="sep"></div>
+  <div class="sep-thick"></div>
   <div class="row"><span>Folio:</span><span class="bold">${escapeHTML(t.folio)}</span></div>
   <div class="row"><span>Fecha:</span><span>${escapeHTML(t.fecha)}</span></div>
   <div class="row"><span>Cajero:</span><span>${escapeHTML(t.usuario)}</span></div>
@@ -95,12 +108,48 @@ export function buildTicketHTML(negocio: ConfigNegocio, t: TicketData): string {
     <div class="row"><span>Recibido:</span><span>${fmt(t.monto_recibido!)}</span></div>
     <div class="row big bold"><span>Cambio:</span><span>${fmt(t.cambio || 0)}</span></div>
   ` : ''}
-  <div class="sep"></div>
-  <div class="center">${escapeHTML(negocio.mensaje_pie)}</div>
+  <div class="sep-thick"></div>
+  <div class="center footer-msg">${escapeHTML(negocio.mensaje_pie || '¡Gracias por su compra!')}</div>
   <div class="center muted">Conserve este ticket</div>
+  <div class="center footer-brand">MOTO REFACCIONARIA LB</div>
 </body></html>`;
 }
 
 export async function imprimirTicket(negocio: ConfigNegocio, data: TicketData): Promise<void> {
+  // 1) Si hay impresora térmica configurada, intentar ESC/POS directo (sin ventana).
+  const impresora = (negocio.impresora_termica || '').trim();
+  if (impresora) {
+    try {
+      await invoke('imprimir_ticket_termico', {
+        datos: {
+          negocio_nombre: negocio.nombre,
+          negocio_direccion: negocio.direccion,
+          negocio_telefono: negocio.telefono,
+          negocio_rfc: negocio.rfc,
+          mensaje_pie: negocio.mensaje_pie,
+          folio: data.folio,
+          fecha: data.fecha,
+          usuario: data.usuario,
+          cliente: data.cliente ?? null,
+          items: data.items.map(i => ({
+            cantidad: i.cantidad,
+            nombre: i.nombre,
+            precio_unitario: i.precio_final,
+            subtotal: i.subtotal,
+          })),
+          subtotal: data.subtotal,
+          descuento: data.descuento,
+          total: data.total,
+          metodo_pago: data.metodo_pago,
+        },
+        impresora,
+      });
+      return; // Éxito — no abrimos nada más.
+    } catch (e) {
+      console.warn('Impresión térmica falló, usando fallback HTML:', e);
+      // Continúa al fallback de abajo.
+    }
+  }
+  // 2) Fallback: HTML en ventana del navegador (comportamiento legacy).
   await printHTML(buildTicketHTML(negocio, data));
 }
