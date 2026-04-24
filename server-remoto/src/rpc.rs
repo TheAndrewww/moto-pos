@@ -74,8 +74,9 @@ pub async fn dispatch(
         "obtener_info_servidor"         => obtener_info_servidor(&state).await?,
         "listar_dispositivos"           => listar_dispositivos(&state).await?,
 
-        // ─── Cortes / caja (stubs para web) ──────────────────
-        "obtener_apertura_hoy"          => Value::Null,
+        // ─── Cortes / caja ───────────────────────────────────
+        "obtener_apertura_hoy"          => obtener_apertura_hoy(&state).await?,
+        "crear_apertura_caja"           => crear_apertura_caja(&state, &args).await?,
         "verificar_corte_dia_pendiente" => Value::Null,
         "listar_movimientos_sin_corte"  => json!([]),
         "listar_cortes"                 => json!([]),
@@ -92,11 +93,20 @@ pub async fn dispatch(
         // ─── Bitácora (read) ─────────────────────────────────
         "listar_bitacora"               => json!([]),
 
-        // ─── Presupuestos / pedidos / recepciones (stubs) ────
+        // ─── Presupuestos (stub) ─────────────────────────────
         "listar_presupuestos"           => json!([]),
-        "listar_ordenes_pedido"         => json!([]),
-        "listar_recepciones"            => json!([]),
         "listar_devoluciones"           => json!([]),
+
+        // ─── Recepciones ─────────────────────────────────────
+        "listar_recepciones"            => listar_recepciones(&state).await?,
+        "obtener_detalle_recepcion"     => obtener_detalle_recepcion(&state, &args).await?,
+        "crear_recepcion"               => crear_recepcion(&state, args).await?,
+
+        // ─── Pedidos a proveedor ─────────────────────────────
+        "listar_ordenes_pedido"         => listar_ordenes_pedido(&state, &args).await?,
+        "obtener_detalle_orden"         => obtener_detalle_orden(&state, &args).await?,
+        "crear_orden_pedido"            => crear_orden_pedido(&state, args).await?,
+        "cambiar_estado_orden"          => cambiar_estado_orden(&state, &args).await?,
 
         // ─── PIN dueño (autorizaciones) ──────────────────────
         "verificar_pin_dueno"           => verificar_pin_dueno(&state, &args).await?,
@@ -750,15 +760,7 @@ struct PinArg { pin: String }
 async fn verificar_pin_dueno(state: &AppState, args: &Value) -> Result<Value, ApiError> {
     let a: PinArg = serde_json::from_value(args.clone())
         .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
-    let ok: Option<i64> = sqlx::query_scalar(
-        "SELECT id FROM usuarios \
-         WHERE pin = $1 AND rol_id IN (1,2) AND activo = 1 AND deleted_at IS NULL \
-         LIMIT 1",
-    )
-    .bind(&a.pin)
-    .fetch_optional(&state.pool)
-    .await?;
-    Ok(json!(ok.is_some()))
+    Ok(json!(buscar_dueno_por_pin(state, &a.pin).await?.is_some()))
 }
 
 // =============================================================================
@@ -776,20 +778,24 @@ async fn login_pin(state: &AppState, args: &Value) -> Result<Value, ApiError> {
     let a: A = serde_json::from_value(args.clone())
         .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
 
-    let row_opt = sqlx::query(
-        "SELECT id, nombre_completo, nombre_usuario, rol_id \
+    // El campo `pin` se almacena como bcrypt hash (igual que en el POS local).
+    // No podemos buscar por igualdad — hay que iterar usuarios activos y
+    // verificar el hash. La cantidad de usuarios es chica (decenas), así que ok.
+    let candidatos = sqlx::query(
+        "SELECT id, nombre_completo, nombre_usuario, rol_id, pin \
          FROM usuarios \
-         WHERE pin = $1 AND activo = 1 AND deleted_at IS NULL \
-         LIMIT 1",
+         WHERE activo = 1 AND deleted_at IS NULL",
     )
-    .bind(&a.pin)
-    .fetch_optional(&state.pool)
+    .fetch_all(&state.pool)
     .await?;
 
-    match row_opt {
-        Some(r) => Ok(usuario_sesion_response(&state, &r).await?),
-        None    => Ok(json!({ "ok": false, "error": "PIN incorrecto" })),
+    for r in &candidatos {
+        let hash: String = r.get("pin");
+        if bcrypt::verify(&a.pin, &hash).unwrap_or(false) {
+            return usuario_sesion_response(&state, r).await;
+        }
     }
+    Ok(json!({ "ok": false, "error": "PIN incorrecto" }))
 }
 
 async fn login_password(state: &AppState, args: &Value) -> Result<Value, ApiError> {
@@ -864,13 +870,622 @@ async fn usuario_sesion_response(
 async fn resolver_dueno_por_pin(state: &AppState, args: &Value) -> Result<Value, ApiError> {
     let a: PinArg = serde_json::from_value(args.clone())
         .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
-    let id: Option<i64> = sqlx::query_scalar(
-        "SELECT id FROM usuarios \
-         WHERE pin = $1 AND rol_id IN (1,2) AND activo = 1 AND deleted_at IS NULL \
-         LIMIT 1",
+    Ok(match buscar_dueno_por_pin(state, &a.pin).await? {
+        Some(id) => json!(id),
+        None     => Value::Null,
+    })
+}
+
+// =============================================================================
+// RECEPCIONES (entrada de mercancía)
+// =============================================================================
+
+async fn listar_recepciones(state: &AppState) -> Result<Value, ApiError> {
+    let rows = sqlx::query(
+        r#"
+        SELECT r.id, u.nombre_completo AS usuario_nombre,
+               p.nombre AS proveedor_nombre, r.fecha, r.notas,
+               COALESCE((SELECT COUNT(*) FROM recepcion_detalle rd
+                         WHERE rd.recepcion_id = r.id AND rd.deleted_at IS NULL), 0)
+                 AS total_items
+        FROM recepciones r
+        LEFT JOIN usuarios u ON u.id = r.usuario_id
+        LEFT JOIN proveedores p ON p.id = r.proveedor_id
+        WHERE r.deleted_at IS NULL
+        ORDER BY r.fecha DESC
+        LIMIT 200
+        "#,
     )
-    .bind(&a.pin)
+    .fetch_all(&state.pool)
+    .await?;
+
+    Ok(json!(rows.iter().map(|r| json!({
+        "id":               r.get::<i64, _>("id"),
+        "usuario_nombre":   r.try_get::<Option<String>, _>("usuario_nombre").ok().flatten().unwrap_or_default(),
+        "proveedor_nombre": r.try_get::<Option<String>, _>("proveedor_nombre").ok().flatten(),
+        "fecha":            r.get::<String, _>("fecha"),
+        "notas":            r.try_get::<Option<String>, _>("notas").ok().flatten(),
+        "total_items":      r.get::<i64, _>("total_items"),
+    })).collect::<Vec<_>>()))
+}
+
+async fn obtener_detalle_recepcion(state: &AppState, args: &Value) -> Result<Value, ApiError> {
+    use rust_decimal::prelude::ToPrimitive;
+    #[derive(Deserialize)]
+    struct A {
+        #[serde(rename = "recepcionId")] recepcion_id: i64,
+    }
+    let a: A = serde_json::from_value(args.clone())
+        .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
+
+    let rows = sqlx::query(
+        r#"
+        SELECT rd.id, rd.producto_id, p.nombre AS producto_nombre,
+               p.codigo AS producto_codigo,
+               rd.cantidad, rd.precio_costo
+        FROM recepcion_detalle rd
+        LEFT JOIN productos p ON p.id = rd.producto_id
+        WHERE rd.recepcion_id = $1 AND rd.deleted_at IS NULL
+        ORDER BY rd.id
+        "#,
+    )
+    .bind(a.recepcion_id)
+    .fetch_all(&state.pool)
+    .await?;
+
+    Ok(json!(rows.iter().map(|r| json!({
+        "id":               r.get::<i64, _>("id"),
+        "producto_id":      r.get::<i64, _>("producto_id"),
+        "producto_nombre":  r.try_get::<Option<String>, _>("producto_nombre").ok().flatten().unwrap_or_default(),
+        "producto_codigo":  r.try_get::<Option<String>, _>("producto_codigo").ok().flatten().unwrap_or_default(),
+        "cantidad":         r.try_get::<rust_decimal::Decimal, _>("cantidad").ok()
+                              .and_then(|d| d.to_f64()).unwrap_or(0.0),
+        "precio_costo":     r.try_get::<rust_decimal::Decimal, _>("precio_costo").ok()
+                              .and_then(|d| d.to_f64()).unwrap_or(0.0),
+    })).collect::<Vec<_>>()))
+}
+
+async fn crear_recepcion(state: &AppState, args: Value) -> Result<Value, ApiError> {
+    #[derive(Deserialize)]
+    struct A { recepcion: DatosRecepcionWeb }
+    #[derive(Deserialize)]
+    struct DatosRecepcionWeb {
+        usuario_id: i64,
+        #[serde(default)] proveedor_id: Option<i64>,
+        #[serde(default)] orden_id: Option<i64>,
+        #[serde(default)] notas: Option<String>,
+        items: Vec<ItemRecepcionWeb>,
+    }
+    #[derive(Deserialize)]
+    struct ItemRecepcionWeb {
+        producto_id: i64,
+        cantidad: f64,
+        precio_costo: f64,
+    }
+
+    let a: A = serde_json::from_value(args)
+        .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
+    let r = a.recepcion;
+
+    if r.items.is_empty() {
+        return Err(ApiError::BadRequest("La recepción no tiene items".into()));
+    }
+
+    let sucursal_id: i64 = 1;
+    let mut tx = state.pool.begin().await?;
+
+    // Cabecera
+    let recep_uuid = uuid::Uuid::now_v7().to_string();
+    let cab_sql = format!(
+        r#"
+        INSERT INTO recepciones
+          (uuid, sucursal_id, orden_id, usuario_id, proveedor_id, fecha, notas, updated_at)
+        VALUES ($1, $2, $3, $4, $5, {NOW_TEXT}, $6, {NOW_TEXT})
+        RETURNING id, fecha
+        "#
+    );
+    let crow = sqlx::query(&cab_sql)
+        .bind(&recep_uuid)
+        .bind(sucursal_id)
+        .bind(r.orden_id)
+        .bind(r.usuario_id)
+        .bind(r.proveedor_id)
+        .bind(r.notas.as_deref())
+        .fetch_one(&mut *tx)
+        .await?;
+    let recep_id: i64 = crow.get("id");
+    let fecha: String = crow.get("fecha");
+    let total_items = r.items.len() as i64;
+
+    // Detalle + actualización de stock + (si aplica) cantidad_recibida en orden
+    for it in &r.items {
+        let det_uuid = uuid::Uuid::now_v7().to_string();
+        let det_sql = format!(
+            r#"
+            INSERT INTO recepcion_detalle
+              (uuid, recepcion_id, producto_id, cantidad, precio_costo, updated_at)
+            VALUES ($1, $2, $3, $4, $5, {NOW_TEXT})
+            "#
+        );
+        sqlx::query(&det_sql)
+            .bind(&det_uuid)
+            .bind(recep_id)
+            .bind(it.producto_id)
+            .bind(it.cantidad)
+            .bind(it.precio_costo)
+            .execute(&mut *tx)
+            .await?;
+
+        // Sumar al stock + actualizar precio_costo
+        let upd_sql = format!(
+            "UPDATE productos SET stock_actual = stock_actual + $1, \
+             precio_costo = $2, updated_at = {NOW_TEXT} WHERE id = $3"
+        );
+        sqlx::query(&upd_sql)
+            .bind(it.cantidad)
+            .bind(it.precio_costo)
+            .bind(it.producto_id)
+            .execute(&mut *tx)
+            .await?;
+
+        // sync_cursor productos
+        sqlx::query(
+            "INSERT INTO sync_cursor (tabla, uuid, sucursal_id, origen_device) \
+             SELECT 'productos', p.uuid, $1, $2 FROM productos p WHERE p.id = $3",
+        )
+        .bind(sucursal_id)
+        .bind(WEB_ORIGIN)
+        .bind(it.producto_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // Si es contra una orden, sumar a cantidad_recibida en el detalle
+        if let Some(oid) = r.orden_id {
+            let upd_pd_sql = format!(
+                "UPDATE orden_pedido_detalle \
+                 SET cantidad_recibida = cantidad_recibida + $1, updated_at = {NOW_TEXT} \
+                 WHERE orden_id = $2 AND producto_id = $3"
+            );
+            let _ = sqlx::query(&upd_pd_sql)
+                .bind(it.cantidad)
+                .bind(oid)
+                .bind(it.producto_id)
+                .execute(&mut *tx)
+                .await;
+        }
+    }
+
+    // Si hay orden, recalcular su estado (completa / parcial)
+    if let Some(oid) = r.orden_id {
+        use rust_decimal::prelude::ToPrimitive;
+        let faltante: rust_decimal::Decimal = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(CASE WHEN cantidad_pedida > cantidad_recibida \
+                                      THEN cantidad_pedida - cantidad_recibida ELSE 0 END), 0) \
+             FROM orden_pedido_detalle WHERE orden_id = $1",
+        )
+        .bind(oid)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap_or_default();
+        let f64_falt = faltante.to_f64().unwrap_or(0.0);
+        let nuevo_estado = if f64_falt <= 0.0 { "recibida_completa" } else { "recibida_parcial" };
+        let upd_orden_sql = format!(
+            "UPDATE ordenes_pedido SET estado = $1, fecha_recepcion = {NOW_TEXT}, \
+             updated_at = {NOW_TEXT} WHERE id = $2"
+        );
+        let _ = sqlx::query(&upd_orden_sql)
+            .bind(nuevo_estado)
+            .bind(oid)
+            .execute(&mut *tx)
+            .await;
+    }
+
+    // sync_cursor para la recepción
+    sqlx::query(
+        "INSERT INTO sync_cursor (tabla, uuid, sucursal_id, origen_device) \
+         VALUES ('recepciones', $1, $2, $3)",
+    )
+    .bind(&recep_uuid)
+    .bind(sucursal_id)
+    .bind(WEB_ORIGIN)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    // Resolver nombres para el response
+    let usuario_nombre: String = sqlx::query_scalar(
+        "SELECT nombre_completo FROM usuarios WHERE id = $1",
+    )
+    .bind(r.usuario_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .unwrap_or_else(|| "—".into());
+
+    let proveedor_nombre: Option<String> = match r.proveedor_id {
+        Some(pid) => sqlx::query_scalar("SELECT nombre FROM proveedores WHERE id = $1")
+            .bind(pid)
+            .fetch_optional(&state.pool)
+            .await?,
+        None => None,
+    };
+
+    Ok(json!({
+        "id":               recep_id,
+        "usuario_nombre":   usuario_nombre,
+        "proveedor_nombre": proveedor_nombre,
+        "fecha":            fecha,
+        "notas":            r.notas,
+        "total_items":      total_items,
+    }))
+}
+
+// =============================================================================
+// PEDIDOS A PROVEEDOR (órdenes)
+// =============================================================================
+
+async fn listar_ordenes_pedido(state: &AppState, args: &Value) -> Result<Value, ApiError> {
+    #[derive(Deserialize, Default)]
+    struct A {
+        #[serde(default, rename = "estadoFiltro")] estado_filtro: Option<String>,
+    }
+    let a: A = serde_json::from_value(args.clone()).unwrap_or_default();
+
+    let rows = sqlx::query(
+        r#"
+        SELECT o.id, p.nombre AS proveedor_nombre,
+               u.nombre_completo AS usuario_nombre,
+               o.estado, o.notas, o.fecha_pedido AS fecha,
+               COALESCE((SELECT COUNT(*) FROM orden_pedido_detalle d
+                         WHERE d.orden_id = o.id AND d.deleted_at IS NULL), 0)
+                 AS total_items
+        FROM ordenes_pedido o
+        LEFT JOIN proveedores p ON p.id = o.proveedor_id
+        LEFT JOIN usuarios u    ON u.id = o.usuario_id
+        WHERE o.deleted_at IS NULL
+          AND ($1::text IS NULL OR o.estado = $1)
+        ORDER BY o.fecha_pedido DESC
+        LIMIT 200
+        "#,
+    )
+    .bind(&a.estado_filtro)
+    .fetch_all(&state.pool)
+    .await?;
+
+    Ok(json!(rows.iter().map(|r| json!({
+        "id":               r.get::<i64, _>("id"),
+        "proveedor_nombre": r.try_get::<Option<String>, _>("proveedor_nombre").ok().flatten(),
+        "usuario_nombre":   r.try_get::<Option<String>, _>("usuario_nombre").ok().flatten().unwrap_or_default(),
+        "estado":           r.get::<String, _>("estado"),
+        "notas":            r.try_get::<Option<String>, _>("notas").ok().flatten(),
+        "fecha":            r.get::<String, _>("fecha"),
+        "total_items":      r.get::<i64, _>("total_items"),
+    })).collect::<Vec<_>>()))
+}
+
+async fn obtener_detalle_orden(state: &AppState, args: &Value) -> Result<Value, ApiError> {
+    use rust_decimal::prelude::ToPrimitive;
+    #[derive(Deserialize)]
+    struct A { #[serde(rename = "ordenId")] orden_id: i64 }
+    let a: A = serde_json::from_value(args.clone())
+        .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
+
+    let rows = sqlx::query(
+        r#"
+        SELECT od.id, od.producto_id, p.nombre AS producto_nombre,
+               p.codigo AS producto_codigo,
+               od.cantidad_pedida, od.cantidad_recibida, od.precio_costo
+        FROM orden_pedido_detalle od
+        LEFT JOIN productos p ON p.id = od.producto_id
+        WHERE od.orden_id = $1 AND od.deleted_at IS NULL
+        ORDER BY od.id
+        "#,
+    )
+    .bind(a.orden_id)
+    .fetch_all(&state.pool)
+    .await?;
+
+    Ok(json!(rows.iter().map(|r| json!({
+        "id":                r.get::<i64, _>("id"),
+        "producto_id":       r.get::<i64, _>("producto_id"),
+        "producto_nombre":   r.try_get::<Option<String>, _>("producto_nombre").ok().flatten().unwrap_or_default(),
+        "producto_codigo":   r.try_get::<Option<String>, _>("producto_codigo").ok().flatten().unwrap_or_default(),
+        "cantidad_pedida":   r.try_get::<rust_decimal::Decimal, _>("cantidad_pedida").ok()
+                                .and_then(|d| d.to_f64()).unwrap_or(0.0),
+        "cantidad_recibida": r.try_get::<rust_decimal::Decimal, _>("cantidad_recibida").ok()
+                                .and_then(|d| d.to_f64()).unwrap_or(0.0),
+        "precio_costo":      r.try_get::<rust_decimal::Decimal, _>("precio_costo").ok()
+                                .and_then(|d| d.to_f64()).unwrap_or(0.0),
+    })).collect::<Vec<_>>()))
+}
+
+async fn crear_orden_pedido(state: &AppState, args: Value) -> Result<Value, ApiError> {
+    #[derive(Deserialize)]
+    struct A { orden: DatosOrdenWeb }
+    #[derive(Deserialize)]
+    struct DatosOrdenWeb {
+        usuario_id: i64,
+        #[serde(default)] proveedor_id: Option<i64>,
+        #[serde(default)] notas: Option<String>,
+        items: Vec<ItemOrdenWeb>,
+    }
+    #[derive(Deserialize)]
+    struct ItemOrdenWeb {
+        producto_id: i64,
+        cantidad_pedida: f64,
+        precio_costo: f64,
+    }
+
+    let a: A = serde_json::from_value(args)
+        .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
+    let o = a.orden;
+
+    if o.items.is_empty() {
+        return Err(ApiError::BadRequest("El pedido no tiene items".into()));
+    }
+
+    let sucursal_id: i64 = 1;
+    let mut tx = state.pool.begin().await?;
+
+    // Folio consecutivo
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM ordenes_pedido WHERE deleted_at IS NULL",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    let folio = format!("P-{:06}", count + 1);
+
+    let orden_uuid = uuid::Uuid::now_v7().to_string();
+    let cab_sql = format!(
+        r#"
+        INSERT INTO ordenes_pedido
+          (uuid, sucursal_id, folio, usuario_id, origen, proveedor_id,
+           estado, notas, fecha_pedido, updated_at)
+        VALUES ($1, $2, $3, $4, 'WEB', $5, 'borrador', $6, {NOW_TEXT}, {NOW_TEXT})
+        RETURNING id, fecha_pedido
+        "#
+    );
+    let crow = sqlx::query(&cab_sql)
+        .bind(&orden_uuid)
+        .bind(sucursal_id)
+        .bind(&folio)
+        .bind(o.usuario_id)
+        .bind(o.proveedor_id)
+        .bind(o.notas.as_deref())
+        .fetch_one(&mut *tx)
+        .await?;
+    let orden_id: i64 = crow.get("id");
+    let fecha: String = crow.get("fecha_pedido");
+    let total_items = o.items.len() as i64;
+
+    for it in &o.items {
+        let det_uuid = uuid::Uuid::now_v7().to_string();
+        let det_sql = format!(
+            r#"
+            INSERT INTO orden_pedido_detalle
+              (uuid, orden_id, producto_id, cantidad_pedida,
+               cantidad_recibida, precio_costo, updated_at)
+            VALUES ($1, $2, $3, $4, 0, $5, {NOW_TEXT})
+            "#
+        );
+        sqlx::query(&det_sql)
+            .bind(&det_uuid)
+            .bind(orden_id)
+            .bind(it.producto_id)
+            .bind(it.cantidad_pedida)
+            .bind(it.precio_costo)
+            .execute(&mut *tx)
+            .await?;
+    }
+
+    // sync_cursor para la orden
+    sqlx::query(
+        "INSERT INTO sync_cursor (tabla, uuid, sucursal_id, origen_device) \
+         VALUES ('ordenes_pedido', $1, $2, $3)",
+    )
+    .bind(&orden_uuid)
+    .bind(sucursal_id)
+    .bind(WEB_ORIGIN)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    let usuario_nombre: String = sqlx::query_scalar(
+        "SELECT nombre_completo FROM usuarios WHERE id = $1",
+    )
+    .bind(o.usuario_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .unwrap_or_else(|| "—".into());
+
+    let proveedor_nombre: Option<String> = match o.proveedor_id {
+        Some(pid) => sqlx::query_scalar("SELECT nombre FROM proveedores WHERE id = $1")
+            .bind(pid)
+            .fetch_optional(&state.pool)
+            .await?,
+        None => None,
+    };
+
+    Ok(json!({
+        "id":               orden_id,
+        "proveedor_nombre": proveedor_nombre,
+        "usuario_nombre":   usuario_nombre,
+        "estado":           "borrador",
+        "notas":            o.notas,
+        "fecha":            fecha,
+        "total_items":      total_items,
+    }))
+}
+
+async fn cambiar_estado_orden(state: &AppState, args: &Value) -> Result<Value, ApiError> {
+    #[derive(Deserialize)]
+    struct A {
+        #[serde(rename = "ordenId")] orden_id: i64,
+        #[serde(rename = "nuevoEstado")] nuevo_estado: String,
+    }
+    let a: A = serde_json::from_value(args.clone())
+        .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
+
+    let upd_sql = format!(
+        "UPDATE ordenes_pedido SET estado = $1, updated_at = {NOW_TEXT} \
+         WHERE id = $2 AND deleted_at IS NULL"
+    );
+    let affected = sqlx::query(&upd_sql)
+        .bind(&a.nuevo_estado)
+        .bind(a.orden_id)
+        .execute(&state.pool)
+        .await?
+        .rows_affected();
+    if affected == 0 {
+        return Err(ApiError::NotFound);
+    }
+
+    // Propagar al sync_cursor
+    let _ = sqlx::query(
+        "INSERT INTO sync_cursor (tabla, uuid, sucursal_id, origen_device) \
+         SELECT 'ordenes_pedido', uuid, 1, $1 FROM ordenes_pedido WHERE id = $2",
+    )
+    .bind(WEB_ORIGIN)
+    .bind(a.orden_id)
+    .execute(&state.pool)
+    .await;
+
+    Ok(json!(true))
+}
+
+// =============================================================================
+// APERTURA DE CAJA
+// =============================================================================
+
+async fn obtener_apertura_hoy(state: &AppState) -> Result<Value, ApiError> {
+    use rust_decimal::prelude::ToPrimitive;
+    let row = sqlx::query(
+        r#"
+        SELECT a.id, a.usuario_id, u.nombre_completo AS usuario_nombre,
+               a.fondo_declarado, a.nota, a.fecha
+        FROM aperturas_caja a
+        JOIN usuarios u ON u.id = a.usuario_id
+        WHERE a.deleted_at IS NULL
+          AND substr(a.fecha, 1, 10)
+              = to_char(now() AT TIME ZONE 'America/Mexico_City', 'YYYY-MM-DD')
+        ORDER BY a.id DESC LIMIT 1
+        "#,
+    )
     .fetch_optional(&state.pool)
     .await?;
-    Ok(match id { Some(i) => json!(i), None => Value::Null })
+
+    Ok(match row {
+        None => Value::Null,
+        Some(r) => json!({
+            "id":              r.get::<i64, _>("id"),
+            "usuario_id":      r.get::<i64, _>("usuario_id"),
+            "usuario_nombre":  r.get::<String, _>("usuario_nombre"),
+            "fondo_declarado": r.try_get::<rust_decimal::Decimal, _>("fondo_declarado")
+                                  .ok().and_then(|d| d.to_f64()).unwrap_or(0.0),
+            "nota":            r.try_get::<Option<String>, _>("nota").ok().flatten(),
+            "fecha":           r.get::<String, _>("fecha"),
+        }),
+    })
+}
+
+async fn crear_apertura_caja(state: &AppState, args: &Value) -> Result<Value, ApiError> {
+    #[derive(Deserialize)]
+    struct A {
+        datos: NuevaAperturaWeb,
+    }
+    #[derive(Deserialize)]
+    struct NuevaAperturaWeb {
+        usuario_id: i64,
+        fondo_declarado: f64,
+        #[serde(default)] nota: Option<String>,
+    }
+    let a: A = serde_json::from_value(args.clone())
+        .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
+    let d = a.datos;
+
+    if d.fondo_declarado < 0.0 {
+        return Err(ApiError::BadRequest("El fondo no puede ser negativo".into()));
+    }
+
+    // Validar que no exista ya una apertura para hoy.
+    let existe: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM aperturas_caja \
+         WHERE deleted_at IS NULL \
+           AND substr(fecha, 1, 10) \
+               = to_char(now() AT TIME ZONE 'America/Mexico_City', 'YYYY-MM-DD')",
+    )
+    .fetch_one(&state.pool)
+    .await?;
+    if existe > 0 {
+        return Err(ApiError::BadRequest("Ya existe una apertura de caja para hoy".into()));
+    }
+
+    let sucursal_id: i64 = 1;
+    let new_uuid = uuid::Uuid::now_v7().to_string();
+    let sql = format!(
+        r#"
+        INSERT INTO aperturas_caja
+          (uuid, sucursal_id, usuario_id, fondo_declarado, nota, fecha, updated_at)
+        VALUES ($1, $2, $3, $4, $5, {NOW_TEXT}, {NOW_TEXT})
+        RETURNING id, fecha
+        "#
+    );
+    let row = sqlx::query(&sql)
+        .bind(&new_uuid)
+        .bind(sucursal_id)
+        .bind(d.usuario_id)
+        .bind(d.fondo_declarado)
+        .bind(d.nota.as_deref())
+        .fetch_one(&state.pool)
+        .await?;
+
+    // sync_cursor para que el desktop la jale
+    sqlx::query(
+        "INSERT INTO sync_cursor (tabla, uuid, sucursal_id, origen_device) \
+         VALUES ('aperturas_caja', $1, $2, $3)",
+    )
+    .bind(&new_uuid)
+    .bind(sucursal_id)
+    .bind(WEB_ORIGIN)
+    .execute(&state.pool)
+    .await?;
+
+    let id: i64       = row.get("id");
+    let fecha: String = row.get("fecha");
+
+    // Nombre del usuario (para devolver shape completa)
+    let nombre: String = sqlx::query_scalar(
+        "SELECT nombre_completo FROM usuarios WHERE id = $1",
+    )
+    .bind(d.usuario_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .unwrap_or_default();
+
+    Ok(json!({
+        "id":              id,
+        "usuario_id":      d.usuario_id,
+        "usuario_nombre":  nombre,
+        "fondo_declarado": d.fondo_declarado,
+        "nota":            d.nota,
+        "fecha":           fecha,
+    }))
+}
+
+/// Busca un usuario admin/dueño por PIN comparando contra el bcrypt hash.
+async fn buscar_dueno_por_pin(state: &AppState, pin: &str) -> Result<Option<i64>, ApiError> {
+    let candidatos = sqlx::query(
+        "SELECT id, pin FROM usuarios \
+         WHERE rol_id IN (1,2) AND activo = 1 AND deleted_at IS NULL",
+    )
+    .fetch_all(&state.pool)
+    .await?;
+    for r in &candidatos {
+        let hash: String = r.get("pin");
+        if bcrypt::verify(pin, &hash).unwrap_or(false) {
+            return Ok(Some(r.get::<i64, _>("id")));
+        }
+    }
+    Ok(None)
 }

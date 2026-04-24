@@ -340,3 +340,181 @@
   transition: background 0.1s;
 }
 .cart-item:hover { background: var(--color-surface-2); }
+
+/* ============================================================
+   LAYOUT DASHBOARD (responsive)
+   ============================================================ */
+.pos-dashboard {
+  display: grid;
+  grid-template-columns: 200px 1fr;
+  grid-template-rows: 48px 1fr;
+  height: 100vh;
+}
+
+/* Hamburguesa: oculta en desktop, visible en mobile */
+.pos-hamburger {
+  display: none;
+  background: transparent;
+  border: none;
+  padding: 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  color: var(--color-text);
+}
+.pos-hamburger:active { background: var(--color-surface-2); }
+
+.pos-sidebar-backdrop { display: none; }
+
+/* ============================================================
+   MEDIA QUERY MOBILE (≤768px)
+   ============================================================ */
+@media (max-width: 768px) {
+  /* Layout: una sola columna, sidebar absoluto que se desliza */
+  .pos-dashboard {
+    grid-template-columns: 1fr;
+  }
+
+  .pos-hamburger { display: inline-flex; }
+
+  /* Acortar título en mobile para que no choque con el botón usuario */
+  .pos-topbar-title {
+    font-size: 12px !important;
+    max-width: 140px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* Sidebar fuera de pantalla por defecto */
+  .pos-sidebar {
+    position: fixed;
+    top: 48px;
+    left: 0;
+    bottom: 0;
+    width: 240px;
+    z-index: 80;
+    transform: translateX(-100%);
+    transition: transform 0.2s ease;
+    box-shadow: 4px 0 12px rgba(0,0,0,0.15);
+  }
+  .pos-sidebar.open { transform: translateX(0); }
+
+  /* Backdrop semi-transparente */
+  .pos-sidebar-backdrop {
+    display: block;
+    position: fixed;
+    top: 48px;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0,0,0,0.5);
+    z-index: 70;
+  }
+
+  /* Topbar más compacto y sin overflow */
+  .pos-topbar { padding: 0 8px; gap: 4px; }
+  .pos-topbar > div { gap: 6px !important; }
+
+  /* Botones del sidebar más altos para dedo */
+  .pos-sidebar button { padding: 14px 14px !important; font-size: 14px !important; }
+
+  /* Inputs más grandes (44px+ es lo que recomienda Apple para touch) */
+  .input { padding: 12px 14px !important; font-size: 15px !important; }
+  .btn { padding: 10px 14px !important; font-size: 14px !important; min-height: 40px; }
+  .btn-sm { padding: 8px 12px !important; font-size: 13px !important; min-height: 36px; }
+  .btn-lg { padding: 14px 20px !important; font-size: 16px !important; min-height: 48px; }
+
+  /* Cards: padding más compacto en mobile */
+  .card { padding: 14px !important; }
+
+  /* Modales: full-width con scroll */
+  .modal { padding: 12px !important; }
+  .modal-body, .modal-content { width: 100% !important; max-width: 100% !important; }
+
+  /* Grids comunes que se aplastan en mobile → 1 columna */
+  .grid-2-mobile-1, .stats-grid {
+    grid-template-columns: 1fr !important;
+  }
+
+  /* ─── RECEPCIÓN — mobile ─────────────────────────────── */
+
+  /* Stack vertical: izquierda (escaneo+items) primero, derecha (proveedor+notas+confirmar) después */
+  .recepcion-grid {
+    grid-template-columns: 1fr !important;
+    grid-template-rows: auto auto !important;
+    overflow: auto;
+  }
+  .recepcion-col-left {
+    border-right: none !important;
+    border-bottom: 1px solid var(--color-border);
+  }
+  .recepcion-col-right {
+    background: var(--color-surface) !important;
+  }
+
+  /* Subheader compacto */
+  .recepcion-subheader {
+    padding: 8px 10px !important;
+    gap: 6px !important;
+    flex-wrap: wrap;
+  }
+  .recepcion-subheader h2 {
+    font-size: 14px !important;
+  }
+
+  /* Tabla de items escaneados → tarjetas */
+  .recepcion-items-table thead { display: none; }
+  .recepcion-items-table,
+  .recepcion-items-table tbody,
+  .recepcion-items-table tr,
+  .recepcion-items-table td { display: block; width: 100%; }
+  .recepcion-items-table tr {
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--color-border);
+    position: relative;
+  }
+  .recepcion-items-table td {
+    padding: 4px 0 !important;
+    text-align: left !important;
+    width: auto !important;
+  }
+  /* Inputs internos full-width para tocar fácil */
+  .recepcion-items-table input.input {
+    width: 100% !important;
+    text-align: center !important;
+    font-size: 16px !important;
+  }
+  .recepcion-items-table .btn {
+    min-height: 36px;
+  }
+
+  /* Tabla de detalle → también tarjetas */
+  .recepcion-detalle-table thead { display: none; }
+  .recepcion-detalle-table,
+  .recepcion-detalle-table tbody,
+  .recepcion-detalle-table tr,
+  .recepcion-detalle-table td { display: block; width: 100%; }
+  .recepcion-detalle-table tr {
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--color-border);
+  }
+  .recepcion-detalle-table td {
+    padding: 3px 0 !important;
+    text-align: left !important;
+  }
+
+  /* Tiles de detalle: 2 columnas en mobile */
+  .recepcion-detalle-tiles {
+    grid-template-columns: repeat(2, 1fr) !important;
+  }
+
+  /* Lista de recepciones: layout vertical, info en columna */
+  .recepcion-list-row {
+    flex-wrap: wrap;
+    gap: 6px !important;
+    padding: 12px 14px !important;
+  }
+  .recepcion-list-row > span {
+    min-width: auto !important;
+  }
+}

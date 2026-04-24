@@ -219,7 +219,7 @@ export default function Recepcion() {
 
     return (
       <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
-        <div style={{
+        <div className="recepcion-subheader" style={{
           padding: '10px 20px', borderBottom: '1px solid var(--color-border)',
           background: 'var(--color-surface)', display: 'flex', alignItems: 'center', gap: 10,
         }}>
@@ -239,9 +239,9 @@ export default function Recepcion() {
           )}
         </div>
 
-        <div style={{ flex: 1, display: 'grid', gridTemplateColumns: '1fr 380px', minHeight: 0 }}>
+        <div className="recepcion-grid" style={{ flex: 1, display: 'grid', gridTemplateColumns: '1fr 380px', minHeight: 0 }}>
           {/* Izquierda — escaneo + lista */}
-          <div style={{ display: 'flex', flexDirection: 'column', minHeight: 0, borderRight: '1px solid var(--color-border)' }}>
+          <div className="recepcion-col-left" style={{ display: 'flex', flexDirection: 'column', minHeight: 0, borderRight: '1px solid var(--color-border)' }}>
             {/* Barra de escaneo */}
             <div style={{ padding: '14px 16px', borderBottom: '1px solid var(--color-border)', background: 'var(--color-surface)' }}>
               <label style={labelStyle}>
@@ -321,7 +321,7 @@ export default function Recepcion() {
                   <p style={{ fontSize: 12 }}>Los productos se sumarán al stock cuando confirmes</p>
                 </div>
               ) : (
-                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+                <table className="recepcion-items-table" style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
                   <thead style={{ position: 'sticky', top: 0, background: 'var(--color-surface-2)', zIndex: 1 }}>
                     <tr style={{ fontSize: 10, fontWeight: 600, color: 'var(--color-text-dim)', textTransform: 'uppercase' }}>
                       <th style={{ padding: '8px 12px', textAlign: 'left' }}>Producto</th>
@@ -389,7 +389,7 @@ export default function Recepcion() {
           </div>
 
           {/* Derecha — resumen / metadatos */}
-          <div style={{ display: 'flex', flexDirection: 'column', minHeight: 0, background: 'var(--color-surface)' }}>
+          <div className="recepcion-col-right" style={{ display: 'flex', flexDirection: 'column', minHeight: 0, background: 'var(--color-surface)' }}>
             <div style={{ padding: '14px 16px', display: 'flex', flexDirection: 'column', gap: 12, flex: 1, overflow: 'auto' }}>
               <div>
                 <label style={labelStyle}>RECIBIR CONTRA PEDIDO (OPCIONAL)</label>
@@ -488,19 +488,19 @@ export default function Recepcion() {
         </div>
 
         <div style={{ flex: 1, overflow: 'auto', padding: 20 }}>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12, marginBottom: 20 }}>
+          <div className="recepcion-detalle-tiles" style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12, marginBottom: 20 }}>
             <Tile label="Fecha" value={formatFecha(recep.fecha)} />
             <Tile label="Proveedor" value={recep.proveedor_nombre || '—'} />
             <Tile label="Recibió" value={recep.usuario_nombre} />
             <Tile label="Costo total" value={fmt(totalCosto)} highlight />
           </div>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 12, marginBottom: 16 }}>
+          <div className="recepcion-detalle-tiles-2" style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 12, marginBottom: 16 }}>
             <Tile label="Productos" value={String(items.length)} />
             <Tile label="Unidades" value={String(totalUnidades)} />
           </div>
 
           <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
-            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+            <table className="recepcion-detalle-table" style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
               <thead>
                 <tr style={{ background: 'var(--color-surface-2)', fontSize: 11, fontWeight: 600, color: 'var(--color-text-dim)', textTransform: 'uppercase' }}>
                   <th style={{ padding: '8px 12px', textAlign: 'left' }}>Producto</th>
@@ -582,6 +582,7 @@ export default function Recepcion() {
           <div style={{ display: 'flex', flexDirection: 'column' }}>
             {recepciones.map(r => (
               <div key={r.id}
+                className="recepcion-list-row"
                 style={{
                   display: 'flex', alignItems: 'center', gap: 14,
                   padding: '12px 20px', borderBottom: '1px solid var(--color-border)',

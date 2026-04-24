@@ -22,7 +22,7 @@ import { useCortesStore } from '../store/cortesStore';
 import {
   ShoppingCart, Package, BarChart3, LogOut, ClipboardList,
   TruckIcon, Tag, Users, ScrollText, DollarSign, History, Settings, UserPlus, TrendingUp,
-  Smartphone,
+  Smartphone, Menu, X,
 } from 'lucide-react';
 
 type Modulo = 'venta' | 'catalogo' | 'dashboard' | 'presupuestos' | 'recepcion' | 'pedidos' | 'etiquetas' | 'bitacora' | 'usuarios' | 'clientes' | 'cortes' | 'historial' | 'reportes' | 'ajustes' | 'conexion';
@@ -46,6 +46,7 @@ export default function Dashboard() {
   const [verificandoApertura, setVerificandoApertura] = useState<boolean>(true);
   const [stockBajoCount, setStockBajoCount] = useState<number>(0);
   const [stockAlertDismiss, setStockAlertDismiss] = useState<boolean>(false);
+  const [mobileMenuOpen, setMobileMenuOpen] = useState<boolean>(false);
   const { obtenerAperturaHoy } = useCortesStore();
 
   // Triggers para abrir modales de cortes desde shortcuts globales
@@ -140,13 +141,20 @@ export default function Dashboard() {
         onSuccess={() => setNecesitaApertura(false)}
       />
     )}
-    <div style={{ display: 'grid', gridTemplateColumns: '200px 1fr', gridTemplateRows: '48px 1fr', height: '100vh' }}>
+    <div className="pos-dashboard">
 
       {/* ─── Top Bar ─── */}
       <div className="pos-topbar" style={{ gridColumn: '1 / -1' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <button
+            className="pos-hamburger btn-ghost"
+            aria-label="Menú"
+            onClick={() => setMobileMenuOpen(v => !v)}
+          >
+            {mobileMenuOpen ? <X size={20} /> : <Menu size={20} />}
+          </button>
           <img src="/logo.png" alt="LB" style={{ height: 30, width: 'auto' }} draggable={false} />
-          <span style={{ fontWeight: 700, fontSize: 14, color: 'var(--color-text)' }}>
+          <span className="pos-topbar-title" style={{ fontWeight: 700, fontSize: 14, color: 'var(--color-text)' }}>
             MOTO REFACCIONARIA LB
           </span>
         </div>
@@ -188,8 +196,13 @@ export default function Dashboard() {
         </div>
       </div>
 
+      {/* Backdrop para cerrar el menú al tocar afuera (solo mobile) */}
+      {mobileMenuOpen && (
+        <div className="pos-sidebar-backdrop" onClick={() => setMobileMenuOpen(false)} />
+      )}
+
       {/* ─── Sidebar ─── */}
-      <div style={{
+      <div className={`pos-sidebar${mobileMenuOpen ? ' open' : ''}`} style={{
         background: 'var(--color-surface)',
         borderRight: '1px solid var(--color-border)',
         display: 'flex', flexDirection: 'column',
@@ -200,7 +213,7 @@ export default function Dashboard() {
         {menuItems.filter(m => m.visible).map((item) => (
           <button
             key={item.id}
-            onClick={() => setModulo(item.id)}
+            onClick={() => { setModulo(item.id); setMobileMenuOpen(false); }}
             style={{
               display: 'flex', alignItems: 'center', gap: 10,
               padding: '10px 12px', borderRadius: 8, border: 'none',
