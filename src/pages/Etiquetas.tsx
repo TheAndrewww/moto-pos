@@ -3,7 +3,7 @@
 import { useState, useEffect, useRef, useMemo } from 'react';
 import { useProductStore, type Producto } from '../store/productStore';
 import { Tag, Search, Printer, X, Trash2 } from 'lucide-react';
-import { printHTML, escapeHTML } from '../utils/print';
+import { printHTMLExplicit, escapeHTML } from '../utils/print';
 import QRCode from 'qrcode';
 
 const QR_OPTS: QRCode.QRCodeToDataURLOptions = {
@@ -105,7 +105,7 @@ export default function Etiquetas() {
         </div>
       `).join('')}
       </body></html>`;
-    await printHTML(html);
+    printHTMLExplicit(html);
   };
 
   return (

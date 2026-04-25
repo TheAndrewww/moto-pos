@@ -71,3 +71,25 @@ export function escapeHTML(s: string): string {
   return s.replace(/[&<>"']/g, c =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!));
 }
+
+// Abre una ventana separada explícitamente para que el OS siempre muestre
+// la vista de diálogo de impresión. Especialmente útil para Etiquetas donde
+// el usuario debe poder seleccionar el tamaño de papel.
+export function printHTMLExplicit(html: string): void {
+  const win = window.open('', '_blank', 'width=800,height=600');
+  if (win) {
+    win.document.open();
+    // Añadimos un pequeño script para auto-lanzar el diálogo
+    win.document.write(html + '<script>window.onload = function() { window.print(); }</script>');
+    win.document.close();
+    win.focus();
+  } else {
+    // Failover
+    const blob = new Blob([html], { type: 'text/html' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.target = '_blank';
+    a.click();
+  }
+}
