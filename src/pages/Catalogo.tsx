@@ -14,7 +14,7 @@ export default function Catalogo() {
     categorias, proveedores, crearProducto, actualizarProducto,
     eliminarProducto, ajustarStock,
   } = useProductStore();
-  const _productosSub = useProductStore(s => s.productos.length);
+  useProductStore(s => s.productos.length); // Track array changes
   const { usuario, tienePermiso } = useAuthStore();
 
   const [showForm, setShowForm] = useState(false);
