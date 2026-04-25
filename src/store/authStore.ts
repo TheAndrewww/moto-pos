@@ -1,7 +1,28 @@
 // store/authStore.ts — Estado global de autenticación (Zustand)
 
 import { create } from 'zustand';
-import { invoke, setAuthToken } from '../lib/invokeCompat';
+import { invoke, setAuthToken, isTauri } from '../lib/invokeCompat';
+
+// En modo web, persistimos el objeto `usuario` en localStorage junto con el
+// JWT, para que recargar la página no expulse al usuario. En Tauri la sesión
+// vive en memoria de la ventana — no se pierde porque no hay reload.
+const USER_KEY = 'moto_usuario';
+
+function leerUsuarioPersistido(): UsuarioSesion | null {
+  if (isTauri()) return null;
+  try {
+    const raw = localStorage.getItem(USER_KEY);
+    return raw ? (JSON.parse(raw) as UsuarioSesion) : null;
+  } catch { return null; }
+}
+
+function guardarUsuarioPersistido(u: UsuarioSesion | null): void {
+  if (isTauri()) return;
+  try {
+    if (u) localStorage.setItem(USER_KEY, JSON.stringify(u));
+    else localStorage.removeItem(USER_KEY);
+  } catch { /* quota / safari privado: no-op */ }
+}
 
 export interface Permiso {
   modulo: string;
@@ -43,7 +64,10 @@ interface AuthState {
 }
 
 export const useAuthStore = create<AuthState>((set, get) => ({
-  usuario: null,
+  // Hidratar desde localStorage al arrancar (solo modo web). En Tauri retorna
+  // null porque la sesión real vive en el backend Rust y este state es solo
+  // un cache UI.
+  usuario: leerUsuarioPersistido(),
   cargando: false,
   error: null,
 
@@ -65,6 +89,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       }>('login_pin', { pin });
       if (result.ok && result.usuario) {
         if (result.token) setAuthToken(result.token);
+        guardarUsuarioPersistido(result.usuario);
         set({ usuario: result.usuario, cargando: false, error: null });
         return true;
       } else {
@@ -85,6 +110,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       }>('login_password', { nombreUsuario: nombre_usuario, password });
       if (result.ok && result.usuario) {
         if (result.token) setAuthToken(result.token);
+        guardarUsuarioPersistido(result.usuario);
         set({ usuario: result.usuario, cargando: false, error: null });
         return true;
       } else {
@@ -107,6 +133,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       }).catch(() => {});
     }
     setAuthToken(null);  // limpia token en web (no-op en Tauri si nunca se setteó)
+    guardarUsuarioPersistido(null);
     set({ usuario: null, error: null });
   },
 
