@@ -32,6 +32,10 @@ pub struct DatosTicketTermico {
     pub items: Vec<ItemTicket>,
     pub subtotal: f64,
     pub descuento: f64,
+    /// Monto agregado por redondeo al peso siguiente (>= 0). Opcional para
+    /// retrocompatibilidad con tickets viejos que no lo enviaban.
+    #[serde(default)]
+    pub redondeo: f64,
     pub total: f64,
     pub metodo_pago: String,
 }
@@ -154,6 +158,9 @@ pub fn generar_ticket_venta(datos: &DatosTicketTermico) -> Vec<u8> {
     linea_kv(&mut b, "Subtotal:", &format!("${:.2}", datos.subtotal), ancho);
     if datos.descuento > 0.0 {
         linea_kv(&mut b, "Descuento:", &format!("-${:.2}", datos.descuento), ancho);
+    }
+    if datos.redondeo > 0.0 {
+        linea_kv(&mut b, "Redondeo:", &format!("+${:.2}", datos.redondeo), ancho);
     }
     negrita_on(&mut b);
     linea_kv(&mut b, "TOTAL:", &format!("${:.2}", datos.total), ancho);

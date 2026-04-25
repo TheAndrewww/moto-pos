@@ -358,6 +358,9 @@ function ModalDetalleVenta({
         })),
         subtotal: venta.subtotal,
         descuento: venta.descuento,
+        // El redondeo no se guarda en BD; se infiere por diferencia.
+        // Si total > (subtotal - descuento) entonces hubo redondeo hacia arriba.
+        redondeo: Math.max(0, +(venta.total - (venta.subtotal - venta.descuento)).toFixed(2)),
         total: venta.total,
         metodo_pago: venta.metodo_pago,
         reimpresion: true,

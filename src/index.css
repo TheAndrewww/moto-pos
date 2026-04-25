@@ -347,8 +347,10 @@
 .pos-dashboard {
   display: grid;
   grid-template-columns: 200px 1fr;
-  grid-template-rows: 48px 1fr;
+  grid-template-rows: 48px minmax(0, 1fr);
   height: 100vh;
+  min-height: 0;
+  overflow: hidden;
 }
 
 /* Hamburguesa: oculta en desktop, visible en mobile */

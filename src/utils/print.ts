@@ -1,18 +1,27 @@
-// utils/print.ts — Impresión híbrida: WebView (Windows) → Navegador fallback (macOS)
-
-import { invoke } from '../lib/invokeCompat';
+// utils/print.ts — Impresión vía iframe oculto (sin abrir ventanas externas)
+//
+// Estrategia: renderizar el HTML en un iframe invisible y llamar window.print()
+// dentro de él. La ruta ideal es la impresora térmica ESC/POS configurada en
+// Ajustes (silenciosa). Este fallback solo entra si no hay térmica.
+//
+// Comportamiento por plataforma del fallback:
+//   - Windows (WebView2): imprime silenciosamente sin diálogo.
+//   - macOS (WebKit):     muestra el diálogo de impresión del sistema (1 clic).
+//                         No abre ventana de navegador.
+//
+// Si la impresión via iframe falla (raro), mostramos un aviso. Antes el fallback
+// abría una pestaña en el navegador con el ticket; eso fue eliminado a petición.
 
 export async function printHTML(html: string): Promise<void> {
-  // Intentar primero con WebView (funciona en Windows/WebView2)
   const ok = await tryWebViewPrint(html);
   if (!ok) {
-    // Fallback: abrir en navegador del sistema (macOS/WebKit)
-    try {
-      await invoke('imprimir_html', { html });
-    } catch (e) {
-      console.error('Error al imprimir:', e);
-      alert('Error al imprimir: ' + String(e));
-    }
+    // No abrimos navegador — solo notificamos al usuario.
+    console.warn('Impresión silenciosa falló. Configurar impresora térmica en Ajustes.');
+    alert(
+      'No se pudo imprimir el ticket automáticamente.\n\n' +
+      'Para impresión silenciosa configura una impresora térmica ESC/POS ' +
+      'en Ajustes → Impresora.'
+    );
   }
 }
 
@@ -34,27 +43,18 @@ function tryWebViewPrint(html: string): Promise<boolean> {
       doc.write(html);
       doc.close();
 
-      // Esperar a que renderice y luego intentar imprimir
+      // Esperar a que renderice y luego imprimir directo desde el iframe.
       setTimeout(() => {
         try {
           const win = iframe.contentWindow;
           if (!win) { iframe.remove(); resolve(false); return; }
 
-          // En WebView2 (Windows), esto funciona perfectamente
-          // En WebKit (macOS), falla silenciosamente
-          // Detectar si estamos en macOS para ir directo al fallback
-          const isMac = navigator.userAgent.includes('Macintosh') ||
-                        navigator.platform?.includes('Mac');
-
-          if (isMac) {
-            iframe.remove();
-            resolve(false); // Ir directo al fallback en macOS
-            return;
-          }
-
           win.focus();
           win.print();
-          setTimeout(() => iframe.remove(), 1000);
+
+          // Quitar el iframe después; si la diálogo de macOS bloquea el
+          // hilo de UI, este timeout solo corre cuando se cierra.
+          setTimeout(() => iframe.remove(), 1500);
           resolve(true);
         } catch {
           iframe.remove();

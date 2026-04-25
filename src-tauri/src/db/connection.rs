@@ -19,11 +19,14 @@ pub fn init_database(db_path: &Path) -> Result<Connection> {
     // Aplicar schema (crea tablas e índices)
     conn.execute_batch(SCHEMA_V1)?;
 
-    // Insertar datos iniciales
-    conn.execute_batch(SEED_DATA)?;
-
-    // Aplicar migraciones incrementales (columnas nuevas, etc.)
+    // IMPORTANTE: las migraciones DEBEN correr antes de SEED_DATA.
+    // SEED_DATA hace INSERT OR IGNORE en tablas sincronizadas (ej. categorias);
+    // esos INSERT disparan triggers que asumen el esquema migrado (uuid,
+    // updated_at). Si el esquema todavía no está reparado, el seed truena.
     aplicar_migraciones(&conn)?;
+
+    // Insertar datos iniciales (después de migraciones)
+    conn.execute_batch(SEED_DATA)?;
 
     // VACUUM semanal: compactar BD si han pasado >= 7 días
     vacuum_si_toca(&conn, db_path);

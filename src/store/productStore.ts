@@ -70,6 +70,8 @@ interface ProductState {
   buscarPorCodigo: (codigo: string) => Promise<Producto | null>;
   crearProducto: (producto: NuevoProducto, usuario_id: number) => Promise<Producto>;
   actualizarProducto: (producto: any, usuario_id: number) => Promise<boolean>;
+  eliminarProducto: (producto_id: number, usuario_id: number) => Promise<boolean>;
+  ajustarStock: (producto_id: number, nuevo_stock: number, motivo: string, usuario_id: number) => Promise<boolean>;
 }
 
 function normalizar(s: string): string {
@@ -208,6 +210,37 @@ export const useProductStore = create<ProductState>((set, get) => ({
     const ok = await invoke<boolean>('actualizar_producto', { producto, usuarioId: usuario_id });
     if (ok) {
       const productos = await invoke<Producto[]>('listar_productos');
+      rebuildIndex(productos);
+      set({ productos });
+    }
+    return ok;
+  },
+
+  eliminarProducto: async (producto_id, usuario_id) => {
+    const ok = await invoke<boolean>('eliminar_producto', {
+      productoId: producto_id, usuarioId: usuario_id,
+    });
+    if (ok) {
+      // Quitar localmente sin necesidad de refetch completo
+      const productos = get().productos.filter(p => p.id !== producto_id);
+      rebuildIndex(productos);
+      set({ productos });
+    }
+    return ok;
+  },
+
+  ajustarStock: async (producto_id, nuevo_stock, motivo, usuario_id) => {
+    const ok = await invoke<boolean>('ajustar_stock', {
+      productoId: producto_id,
+      nuevoStock: nuevo_stock,
+      motivo,
+      usuarioId: usuario_id,
+    });
+    if (ok) {
+      // Actualizar en memoria sin refetch (más fluido)
+      const productos = get().productos.map(p =>
+        p.id === producto_id ? { ...p, stock_actual: nuevo_stock } : p
+      );
       rebuildIndex(productos);
       set({ productos });
     }

@@ -236,7 +236,7 @@ export default function Dashboard() {
       </div>
 
       {/* ─── Contenido ─── */}
-      <div style={{ overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+      <div style={{ overflow: 'hidden', display: 'flex', flexDirection: 'column', minHeight: 0, minWidth: 0 }}>
 
         {/* Alerta de corte del día pendiente */}
         {cortePendiente && (

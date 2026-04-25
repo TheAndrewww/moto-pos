@@ -8,7 +8,8 @@ mod sync;
 use commands::auth::{AppState, login_pin, login_password, logout, verificar_pin_dueno, resolver_dueno_por_pin, crear_usuario_inicial};
 use commands::productos::{
     listar_productos, obtener_producto_por_codigo, generar_codigo_interno,
-    crear_producto, actualizar_producto, listar_productos_stock_bajo,
+    crear_producto, actualizar_producto, eliminar_producto, ajustar_stock,
+    listar_productos_stock_bajo,
     listar_categorias, listar_proveedores,
     listar_clientes, crear_cliente, actualizar_cliente, toggle_cliente_activo,
     obtener_config_descuentos,
@@ -170,6 +171,8 @@ pub fn run() {
             generar_codigo_interno,
             crear_producto,
             actualizar_producto,
+            eliminar_producto,
+            ajustar_stock,
             listar_productos_stock_bajo,
             historial_precios_producto,
             listar_categorias,

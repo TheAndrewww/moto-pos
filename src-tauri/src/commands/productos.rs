@@ -44,6 +44,7 @@ pub struct NuevoProducto {
 #[derive(Deserialize)]
 pub struct ActualizarProducto {
     pub id: i64,
+    pub codigo: String,
     pub nombre: String,
     pub descripcion: Option<String>,
     pub categoria_id: Option<i64>,
@@ -316,7 +317,8 @@ pub fn actualizar_producto(
         |row| row.get(0),
     ).ok();
 
-    let search_text = normalizar_texto(&format!("{} {}",
+    let search_text = normalizar_texto(&format!("{} {} {}",
+        producto.codigo,
         producto.nombre,
         producto.descripcion.as_deref().unwrap_or("")
     ));
@@ -325,13 +327,13 @@ pub fn actualizar_producto(
 
     db.execute(
         r#"UPDATE productos SET
-            nombre = ?, descripcion = ?, categoria_id = ?,
+            codigo = ?, nombre = ?, descripcion = ?, categoria_id = ?,
             precio_costo = ?, precio_venta = ?,
             stock_minimo = ?, proveedor_id = ?, foto_url = ?,
             search_text = ?, updated_at = ?
            WHERE id = ?"#,
         rusqlite::params![
-            producto.nombre, producto.descripcion, producto.categoria_id,
+            producto.codigo, producto.nombre, producto.descripcion, producto.categoria_id,
             producto.precio_costo, producto.precio_venta,
             producto.stock_minimo, producto.proveedor_id, producto.foto_url,
             search_text, now, producto.id
@@ -365,6 +367,115 @@ pub fn actualizar_producto(
             ],
         );
     }
+
+    Ok(true)
+}
+
+/// Eliminar producto (soft delete).
+///
+/// No hace DELETE físico para no romper integridad con ventas anteriores
+/// (venta_detalle.producto_id → productos.id). En su lugar:
+///   - `activo = 0` → desaparece de listados y de búsqueda en el POS
+///   - `deleted_at = datetime('now')` → marca tombstone para sync remoto
+///   - `updated_at` se bumpea automáticamente vía trigger
+///
+/// El registro queda en la BD para mantener consistencia histórica.
+#[tauri::command]
+pub fn eliminar_producto(
+    producto_id: i64,
+    usuario_id: i64,
+    state: State<'_, AppState>,
+) -> Result<bool, String> {
+    let db = state.db.lock().unwrap();
+
+    // Capturar nombre para bitácora antes de marcar como eliminado
+    let nombre: String = db.query_row(
+        "SELECT nombre FROM productos WHERE id = ?",
+        rusqlite::params![producto_id],
+        |row| row.get(0),
+    ).map_err(|e| format!("Producto no encontrado: {}", e))?;
+
+    let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+
+    let n = db.execute(
+        "UPDATE productos SET activo = 0, deleted_at = ?, updated_at = ? WHERE id = ?",
+        rusqlite::params![now, now, producto_id],
+    ).map_err(|e| e.to_string())?;
+
+    if n == 0 {
+        return Err("Producto no encontrado".to_string());
+    }
+
+    // Bitácora
+    let _ = db.execute(
+        r#"INSERT INTO audit_log (usuario_id, accion, tabla_afectada, registro_id, descripcion_legible, origen)
+           VALUES (?, 'PRODUCTO_ELIMINADO', 'productos', ?, ?, 'POS')"#,
+        rusqlite::params![
+            usuario_id, producto_id,
+            format!("Producto eliminado: {}", nombre)
+        ],
+    );
+
+    Ok(true)
+}
+
+/// Ajustar stock de un producto (entrada/salida manual).
+///
+/// Sirve para correcciones de inventario, mermas, ajustes físicos. NO usar
+/// para ventas o recepciones, que tienen sus propios comandos.
+///
+/// Registra en bitácora con datos viejos→nuevos para que pueda auditarse el
+/// movimiento (quién, cuándo, qué cantidad y por qué motivo).
+#[tauri::command]
+pub fn ajustar_stock(
+    producto_id: i64,
+    nuevo_stock: f64,
+    motivo: String,
+    usuario_id: i64,
+    state: State<'_, AppState>,
+) -> Result<bool, String> {
+    if motivo.trim().is_empty() {
+        return Err("El motivo es obligatorio".to_string());
+    }
+
+    let db = state.db.lock().unwrap();
+
+    let (nombre, stock_anterior): (String, f64) = db.query_row(
+        "SELECT nombre, stock_actual FROM productos WHERE id = ?",
+        rusqlite::params![producto_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).map_err(|e| format!("Producto no encontrado: {}", e))?;
+
+    let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+
+    db.execute(
+        "UPDATE productos SET stock_actual = ?, updated_at = ? WHERE id = ?",
+        rusqlite::params![nuevo_stock, now, producto_id],
+    ).map_err(|e| e.to_string())?;
+
+    // También sincronizar stock_sucursal (sucursal 1 = principal por default)
+    let _ = db.execute(
+        "UPDATE stock_sucursal SET stock_actual = ?, updated_at = ?
+         WHERE producto_id = ? AND sucursal_id = 1",
+        rusqlite::params![nuevo_stock, now, producto_id],
+    );
+
+    let diff = nuevo_stock - stock_anterior;
+    let signo = if diff >= 0.0 { "+" } else { "" };
+    let json_ant = format!("{{\"stock_actual\":{}}}", stock_anterior);
+    let json_new = format!("{{\"stock_actual\":{},\"motivo\":\"{}\"}}",
+        nuevo_stock, motivo.replace('"', "\\\""));
+
+    let _ = db.execute(
+        r#"INSERT INTO audit_log (usuario_id, accion, tabla_afectada, registro_id,
+           datos_anteriores, datos_nuevos, descripcion_legible, origen)
+           VALUES (?, 'STOCK_AJUSTADO', 'productos', ?, ?, ?, ?, 'POS')"#,
+        rusqlite::params![
+            usuario_id, producto_id, json_ant, json_new,
+            format!("Stock ajustado: {} ({}{}) — {}",
+                nombre, signo, diff, motivo.trim())
+        ],
+    );
 
     Ok(true)
 }

@@ -13,7 +13,7 @@ export default function PuntoDeVenta() {
   const { productos, cargarTodo, busqueda, setBusqueda, productosFiltrados } = useProductStore();
   const {
     agregarProducto, quitarProducto, cambiarCantidad,
-    total, numItems,
+    total, totalSinRedondeo, redondeo, numItems,
     setMetodoPago, setMontoRecibido,
     procesarVenta, ventaExitosa, cerrarVentaExitosa, procesando,
     clientes, cargarClientes, seleccionarCliente,
@@ -136,6 +136,7 @@ export default function PuntoDeVenta() {
     const { subtotal, descuentoTotal } = useVentaStore.getState();
     const subtotalSnap = subtotal();
     const descuentoSnap = descuentoTotal();
+    const redondeoSnap = redondeo();
     const totalSnap = total();
     const clienteSnap = clienteSeleccionado?.nombre || null;
     const metodoSnap = metodoPago;
@@ -153,6 +154,7 @@ export default function PuntoDeVenta() {
         items: itemsSnapshot,
         subtotal: subtotalSnap,
         descuento: descuentoSnap,
+        redondeo: redondeoSnap,
         total: venta.total,
         metodo_pago: metodoSnap,
         monto_recibido: recibidoSnap,
@@ -277,12 +279,13 @@ export default function PuntoDeVenta() {
   }
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+    <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
       {/* ─── Barra de pestañas ─── */}
       <div style={{
         display: 'flex', alignItems: 'center', gap: 2,
         padding: '6px 10px 0', background: 'var(--color-surface)',
         borderBottom: '1px solid var(--color-border)', overflowX: 'auto',
+        flexShrink: 0,
       }}>
         {tabs.map(t => {
           const isActiva = t.id === tabActivaId;
@@ -381,9 +384,9 @@ export default function PuntoDeVenta() {
         </div>
       </div>
 
-    <div style={{ display: 'grid', gridTemplateColumns: '1fr 360px', flex: 1, minHeight: 0, gap: 0 }}>
+    <div style={{ display: 'grid', gridTemplateColumns: '1fr 360px', gridTemplateRows: 'minmax(0, 1fr)', flex: 1, minHeight: 0, gap: 0 }}>
       {/* ─── Panel Izquierdo: Productos ─── */}
-      <div style={{ display: 'flex', flexDirection: 'column', borderRight: '1px solid var(--color-border)' }}>
+      <div style={{ display: 'flex', flexDirection: 'column', borderRight: '1px solid var(--color-border)', minHeight: 0, minWidth: 0 }}>
         {/* Barra de escaneo */}
         <div style={{ padding: '10px 16px', borderBottom: '1px solid var(--color-border)', display: 'flex', gap: 8 }}>
           <div style={{ flex: 1, position: 'relative' }}>
@@ -507,12 +510,13 @@ export default function PuntoDeVenta() {
       </div>
 
       {/* ─── Panel Derecho: Resumen + Cobro ─── */}
-      <div style={{ display: 'flex', flexDirection: 'column', background: 'var(--color-surface)' }}>
+      <div style={{ display: 'flex', flexDirection: 'column', background: 'var(--color-surface)', minHeight: 0, minWidth: 0 }}>
         {/* Cliente */}
         <div style={{
           padding: '10px 16px',
           borderBottom: '1px solid var(--color-border)',
           display: 'flex', alignItems: 'center', gap: 8,
+          flexShrink: 0,
         }}>
           <User size={16} style={{ color: 'var(--color-text-dim)' }} />
           <select
@@ -545,6 +549,19 @@ export default function PuntoDeVenta() {
           <div className="price-display" style={{ fontSize: 48, color: modo === 'presupuesto' ? '#e6a817' : undefined }}>
             {fmt(total())}
           </div>
+          {/* Aviso de redondeo: solo en modo venta y cuando el raw tiene centavos */}
+          {modo === 'venta' && redondeo() > 0 && (
+            <div style={{
+              fontSize: 11, color: 'var(--color-text-muted)',
+              display: 'flex', alignItems: 'center', gap: 6,
+              background: 'var(--color-surface-2)', padding: '3px 10px', borderRadius: 12,
+              fontFamily: "'JetBrains Mono', monospace",
+            }}
+              title="El total se redondea hacia arriba al peso siguiente para evitar entregar centavos en el cambio."
+            >
+              {fmt(totalSinRedondeo())} <span>+</span> {fmt(redondeo())} <span style={{ color: 'var(--color-text-dim)' }}>redondeo</span>
+            </div>
+          )}
           <span style={{ fontSize: 13, color: 'var(--color-text-dim)' }}>
             {numItems()} artículo{numItems() !== 1 ? 's' : ''} en el carrito
           </span>
@@ -570,7 +587,7 @@ export default function PuntoDeVenta() {
 
         {/* Campo monto recibido (efectivo, solo venta) */}
         {modo === 'venta' && metodoPago === 'efectivo' && items.length > 0 && (
-          <div style={{ padding: '0 16px 12px', display: 'flex', flexDirection: 'column', gap: 6 }}>
+          <div style={{ padding: '0 16px 12px', display: 'flex', flexDirection: 'column', gap: 6, flexShrink: 0 }}>
             <label style={{ fontSize: 11, fontWeight: 600, color: 'var(--color-text-muted)' }}>
               MONTO RECIBIDO
             </label>
@@ -596,7 +613,7 @@ export default function PuntoDeVenta() {
 
         {/* Campos extra en modo presupuesto */}
         {modo === 'presupuesto' && (
-          <div style={{ padding: '0 16px 12px', display: 'flex', flexDirection: 'column', gap: 10 }}>
+          <div style={{ padding: '0 16px 12px', display: 'flex', flexDirection: 'column', gap: 10, flexShrink: 0 }}>
             <div>
               <label style={{ fontSize: 11, fontWeight: 600, color: 'var(--color-text-muted)' }}>
                 VIGENCIA (DÍAS)
@@ -625,7 +642,7 @@ export default function PuntoDeVenta() {
         )}
 
         {/* Botón principal */}
-        <div style={{ padding: 16 }}>
+        <div style={{ padding: 16, flexShrink: 0 }}>
           {modo === 'venta' ? (
             <button
               className="btn btn-success btn-xl"

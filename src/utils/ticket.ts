@@ -31,6 +31,8 @@ export interface TicketData {
   items: TicketItem[];
   subtotal: number;
   descuento: number;
+  /** Monto agregado por redondeo al peso siguiente (>= 0). Opcional. */
+  redondeo?: number;
   total: number;
   metodo_pago: string;
   monto_recibido?: number;
@@ -56,9 +58,9 @@ export function buildTicketHTML(negocio: ConfigNegocio, t: TicketData): string {
 
   return `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Ticket ${escapeHTML(t.folio)}</title>
 <style>
-  @page { size: 80mm auto; margin: 0; }
+  @page { size: 58mm auto; margin: 0; }
   html, body { margin: 0; padding: 0; font-family: 'Courier New', monospace; color: #000; }
-  body { width: 76mm; padding: 2mm; font-size: 10pt; line-height: 1.25; }
+  body { width: 50mm; padding: 2mm; font-size: 9pt; line-height: 1.25; }
   .center { text-align: center; }
   .right { text-align: right; }
   .bold { font-weight: 700; }
@@ -74,8 +76,8 @@ export function buildTicketHTML(negocio: ConfigNegocio, t: TicketData): string {
   .item-sub { font-weight: 700; }
   .total-row { font-size: 13pt; font-weight: 900; color: #000; }
   .reprint { border: 1px solid #000; padding: 2px 6px; display: inline-block; font-size: 8pt; margin-bottom: 3px; }
-  .logo { width: 50mm; max-width: 80%; height: auto; margin: 3px auto; display: block; }
-  .brand-name { font-size: 13pt; font-weight: 900; letter-spacing: 0.5px; margin: 2px 0; color: #000; }
+  .logo { width: 40mm; max-width: 80%; height: auto; margin: 3px auto; display: block; }
+  .brand-name { font-size: 11pt; font-weight: 900; letter-spacing: 0.5px; margin: 2px 0; color: #000; }
   .brand-sub { font-size: 8pt; color: #000; font-weight: 700; letter-spacing: 1px; margin-bottom: 2px; }
   .footer-msg { font-size: 9pt; font-weight: 600; margin: 4px 0 2px; }
   .footer-brand { font-size: 7pt; color: #000; font-weight: 700; letter-spacing: 0.5px; margin-top: 4px; }
@@ -92,14 +94,15 @@ export function buildTicketHTML(negocio: ConfigNegocio, t: TicketData): string {
   <div class="sep-thick"></div>
   <div class="row"><span>Folio:</span><span class="bold">${escapeHTML(t.folio)}</span></div>
   <div class="row"><span>Fecha:</span><span>${escapeHTML(t.fecha)}</span></div>
-  <div class="row"><span>Cajero:</span><span>${escapeHTML(t.usuario)}</span></div>
+  <div class="row"><span>Cajero:</span><span>${escapeHTML(t.usuario.split(' ')[0])}</span></div>
   ${t.cliente ? `<div class="row"><span>Cliente:</span><span>${escapeHTML(t.cliente)}</span></div>` : ''}
   <div class="sep"></div>
   ${itemsHTML}
   <div class="sep"></div>
-  ${t.descuento > 0 ? `
+  ${(t.descuento > 0 || (t.redondeo ?? 0) > 0) ? `
     <div class="row"><span>Subtotal:</span><span>${fmt(t.subtotal)}</span></div>
-    <div class="row"><span>Descuento:</span><span>-${fmt(t.descuento)}</span></div>
+    ${t.descuento > 0 ? `<div class="row"><span>Descuento:</span><span>-${fmt(t.descuento)}</span></div>` : ''}
+    ${(t.redondeo ?? 0) > 0 ? `<div class="row"><span>Redondeo:</span><span>+${fmt(t.redondeo!)}</span></div>` : ''}
   ` : ''}
   <div class="row total-row"><span>TOTAL:</span><span>${fmt(t.total)}</span></div>
   <div class="sep"></div>
@@ -129,7 +132,7 @@ export async function imprimirTicket(negocio: ConfigNegocio, data: TicketData): 
           mensaje_pie: negocio.mensaje_pie,
           folio: data.folio,
           fecha: data.fecha,
-          usuario: data.usuario,
+          usuario: data.usuario.split(' ')[0],
           cliente: data.cliente ?? null,
           items: data.items.map(i => ({
             cantidad: i.cantidad,
@@ -139,6 +142,7 @@ export async function imprimirTicket(negocio: ConfigNegocio, data: TicketData): 
           })),
           subtotal: data.subtotal,
           descuento: data.descuento,
+          redondeo: data.redondeo ?? 0,
           total: data.total,
           metodo_pago: data.metodo_pago,
         },

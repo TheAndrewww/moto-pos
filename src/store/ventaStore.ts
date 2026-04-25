@@ -105,7 +105,9 @@ interface VentaState {
   // Computed (sobre pestaña activa)
   subtotal: () => number;
   descuentoTotal: () => number;
-  total: () => number;
+  totalSinRedondeo: () => number; // suma cruda antes de redondear (con centavos)
+  redondeo: () => number;         // monto agregado por redondeo (>= 0)
+  total: () => number;            // total a cobrar — redondeado al peso siguiente
   cambio: () => number;
   numItems: () => number;
 
@@ -201,7 +203,28 @@ export const useVentaStore = create<VentaState>((set, get) => {
 
     subtotal: () => getActiva().items.reduce((acc, i) => acc + i.subtotal, 0),
     descuentoTotal: () => getActiva().items.reduce((acc, i) => acc + (i.descuentoMonto * i.cantidad), 0),
-    total: () => getActiva().items.reduce((acc, i) => acc + i.subtotal, 0),
+    // Total crudo (con centavos) — solo informativo / para tickets
+    totalSinRedondeo: () => getActiva().items.reduce((acc, i) => acc + i.subtotal, 0),
+    // Monto que se agrega al redondear hacia arriba al peso. 0 si ya es entero.
+    // Math.round * 100 protege contra errores de punto flotante (e.g. 67.79999...)
+    redondeo: () => {
+      const raw = getActiva().items.reduce((acc, i) => acc + i.subtotal, 0);
+      if (raw <= 0) return 0;
+      const cents = Math.round(raw * 100);
+      const remainder = cents % 100;
+      if (remainder === 0) return 0;
+      return (100 - remainder) / 100;
+    },
+    // Total a cobrar — siempre número entero de pesos (sin centavos).
+    // Si raw es 67.80 → 68. Si raw es 70.00 → 70 (sin cambio).
+    total: () => {
+      const raw = getActiva().items.reduce((acc, i) => acc + i.subtotal, 0);
+      if (raw <= 0) return 0;
+      const cents = Math.round(raw * 100);
+      const remainder = cents % 100;
+      if (remainder === 0) return cents / 100;
+      return Math.ceil(cents / 100);
+    },
     cambio: () => {
       const total = get().total();
       return Math.max(0, getActiva().montoRecibido - total);
@@ -315,6 +338,8 @@ export const useVentaStore = create<VentaState>((set, get) => {
           cliente_id: activa.clienteSeleccionado?.id || null,
           subtotal: s.subtotal(),
           descuento: s.descuentoTotal(),
+          // total ya viene redondeado al peso (Math.ceil). La diferencia
+          // entre subtotal-descuento y total queda como redondeo implícito.
           total: s.total(),
           metodo_pago: activa.metodoPago,
           monto_recibido: activa.montoRecibido,

@@ -4,14 +4,15 @@
 import { useState, useEffect, useRef } from 'react';
 import { useProductStore, type Producto, type NuevoProducto } from '../store/productStore';
 import { useAuthStore } from '../store/authStore';
-import { Package, Plus, Search, Edit2, X, AlertTriangle, Tag, Hash, LayoutGrid, List, Upload, History } from 'lucide-react';
+import { Package, Plus, Search, Edit2, X, AlertTriangle, Tag, Hash, LayoutGrid, List, Upload, History, Trash2 } from 'lucide-react';
 import { invoke } from '../lib/invokeCompat';
 import { useVirtualizer } from '@tanstack/react-virtual';
 
 export default function Catalogo() {
   const {
-    productosFiltrados, cargarTodo, busqueda, setBusqueda,
+    productos, productosFiltrados, cargarTodo, busqueda, setBusqueda,
     categorias, proveedores, crearProducto, actualizarProducto,
+    eliminarProducto, ajustarStock,
   } = useProductStore();
   const { usuario, tienePermiso } = useAuthStore();
 
@@ -19,9 +20,11 @@ export default function Catalogo() {
   const [showImportar, setShowImportar] = useState(false);
   const [editando, setEditando] = useState<Producto | null>(null);
   const [filtroCategoria, setFiltroCategoria] = useState<number | null>(null);
+  const [filtroProveedor, setFiltroProveedor] = useState<number | null>(null);
   const [filtroStock, setFiltroStock] = useState<'todos' | 'bajo' | 'cero'>('todos');
   const [vista, setVista] = useState<'grid' | 'lista'>('grid');
   const [localBusqueda, setLocalBusqueda] = useState(busqueda);
+  const [confirmarEliminar, setConfirmarEliminar] = useState<Producto | null>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // React-virtual state
@@ -52,11 +55,18 @@ export default function Catalogo() {
   const esAdmin = usuario?.es_admin ?? false;
   const puedeEditar = esAdmin || tienePermiso('inventario', 'editar');
   const puedeCrear = esAdmin || tienePermiso('inventario', 'crear');
+  const puedeEliminar = esAdmin || tienePermiso('inventario', 'eliminar');
+
+  // Estado del modal inline de ajuste de stock (clic en badge)
+  const [stockModal, setStockModal] = useState<Producto | null>(null);
 
   // Filtrar productos
   let listaFinal = productosFiltrados();
   if (filtroCategoria) {
     listaFinal = listaFinal.filter(p => p.categoria_id === filtroCategoria);
+  }
+  if (filtroProveedor) {
+    listaFinal = listaFinal.filter(p => p.proveedor_id === filtroProveedor);
   }
   if (filtroStock === 'bajo') {
     listaFinal = listaFinal.filter(p => p.stock_actual <= p.stock_minimo && p.stock_actual > 0);
@@ -129,6 +139,7 @@ export default function Catalogo() {
         if (editando) {
           await actualizarProducto({
             id: editando.id,
+            codigo: form.codigo,
             nombre: form.nombre,
             descripcion: form.descripcion || null,
             categoria_id: form.categoria_id ? Number(form.categoria_id) : null,
@@ -138,6 +149,10 @@ export default function Catalogo() {
             proveedor_id: form.proveedor_id ? Number(form.proveedor_id) : null,
             foto_url: null,
           }, usuario.id);
+          
+          if (Number(form.stock_actual) !== editando.stock_actual) {
+            await ajustarStock(editando.id, Number(form.stock_actual), "Ajuste directo desde editor", usuario.id);
+          }
         } else {
           const nuevo: NuevoProducto = {
             nombre: form.nombre,
@@ -285,11 +300,11 @@ export default function Catalogo() {
             {/* Código + Categoría */}
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
               <div>
-                <label style={labelStyle}>CÓDIGO {!editando && '(vacío = autogenerar MR-XXXXX)'}</label>
+                <label style={labelStyle}>CÓDIGO {editando ? '' : '(vacío = autogenerar MR-XXXXX)'}</label>
                 <input className="input" value={form.codigo}
                   onChange={e => setForm(f => ({ ...f, codigo: e.target.value }))}
-                  placeholder="Escanear o dejar vacío"
-                  disabled={!!editando} />
+                  placeholder="Escanear o editar código"
+                  />
               </div>
               <div>
                 <label style={labelStyle}>CATEGORÍA</label>
@@ -328,13 +343,11 @@ export default function Catalogo() {
 
             {/* Stock */}
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12 }}>
-              {!editando && (
-                <div>
-                  <label style={labelStyle}>STOCK INICIAL</label>
-                  <input className="input mono" type="number" step="1" value={form.stock_actual}
-                    onChange={e => setForm(f => ({ ...f, stock_actual: parseFloat(e.target.value) || 0 }))} />
-                </div>
-              )}
+              <div>
+                <label style={labelStyle}>{editando ? 'STOCK ACTUAL' : 'STOCK INICIAL'}</label>
+                <input className="input mono" type="number" step="1" value={form.stock_actual}
+                  onChange={e => setForm(f => ({ ...f, stock_actual: parseFloat(e.target.value) || 0 }))} />
+              </div>
               <div>
                 <label style={labelStyle}>STOCK MÍNIMO</label>
                 <input className="input mono" type="number" step="1" value={form.stock_minimo}
@@ -354,7 +367,24 @@ export default function Catalogo() {
               <p style={{ color: 'var(--color-danger)', fontSize: 13 }}>{error}</p>
             )}
 
-            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 4 }}>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 4 }}>
+              {/* Eliminar — solo en modo edición, alineado a la izquierda */}
+              {editando && puedeEliminar && (
+                <button
+                  type="button"
+                  className="btn btn-ghost"
+                  style={{ color: 'var(--color-danger)' }}
+                  onClick={async () => {
+                    if (!usuario) return;
+                    setConfirmarEliminar(editando);
+                  }}
+                  disabled={guardando}
+                  title="Eliminar producto"
+                >
+                  <Trash2 size={14} /> Eliminar
+                </button>
+              )}
+              <div style={{ flex: 1 }} />
               <button type="button" className="btn btn-ghost"
                 onClick={() => { setShowForm(false); setEditando(null); }}>
                 Cancelar
@@ -435,10 +465,19 @@ export default function Catalogo() {
             className="input"
             value={filtroCategoria || ''}
             onChange={e => setFiltroCategoria(e.target.value ? Number(e.target.value) : null)}
-            style={{ width: 180 }}
+            style={{ width: 150 }}
           >
-            <option value="">Todas las categorías</option>
+            <option value="">Categorías (Todas)</option>
             {categorias.map(c => <option key={c.id} value={c.id}>{c.nombre}</option>)}
+          </select>
+          <select
+            className="input"
+            value={filtroProveedor || ''}
+            onChange={e => setFiltroProveedor(e.target.value ? Number(e.target.value) : null)}
+            style={{ width: 150 }}
+          >
+            <option value="">Proveedores (Todos)</option>
+            {proveedores.map(p => <option key={p.id} value={p.id}>{p.nombre}</option>)}
           </select>
           <select
             className="input"
@@ -561,20 +600,41 @@ export default function Catalogo() {
                             {fmt(p.precio_venta)}
                           </div>
                           <div>
-                            <span className={`tag ${sinStock ? 'tag-danger' : stockBajo ? 'tag-warning' : 'tag-success'}`}
-                              style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12, padding: '2px 8px' }}>
+                            <span
+                              className={`tag ${sinStock ? 'tag-danger' : stockBajo ? 'tag-warning' : 'tag-success'}`}
+                              style={{
+                                fontFamily: "'JetBrains Mono', monospace", fontSize: 12, padding: '2px 8px',
+                                cursor: puedeEditar ? 'pointer' : 'default',
+                              }}
+                              onClick={(e) => { if (puedeEditar) { e.stopPropagation(); setStockModal(p); } }}
+                              title={puedeEditar ? 'Clic para ajustar stock' : ''}
+                            >
                               {sinStock && <AlertTriangle size={10} style={{ marginRight: 4 }} />}
                               Stock: {p.stock_actual}
                             </span>
                           </div>
-                          <div>
+                          <div style={{ display: 'flex', gap: 4 }}>
                             {puedeEditar && (
                               <button
                                 className="btn btn-ghost btn-sm"
                                 style={{ padding: '6px' }}
                                 onClick={(e) => { e.stopPropagation(); setEditando(p); setShowForm(true); }}
+                                title="Editar"
                               >
                                 <Edit2 size={14} />
+                              </button>
+                            )}
+                            {puedeEliminar && (
+                              <button
+                                className="btn btn-ghost btn-sm"
+                                style={{ padding: '6px', color: 'var(--color-danger)' }}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setConfirmarEliminar(p);
+                                }}
+                                title="Eliminar"
+                              >
+                                <Trash2 size={14} />
                               </button>
                             )}
                           </div>
@@ -695,8 +755,15 @@ export default function Catalogo() {
                               <div style={{ fontSize: 10, color: 'var(--color-text-dim)', fontWeight: 600, marginBottom: 2 }}>
                                 STOCK
                               </div>
-                              <span className={`tag ${sinStock ? 'tag-danger' : stockBajo ? 'tag-warning' : 'tag-success'}`}
-                                style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 13, padding: '3px 10px' }}>
+                              <span
+                                className={`tag ${sinStock ? 'tag-danger' : stockBajo ? 'tag-warning' : 'tag-success'}`}
+                                style={{
+                                  fontFamily: "'JetBrains Mono', monospace", fontSize: 13, padding: '3px 10px',
+                                  cursor: puedeEditar ? 'pointer' : 'default',
+                                }}
+                                onClick={(e) => { if (puedeEditar) { e.stopPropagation(); setStockModal(p); } }}
+                                title={puedeEditar ? 'Clic para ajustar stock' : ''}
+                              >
                                 {sinStock && <AlertTriangle size={11} style={{ marginRight: 4 }} />}
                                 {p.stock_actual}
                               </span>
@@ -744,6 +811,197 @@ export default function Catalogo() {
       {/* Modal de form */}
       {showForm && <FormProducto />}
       {showImportar && <ImportarModal onClose={() => setShowImportar(false)} onDone={() => { setShowImportar(false); cargarTodo(); }} />}
+      {stockModal && (
+        <AjustarStockModal
+          producto={stockModal}
+          onClose={() => setStockModal(null)}
+          onSave={async (nuevo, motivo) => {
+            if (!usuario) return;
+            await ajustarStock(stockModal.id, nuevo, motivo, usuario.id);
+            setStockModal(null);
+          }}
+        />
+      )}
+
+      {/* Modal Confirmar Eliminar */}
+      {confirmarEliminar && (
+        <div style={{
+          position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', zIndex: 1000,
+          display: 'flex', alignItems: 'center', justifyContent: 'center'
+        }} onClick={() => setConfirmarEliminar(null)}>
+          <div className="card animate-fade-in" style={{ width: 400, padding: 24, textAlign: 'center' }} onClick={e => e.stopPropagation()}>
+            <Trash2 size={48} style={{ color: 'var(--color-danger)', margin: '0 auto 16px' }} strokeWidth={1.5} />
+            <h3 style={{ fontSize: 18, fontWeight: 700, marginBottom: 12 }}>¿Estás seguro?</h3>
+            <p style={{ fontSize: 14, color: 'var(--color-text-dim)', marginBottom: 24 }}>
+              ¿Deseas eliminar permanentemente <b>{confirmarEliminar.nombre}</b>? Esta acción lo ocultará del catálogo, aunque las ventas pasadas se mantendrán.
+            </p>
+            <div style={{ display: 'flex', gap: 12 }}>
+              <button className="btn btn-ghost" style={{ flex: 1 }} onClick={() => setConfirmarEliminar(null)}>
+                Cancelar
+              </button>
+              <button
+                className="btn btn-primary"
+                style={{ flex: 1, background: 'var(--color-danger)' }}
+                onClick={async () => {
+                  if (!usuario) return;
+                  try {
+                    await eliminarProducto(confirmarEliminar.id, usuario.id);
+                    setConfirmarEliminar(null);
+                    if (editando?.id === confirmarEliminar.id) {
+                      setShowForm(false);
+                      setEditando(null);
+                    }
+                  } catch (err: any) {
+                    alert('Error al eliminar: ' + err);
+                  }
+                }}
+              >
+                Eliminar Producto
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Modal de ajuste de stock ─────────────────────────────────────
+function AjustarStockModal({
+  producto, onClose, onSave,
+}: {
+  producto: Producto;
+  onClose: () => void;
+  onSave: (nuevo: number, motivo: string) => Promise<void>;
+}) {
+  const [nuevo, setNuevo] = useState<string>(String(producto.stock_actual));
+  const [motivo, setMotivo] = useState('');
+  const [guardando, setGuardando] = useState(false);
+  const [error, setError] = useState('');
+
+  const nuevoNum = parseFloat(nuevo);
+  const valido = !isNaN(nuevoNum) && nuevoNum >= 0;
+  const diff = valido ? nuevoNum - producto.stock_actual : 0;
+
+  const motivosRapidos = [
+    'Conteo físico',
+    'Merma / dañado',
+    'Recibido sin orden',
+    'Ajuste por inventario',
+    'Robo / extravío',
+  ];
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!valido) return setError('Ingresa una cantidad válida (≥ 0)');
+    if (!motivo.trim()) return setError('Indica el motivo del ajuste');
+    if (diff === 0) return setError('El nuevo stock es igual al actual');
+    setGuardando(true);
+    setError('');
+    try {
+      await onSave(nuevoNum, motivo.trim());
+    } catch (err: any) {
+      setError(err?.toString() || 'Error al ajustar stock');
+      setGuardando(false);
+    }
+  };
+
+  return (
+    <div
+      style={{
+        position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 100,
+      }}
+      onClick={onClose}
+    >
+      <div
+        className="card animate-fade-in"
+        style={{ width: 440, padding: 24 }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+          <h2 style={{ fontSize: 17, fontWeight: 700 }}>📦 Ajustar Stock</h2>
+          <button className="btn btn-ghost btn-sm" onClick={onClose}><X size={18} /></button>
+        </div>
+
+        <div style={{ marginBottom: 14, padding: 12, background: 'var(--color-surface-2)', borderRadius: 8 }}>
+          <p style={{ fontSize: 11, color: 'var(--color-text-muted)', fontWeight: 600 }}>PRODUCTO</p>
+          <p style={{ fontSize: 14, fontWeight: 700, marginTop: 2 }}>{producto.nombre}</p>
+          <p className="mono" style={{ fontSize: 12, color: 'var(--color-text-dim)', marginTop: 2 }}>{producto.codigo}</p>
+        </div>
+
+        <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+            <div>
+              <label style={labelStyle}>STOCK ACTUAL</label>
+              <input className="input mono" value={producto.stock_actual} disabled
+                style={{ background: 'var(--color-surface-2)' }} />
+            </div>
+            <div>
+              <label style={labelStyle}>NUEVO STOCK *</label>
+              <input
+                className="input mono"
+                type="number"
+                step="1"
+                min="0"
+                value={nuevo}
+                onChange={e => setNuevo(e.target.value)}
+                autoFocus
+              />
+            </div>
+          </div>
+
+          {valido && diff !== 0 && (
+            <div style={{
+              padding: 10, borderRadius: 8, fontSize: 13,
+              background: diff > 0 ? 'rgba(34,197,94,0.08)' : 'rgba(220,53,69,0.08)',
+              color: diff > 0 ? 'var(--color-success, #22c55e)' : 'var(--color-danger)',
+              fontWeight: 600,
+            }}>
+              {diff > 0 ? '▲ Entrada' : '▼ Salida'} de {Math.abs(diff)} unidad{Math.abs(diff) !== 1 ? 'es' : ''}
+            </div>
+          )}
+
+          <div>
+            <label style={labelStyle}>MOTIVO *</label>
+            <input
+              className="input"
+              value={motivo}
+              onChange={e => setMotivo(e.target.value)}
+              placeholder="Razón del ajuste"
+            />
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 8 }}>
+              {motivosRapidos.map(m => (
+                <button
+                  key={m}
+                  type="button"
+                  onClick={() => setMotivo(m)}
+                  style={{
+                    fontSize: 11, padding: '4px 10px', borderRadius: 12,
+                    border: '1px solid var(--color-border)',
+                    background: motivo === m ? 'var(--color-primary-soft)' : 'var(--color-surface-2)',
+                    color: motivo === m ? 'var(--color-primary)' : 'var(--color-text-muted)',
+                    cursor: 'pointer', fontWeight: 600,
+                  }}
+                >
+                  {m}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {error && (
+            <p style={{ color: 'var(--color-danger)', fontSize: 13 }}>{error}</p>
+          )}
+
+          <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 4 }}>
+            <button type="button" className="btn btn-ghost" onClick={onClose}>Cancelar</button>
+            <button type="submit" className="btn btn-primary" disabled={guardando || !valido || !motivo.trim() || diff === 0}>
+              {guardando ? 'Guardando...' : 'Confirmar ajuste'}
+            </button>
+          </div>
+        </form>
+      </div>
     </div>
   );
 }
