@@ -3,7 +3,7 @@
 import { useState, useEffect, useRef, useMemo } from 'react';
 import { useProductStore, type Producto } from '../store/productStore';
 import { Tag, Search, Printer, X, Trash2 } from 'lucide-react';
-import { printHTMLExplicit, escapeHTML } from '../utils/print';
+import { printHTMLDialogOverlay, escapeHTML } from '../utils/print';
 import QRCode from 'qrcode';
 
 const QR_OPTS: QRCode.QRCodeToDataURLOptions = {
@@ -78,14 +78,16 @@ export default function Etiquetas() {
     await Promise.all(
       codigosUnicos.map(async c => { qrMap[c] = await QRCode.toDataURL(c, QR_OPTS); })
     );
-    const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Etiquetas</title>
+    // Para printHTMLDialogOverlay ocupamos inyectar el contenido en un div
+    const html = `
       <style>
         @page { margin: 2mm; }
-        html, body { margin: 0; padding: 0; font-family: Arial, sans-serif; }
+        .etiqueta-print-container { font-family: Arial, sans-serif; }
         .etiqueta {
           width: 50mm; height: 25mm; border: 0.3mm dashed #ccc;
           padding: 2mm; display: inline-flex; align-items: center; gap: 2mm;
           page-break-inside: avoid; box-sizing: border-box;
+          margin-bottom: 2px;
         }
         .qr { width: 20mm; height: 20mm; flex-shrink: 0; }
         .info { flex: 1; display: flex; flex-direction: column; justify-content: center; text-align: left; overflow: hidden; }
@@ -93,7 +95,8 @@ export default function Etiquetas() {
                   overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
         .precio { font-size: 13pt; font-weight: 900; line-height: 1; }
         .codigo { font-size: 6pt; color: #666; font-family: monospace; margin-top: 0.5mm; }
-      </style></head><body>
+      </style>
+      <div class="etiqueta-print-container">
       ${etiquetas.map(p => `
         <div class="etiqueta">
           <img class="qr" src="${qrMap[p.codigo]}" alt="${escapeHTML(p.codigo)}" />
@@ -104,8 +107,8 @@ export default function Etiquetas() {
           </div>
         </div>
       `).join('')}
-      </body></html>`;
-    printHTMLExplicit(html);
+      </div>`;
+    printHTMLDialogOverlay(html);
   };
 
   return (

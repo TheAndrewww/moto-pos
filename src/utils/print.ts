@@ -1,26 +1,12 @@
-// utils/print.ts — Impresión vía iframe oculto (sin abrir ventanas externas)
-//
-// Estrategia: renderizar el HTML en un iframe invisible y llamar window.print()
-// dentro de él. La ruta ideal es la impresora térmica ESC/POS configurada en
-// Ajustes (silenciosa). Este fallback solo entra si no hay térmica.
-//
-// Comportamiento por plataforma del fallback:
-//   - Windows (WebView2): imprime silenciosamente sin diálogo.
-//   - macOS (WebKit):     muestra el diálogo de impresión del sistema (1 clic).
-//                         No abre ventana de navegador.
-//
-// Si la impresión via iframe falla (raro), mostramos un aviso. Antes el fallback
-// abría una pestaña en el navegador con el ticket; eso fue eliminado a petición.
+// utils/print.ts
 
 export async function printHTML(html: string): Promise<void> {
   const ok = await tryWebViewPrint(html);
   if (!ok) {
-    // No abrimos navegador — solo notificamos al usuario.
-    console.warn('Impresión silenciosa falló. Configurar impresora térmica en Ajustes.');
+    console.warn('Impresión silenciosa falló.');
     alert(
-      'No se pudo imprimir el ticket automáticamente.\n\n' +
-      'Para impresión silenciosa configura una impresora térmica ESC/POS ' +
-      'en Ajustes → Impresora.'
+      'No se pudo imprimir automáticamente.\n\n' +
+      'Configura una impresora térmica ESC/POS en Ajustes.'
     );
   }
 }
@@ -33,27 +19,18 @@ function tryWebViewPrint(html: string): Promise<boolean> {
       document.body.appendChild(iframe);
 
       const doc = iframe.contentDocument || iframe.contentWindow?.document;
-      if (!doc) {
-        iframe.remove();
-        resolve(false);
-        return;
-      }
+      if (!doc) { iframe.remove(); resolve(false); return; }
 
       doc.open();
       doc.write(html);
       doc.close();
 
-      // Esperar a que renderice y luego imprimir directo desde el iframe.
       setTimeout(() => {
         try {
           const win = iframe.contentWindow;
           if (!win) { iframe.remove(); resolve(false); return; }
-
           win.focus();
           win.print();
-
-          // Quitar el iframe después; si la diálogo de macOS bloquea el
-          // hilo de UI, este timeout solo corre cuando se cierra.
           setTimeout(() => iframe.remove(), 1500);
           resolve(true);
         } catch {
@@ -72,24 +49,49 @@ export function escapeHTML(s: string): string {
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!));
 }
 
-// Abre una ventana separada explícitamente para que el OS siempre muestre
-// la vista de diálogo de impresión. Especialmente útil para Etiquetas donde
-// el usuario debe poder seleccionar el tamaño de papel.
-export function printHTMLExplicit(html: string): void {
-  const win = window.open('', '_blank', 'width=800,height=600');
-  if (win) {
-    win.document.open();
-    // Añadimos un pequeño script para auto-lanzar el diálogo
-    win.document.write(html + '<script>window.onload = function() { window.print(); }</script>');
-    win.document.close();
-    win.focus();
-  } else {
-    // Failover
-    const blob = new Blob([html], { type: 'text/html' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.target = '_blank';
-    a.click();
-  }
+// Utiliza la ventana principal de la aplicación para disparar de manera garantizada
+// el cuadro de diálogo de impresión del Sistema Operativo con soporte de @media print.
+export function printHTMLDialogOverlay(htmlContent: string): void {
+  const container = document.createElement('div');
+  container.id = 'print-dialog-overlay';
+  container.innerHTML = htmlContent;
+  document.body.appendChild(container);
+
+  const style = document.createElement('style');
+  style.id = 'print-dialog-style';
+  style.innerHTML = `
+    @media print {
+      body > :not(#print-dialog-overlay) {
+        display: none !important;
+      }
+      #print-dialog-overlay {
+        display: block !important;
+        position: absolute;
+        left: 0;
+        top: 0;
+        width: 100%;
+        margin: 0;
+        padding: 0;
+        background: white;
+      }
+    }
+    @media screen {
+      #print-dialog-overlay {
+        display: none !important;
+      }
+    }
+  `;
+  document.head.appendChild(style);
+
+  const cleanup = () => {
+    container.remove();
+    style.remove();
+    window.removeEventListener('afterprint', cleanup);
+  };
+  
+  window.addEventListener('afterprint', cleanup);
+  setTimeout(cleanup, 120000); // 2 minutos máximo
+
+  // Lanzar el print nativo que forzosamente abre el diálogo
+  setTimeout(() => window.print(), 100);
 }
