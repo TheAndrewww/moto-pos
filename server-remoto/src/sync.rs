@@ -341,13 +341,12 @@ fn bind_json<'q>(
         }
         Value::String(s) => {
             // Strings vacíos → NULL (para FKs opcionales que SQLite envía como "")
+            // No coercionar strings numéricos a i64: rompe columnas TEXT con
+            // valores numéricos (productos.codigo, clientes.telefono, etc.).
+            // Si SQLite tiene una columna INTEGER, rusqlite devuelve
+            // ValueRef::Integer → Value::Number, no Value::String.
             if s.is_empty() {
                 q.bind(Option::<String>::None)
-            } else if let Ok(n) = s.parse::<i64>() {
-                // SQLite puede serializar INTEGER como string "1"/"0" en algunos
-                // contextos (backfill manual, afinidad TEXT, activo, anulada...).
-                // Bind como i64 para que Postgres acepte columnas INTEGER/BIGINT.
-                q.bind(n)
             } else {
                 q.bind(s.as_str())
             }
