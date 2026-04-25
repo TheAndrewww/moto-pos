@@ -2,7 +2,7 @@
 # Multi-stage: compila Rust en imagen builder, corre binario en imagen slim.
 
 # ---------- Stage 1: Builder ----------
-FROM rust:1.82-slim AS builder
+FROM rust:1.86-slim AS builder
 
 # Dependencias de sistema para compilar (sqlx-postgres usa OpenSSL via rustls,
 # pero pkg-config y libssl-dev no estorban y dan compatibilidad).
