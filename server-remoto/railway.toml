@@ -2,9 +2,8 @@
 # Asume plugin Postgres agregado (DATABASE_URL inyectado).
 
 [build]
-builder = "nixpacks"
+builder = "dockerfile"
+dockerfilePath = "Dockerfile"
 
 [deploy]
-# Nixpacks copia el binario producido (nombre = package name) a ./bin
-startCommand = "./bin"
 restartPolicyType = "always"

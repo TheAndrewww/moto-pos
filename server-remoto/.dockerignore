@@ -1,0 +1,9 @@
+target/
+**/target/
+.git/
+.idea/
+.vscode/
+*.log
+.env
+test_bcrypt.rs
+README.md
