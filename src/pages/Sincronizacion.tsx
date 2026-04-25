@@ -2,7 +2,7 @@
 
 import { useState, useEffect } from 'react';
 import { invoke } from '../lib/invokeCompat';
-import { Cloud, CloudOff, CheckCircle2, AlertTriangle, RefreshCw, Wifi, Save } from 'lucide-react';
+import { Cloud, CloudOff, CheckCircle2, AlertTriangle, RefreshCw, Wifi, Save, Upload } from 'lucide-react';
 
 interface EstadoSync {
   activo: boolean;
@@ -20,6 +20,7 @@ export default function Sincronizacion() {
   const [conectando, setConectando] = useState(false);
   const [desactivando, setDesactivando] = useState(false);
   const [probando, setProbando] = useState(false);
+  const [reenviando, setReenviando] = useState(false);
   const [mensaje, setMensaje] = useState<{ tipo: 'ok' | 'error' | 'info'; texto: string } | null>(null);
 
   // Form
@@ -83,6 +84,24 @@ export default function Sincronizacion() {
       setMensaje({ tipo: 'error', texto: typeof e === 'string' ? e : 'No se pudo desactivar.' });
     } finally {
       setDesactivando(false);
+    }
+  };
+
+  const reenviarTodo = async () => {
+    if (!confirm('¿Reenviar todos los datos existentes al servidor? Útil tras configurar el sync por primera vez. Los datos ya sincronizados no se duplican.')) return;
+    setReenviando(true);
+    setMensaje(null);
+    try {
+      const total = await invoke<number>('backfill_outbox');
+      cargarEstado();
+      setMensaje({
+        tipo: 'ok',
+        texto: `${total} registros encolados. Empezarán a subirse en los próximos 30 segundos.`,
+      });
+    } catch (e: any) {
+      setMensaje({ tipo: 'error', texto: typeof e === 'string' ? e : 'Error encolando datos.' });
+    } finally {
+      setReenviando(false);
     }
   };
 
@@ -255,6 +274,16 @@ export default function Sincronizacion() {
                 {probando
                   ? <><RefreshCw size={14} className="spin" /> Probando…</>
                   : <><Wifi size={14} /> Probar conexión</>}
+              </button>
+              <button
+                className="btn btn-ghost"
+                onClick={reenviarTodo}
+                disabled={reenviando}
+                title="Encola todos los datos locales para subirlos al servidor. Útil la primera vez."
+              >
+                {reenviando
+                  ? <><RefreshCw size={14} className="spin" /> Encolando…</>
+                  : <><Upload size={14} /> Reenviar todo</>}
               </button>
               <button
                 className="btn btn-ghost"

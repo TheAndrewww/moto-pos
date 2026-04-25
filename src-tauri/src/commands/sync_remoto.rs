@@ -106,3 +106,51 @@ pub async fn probar_conexion_sync(state: State<'_, AppState>) -> Result<bool, St
     let client = RemoteClient::new(&url, &token)?;
     Ok(client.health().await)
 }
+
+/// Encola TODOS los registros existentes de las tablas sincronizables en sync_outbox.
+/// Usado tras configurar sync por primera vez para subir datos preexistentes
+/// (los triggers solo capturan cambios futuros, no históricos).
+/// Devuelve cuántas filas se encolaron en total.
+#[tauri::command]
+pub fn backfill_outbox(state: State<AppState>) -> Result<i64, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+
+    // Mismas tablas que tienen triggers de outbox (ver migrations.rs::migracion_005_triggers_outbox)
+    let tablas: &[&str] = &[
+        "productos", "proveedores", "clientes", "usuarios", "categorias",
+        "sucursales", "stock_sucursal",
+        "ventas", "presupuestos", "ordenes_pedido", "recepciones",
+        "cortes", "devoluciones", "transferencias",
+        "movimientos_caja", "aperturas_caja",
+    ];
+
+    let mut total: i64 = 0;
+    for tabla in tablas {
+        // INSERT OR IGNORE para no duplicar entradas pendientes existentes.
+        // La PK conflictual (tabla, uuid) WHERE synced_at IS NULL evita reabrir
+        // entradas ya sincronizadas — pero para backfill queremos justamente
+        // que se reabran si no se sincronizaron. Usamos INSERT con ON CONFLICT
+        // que toca created_at para forzar reintento.
+        let sql = format!(
+            r#"
+            INSERT INTO sync_outbox (tabla, uuid, operacion)
+            SELECT '{tabla}', uuid, 'UPDATE'
+              FROM {tabla}
+             WHERE uuid IS NOT NULL
+            ON CONFLICT(tabla, uuid) WHERE synced_at IS NULL
+            DO UPDATE SET created_at = datetime('now'), intentos = 0, ultimo_error = NULL
+            "#,
+            tabla = tabla
+        );
+        match conn.execute(&sql, []) {
+            Ok(n) => total += n as i64,
+            Err(e) => {
+                // Si la tabla no tiene columna uuid o no existe, ignoramos y seguimos
+                log::warn!("backfill_outbox: tabla '{}' falló: {}", tabla, e);
+            }
+        }
+    }
+
+    log::info!("backfill_outbox: {} filas encoladas", total);
+    Ok(total)
+}

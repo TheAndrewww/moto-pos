@@ -57,6 +57,7 @@ use commands::conexion::{
 };
 use commands::sync_remoto::{
     obtener_estado_sync, configurar_sync, desactivar_sync, probar_conexion_sync,
+    backfill_outbox,
 };
 use db::connection::init_database;
 use std::sync::{Arc, Mutex};
@@ -249,6 +250,7 @@ pub fn run() {
             configurar_sync,
             desactivar_sync,
             probar_conexion_sync,
+            backfill_outbox,
         ])
         .run(tauri::generate_context!())
         .expect("Error al iniciar el POS");
