@@ -13,6 +13,7 @@ const MIGRATIONS: &[MigrationFn] = &[
     migracion_004_sync_remoto_y_sucursales,
     migracion_005_triggers_outbox,
     migracion_006_impresora_termica,
+    migracion_007_uuid_auto_y_backfill,
 ];
 
 pub fn aplicar_migraciones(conn: &Connection) -> Result<()> {
@@ -404,5 +405,106 @@ fn migracion_006_impresora_termica(conn: &Connection) -> Result<()> {
         "ALTER TABLE config_negocio ADD COLUMN impresora_termica TEXT NOT NULL DEFAULT ''",
         [],
     );
+    Ok(())
+}
+
+// ─── Migración 007 ────────────────────────────────────────
+// Arregla un bug crítico de sync: varios INSERT (crear_producto,
+// crear_cliente, crear_usuario, importar_catalogo_csv, etc.) NO generaban
+// uuid al insertar filas. Eso dejaba miles de filas con uuid=NULL que los
+// triggers de outbox ignoraban (WHEN NEW.uuid IS NOT NULL), por lo que esas
+// filas nunca se sincronizaban al servidor remoto.
+//
+// Soluciones:
+//   1. Pueblar uuid en filas existentes con uuid NULL (re-ejecuta lo de v4
+//      para capturar todo lo creado después).
+//   2. Agregar triggers BEFORE INSERT que generen uuid si es NULL — así
+//      cualquier INSERT futuro queda blindado sin necesidad de tocar los
+//      commands. (rusqlite/SQLite no soporta DEFAULT con función volátil
+//      como randomblob, por eso es trigger y no DEFAULT clause.)
+//   3. Re-encolar todas las filas en sync_outbox para que el worker las
+//      empuje al remoto.
+fn migracion_007_uuid_auto_y_backfill(conn: &Connection) -> Result<()> {
+    // Tablas que necesitan uuid auto-generado y backfill.
+    // (transferencias se omite — ya tiene UNIQUE NOT NULL, no acepta INSERT
+    // sin uuid; ese flujo sí lo genera.)
+    let tablas: &[&str] = &[
+        "productos", "proveedores", "clientes", "usuarios", "categorias",
+        "sucursales", "stock_sucursal",
+        "ventas", "venta_detalle", "presupuestos", "presupuesto_detalle",
+        "ordenes_pedido", "orden_pedido_detalle", "recepciones", "recepcion_detalle",
+        "cortes", "corte_denominaciones", "corte_vendedores",
+        "movimientos_caja", "aperturas_caja", "devoluciones", "devolucion_detalle",
+    ];
+
+    // 1. Backfill de uuids existentes
+    for tabla in tablas {
+        let sql = format!(
+            "UPDATE {} SET uuid = lower(hex(randomblob(16))) WHERE uuid IS NULL",
+            tabla
+        );
+        // Ignorar error si la tabla no existe (esquemas viejos)
+        let _ = conn.execute(&sql, []);
+    }
+
+    // 2. Trigger AFTER INSERT que auto-genera uuid si la fila se insertó
+    //    con uuid NULL. SQLite no permite SET de NEW en BEFORE INSERT, así
+    //    que usamos AFTER + UPDATE por rowid (idéntico patrón a los triggers
+    //    de updated_at de v5).
+    //
+    //    El UPDATE recursivo dispara trg_<tabla>_outbox_upd, que ahora sí
+    //    ve uuid IS NOT NULL y encola la fila — comportamiento deseado.
+    //
+    //    Durante apply de pull (sync_suppress_flag activo) no hace falta
+    //    suprimirlo porque el remoto siempre envía uuid; el WHEN uuid IS
+    //    NULL no se cumple, el trigger no dispara.
+    for tabla in tablas {
+        let trig = format!(
+            r#"
+            DROP TRIGGER IF EXISTS trg_{tabla}_uuid_auto;
+            CREATE TRIGGER trg_{tabla}_uuid_auto
+            AFTER INSERT ON {tabla}
+            FOR EACH ROW
+            WHEN NEW.uuid IS NULL
+            BEGIN
+                UPDATE {tabla} SET uuid = lower(hex(randomblob(16))) WHERE rowid = NEW.rowid;
+            END;
+            "#,
+            tabla = tabla
+        );
+        conn.execute_batch(&trig)?;
+    }
+
+    // 3. Re-encolar todas las filas con uuid en sync_outbox para que el
+    //    worker las empuje al remoto. Idempotente: ON CONFLICT actualiza
+    //    created_at y resetea intentos.
+    //
+    //    Solo tablas con triggers de outbox (catálogo + transaccionales
+    //    padres). Los detalles van junto al padre.
+    let tablas_outbox: &[&str] = &[
+        "productos", "proveedores", "clientes", "usuarios", "categorias",
+        "sucursales", "stock_sucursal",
+        "ventas", "presupuestos", "ordenes_pedido", "recepciones",
+        "cortes", "devoluciones", "transferencias",
+        "movimientos_caja", "aperturas_caja",
+    ];
+    for tabla in tablas_outbox {
+        let sql = format!(
+            r#"
+            INSERT INTO sync_outbox (tabla, uuid, operacion)
+            SELECT '{tabla}', uuid, 'UPDATE'
+              FROM {tabla}
+             WHERE uuid IS NOT NULL
+            ON CONFLICT(tabla, uuid) WHERE synced_at IS NULL
+            DO UPDATE SET created_at = datetime('now'), intentos = 0, ultimo_error = NULL
+            "#,
+            tabla = tabla
+        );
+        // Ignorar error si la tabla no existe en este esquema
+        if let Err(e) = conn.execute(&sql, []) {
+            log::warn!("migracion 007: re-encolar tabla '{}' falló: {}", tabla, e);
+        }
+    }
+
     Ok(())
 }
