@@ -10,10 +10,11 @@ import { useVirtualizer } from '@tanstack/react-virtual';
 
 export default function Catalogo() {
   const {
-    productos, productosFiltrados, cargarTodo, busqueda, setBusqueda,
+    productosFiltrados, cargarTodo, busqueda, setBusqueda,
     categorias, proveedores, crearProducto, actualizarProducto,
     eliminarProducto, ajustarStock,
   } = useProductStore();
+  const _productosSub = useProductStore(s => s.productos.length);
   const { usuario, tienePermiso } = useAuthStore();
 
   const [showForm, setShowForm] = useState(false);

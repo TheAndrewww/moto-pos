@@ -471,11 +471,11 @@ INSERT OR IGNORE INTO permisos (rol_id, modulo, accion, permitido) VALUES
 INSERT OR IGNORE INTO permisos (rol_id, modulo, accion, permitido) VALUES
     (2, 'ventas',     'ver',      1), (2, 'ventas',     'crear',    1),
     (2, 'ventas',     'anular',   0),
-    (2, 'devoluciones','ver',     1), (2, 'devoluciones','crear',   0),
-    (2, 'inventario', 'ver',      1), (2, 'inventario', 'crear',    0),
-    (2, 'inventario', 'editar',   0),
+    (2, 'devoluciones','ver',     1), (2, 'devoluciones','crear',   1),
+    (2, 'inventario', 'ver',      1), (2, 'inventario', 'crear',    1),
+    (2, 'inventario', 'editar',   1),
     (2, 'precios',    'ver',      0), (2, 'precios',    'editar',   0),
-    (2, 'pedidos',    'ver',      1), (2, 'pedidos',    'crear',    0),
+    (2, 'pedidos',    'ver',      1), (2, 'pedidos',    'crear',    1),
     (2, 'reportes',   'ver',      0),
     (2, 'usuarios',   'ver',      0),
     (2, 'bitacora',   'ver',      0);
