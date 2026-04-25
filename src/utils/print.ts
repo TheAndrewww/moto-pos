@@ -92,6 +92,6 @@ export function printHTMLDialogOverlay(htmlContent: string): void {
   window.addEventListener('afterprint', cleanup);
   setTimeout(cleanup, 120000); // 2 minutos máximo
 
-  // Lanzar el print nativo que forzosamente abre el diálogo
-  setTimeout(() => window.print(), 100);
+  // Lanzar el print nativo synchronously para no perder el contexto de evento de usuario (WebKit)
+  window.print();
 }
