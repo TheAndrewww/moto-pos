@@ -74,6 +74,12 @@ pub async fn dispatch(
         "obtener_info_servidor"         => obtener_info_servidor(&state).await?,
         "listar_dispositivos"           => listar_dispositivos(&state).await?,
 
+        // ─── Respaldos (no aplican en modo web — el server vive en Postgres
+        //     y se respalda con el motor de Railway, no desde el frontend) ──
+        "respaldo_auto_si_necesario"    => Value::Null,
+        "listar_respaldos"              => json!([]),
+        "crear_respaldo"                => Value::Null,
+
         // ─── Cortes / caja ───────────────────────────────────
         "obtener_apertura_hoy"          => obtener_apertura_hoy(&state).await?,
         "crear_apertura_caja"           => crear_apertura_caja(&state, &args).await?,
