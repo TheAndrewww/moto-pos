@@ -255,13 +255,19 @@ export default function PuntoDeVenta() {
           </p>
         </div>
         <div className="card" style={{ padding: 24, minWidth: 280, textAlign: 'center' }}>
-          <div className="price-display" style={{ color: 'var(--color-success)' }}>
-            {fmt(ventaExitosa.total)}
-          </div>
-          {ventaExitosa.cambio > 0 && (
-            <p style={{ color: 'var(--color-warning)', fontSize: 20, fontWeight: 700, marginTop: 8 }}>
-              Cambio: {fmt(ventaExitosa.cambio)}
-            </p>
+          {ventaExitosa.cambio > 0 ? (
+            <>
+              <p style={{ fontSize: 18, color: 'var(--color-text-muted)', fontWeight: 600, textTransform: 'uppercase', letterSpacing: 1 }}>
+                Cambio a entregar
+              </p>
+              <div className="price-display" style={{ color: 'var(--color-warning)', fontSize: 56, marginTop: 8, lineHeight: 1 }}>
+                {fmt(ventaExitosa.cambio)}
+              </div>
+            </>
+          ) : (
+            <div className="price-display" style={{ color: 'var(--color-success)', fontSize: 40, lineHeight: 1.2 }}>
+              Pago Exacto
+            </div>
           )}
         </div>
         <div style={{ display: 'flex', gap: 10 }}>
