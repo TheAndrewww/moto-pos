@@ -38,6 +38,7 @@ export interface TicketData {
   monto_recibido?: number;
   cambio?: number;
   reimpresion?: boolean;
+  es_presupuesto?: boolean;
 }
 
 const fmt = (n: number) => `$${n.toFixed(2)}`;
@@ -56,7 +57,7 @@ export function buildTicketHTML(negocio: ConfigNegocio, t: TicketData): string {
     </div>
   `).join('');
 
-  return `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Ticket ${escapeHTML(t.folio)}</title>
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${t.es_presupuesto ? 'Presupuesto' : 'Ticket'} ${escapeHTML(t.folio)}</title>
 <style>
   @page { size: 58mm auto; margin: 0; }
   html, body { margin: 0; padding: 0; font-family: 'Courier New', monospace; color: #000; }
@@ -82,7 +83,7 @@ export function buildTicketHTML(negocio: ConfigNegocio, t: TicketData): string {
   .footer-msg { font-size: 9pt; font-weight: 600; margin: 4px 0 2px; }
   .footer-brand { font-size: 7pt; color: #000; font-weight: 700; letter-spacing: 0.5px; margin-top: 4px; }
 </style></head><body>
-  ${t.reimpresion ? '<div class="center"><span class="reprint">*** REIMPRESIÓN ***</span></div>' : ''}
+  ${t.es_presupuesto ? '<div class="center"><span class="reprint">*** PRESUPUESTO ***</span><br><span style="font-size: 7pt; font-weight: bold; padding-top: 2px; display: inline-block;">Esta cotización puede variar sin previo aviso.</span></div>' : (t.reimpresion ? '<div class="center"><span class="reprint">*** REIMPRESIÓN ***</span></div>' : '')}
   <div class="center">
     <img class="logo" src="${window.location.origin}/logo-ticket.png" alt="Moto Refaccionaria LB" onerror="this.style.display='none'" />
     <div class="brand-name">${escapeHTML(negocio.nombre || 'MOTO REFACCIONARIA LB')}</div>
@@ -106,12 +107,14 @@ export function buildTicketHTML(negocio: ConfigNegocio, t: TicketData): string {
   ` : ''}
   <div class="row total-row"><span>TOTAL:</span><span>${fmt(t.total)}</span></div>
   <div class="sep"></div>
-  <div class="row"><span>Pago:</span><span class="bold">${escapeHTML(metodo)}</span></div>
-  ${mostrarEfectivo ? `
-    <div class="row"><span>Recibido:</span><span>${fmt(t.monto_recibido!)}</span></div>
-    <div class="row big bold"><span>Cambio:</span><span>${fmt(t.cambio || 0)}</span></div>
+  ${!t.es_presupuesto ? `
+    <div class="row"><span>Pago:</span><span class="bold">${escapeHTML(metodo)}</span></div>
+    ${mostrarEfectivo ? `
+      <div class="row"><span>Recibido:</span><span>${fmt(t.monto_recibido!)}</span></div>
+      <div class="row bold"><span>Cambio:</span><span>${fmt(t.cambio!)}</span></div>
+    ` : ''}
+    <div class="sep"></div>
   ` : ''}
-  <div class="sep-thick"></div>
   <div class="center footer-msg">${escapeHTML(negocio.mensaje_pie || '¡Gracias por su compra!')}</div>
   <div class="center muted">Conserve este ticket</div>
   <div class="center footer-brand">MOTO REFACCIONARIA LB</div>

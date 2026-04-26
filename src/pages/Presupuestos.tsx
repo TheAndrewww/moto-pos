@@ -7,8 +7,9 @@ import { useAuthStore } from '../store/authStore';
 import { useVentaStore } from '../store/ventaStore';
 import {
   ClipboardList, Plus, X, Eye, Check, XCircle,
-  RefreshCw, ShoppingCart,
+  RefreshCw, ShoppingCart, Printer
 } from 'lucide-react';
+import { imprimirTicket, type ConfigNegocio, type TicketData } from '../utils/ticket';
 
 interface Presupuesto {
   id: number;
@@ -53,10 +54,14 @@ export default function Presupuestos({ onIrAVenta }: PresupuestosProps = {}) {
   const [cargando, setCargando] = useState(true);
   const [filtroEstado, setFiltroEstado] = useState('');
   const [detalle, setDetalle] = useState<{ presup: Presupuesto; items: PresupuestoDetalle[] } | null>(null);
+  const [configNegocio, setConfigNegocio] = useState<ConfigNegocio | null>(null);
 
   const cargarDatos = async () => {
     setCargando(true);
     try {
+      const c = await invoke<ConfigNegocio>('obtener_config_negocio').catch(() => null);
+      if (c) setConfigNegocio(c);
+
       const data = await invoke<Presupuesto[]>('listar_presupuestos', {
         estadoFiltro: filtroEstado || null,
       });
@@ -143,6 +148,33 @@ export default function Presupuestos({ onIrAVenta }: PresupuestosProps = {}) {
     onIrAVenta?.();
   };
 
+  const handleImprimir = (p: Presupuesto, items: PresupuestoDetalle[]) => {
+    if (!configNegocio) {
+      alert("No se cargó la configuración del ticket.");
+      return;
+    }
+    const ticketData: TicketData = {
+      folio: p.folio,
+      fecha: formatFecha(p.fecha),
+      usuario: p.usuario_nombre,
+      cliente: p.cliente_nombre,
+      items: items.map(i => ({
+        nombre: i.descripcion,
+        codigo: i.producto_id ? String(i.producto_id) : 'S/C',
+        cantidad: i.cantidad,
+        precio_final: i.precio_unitario,
+        subtotal: i.subtotal,
+        descuento_porcentaje: i.descuento_porcentaje,
+      })),
+      subtotal: items.reduce((s, i) => s + (i.precio_unitario * i.cantidad), 0),
+      descuento: items.reduce((s, i) => s + ((i.precio_unitario * i.cantidad) - i.subtotal), 0),
+      total: p.total,
+      metodo_pago: 'N/A',
+      es_presupuesto: true,
+    };
+    imprimirTicket(configNegocio, ticketData);
+  };
+
   // ─── Modal de detalle ────
 
   const ModalDetalle = () => {
@@ -192,6 +224,11 @@ export default function Presupuestos({ onIrAVenta }: PresupuestosProps = {}) {
                 </button>
               </>
             )}
+            <div style={{ flex: 1 }}></div>
+            <button className="btn btn-ghost btn-sm"
+              onClick={() => handleImprimir(presup, items)}>
+              <Printer size={14} /> Imprimir
+            </button>
           </div>
 
           {/* Items */}

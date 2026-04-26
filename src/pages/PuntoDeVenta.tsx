@@ -163,7 +163,7 @@ export default function PuntoDeVenta() {
         cambio: venta.cambio,
       };
       setUltimoTicket(ticket);
-      if (configNegocio) imprimirTicket(configNegocio, ticket);
+      // Auto-impresión deshabilitada por petición del usuario
     } catch (err: any) {
       alert(err.message);
     }
@@ -274,8 +274,8 @@ export default function PuntoDeVenta() {
         </div>
         <div style={{ display: 'flex', gap: 10 }}>
           {ultimoTicket && (
-            <button className="btn btn-ghost btn-lg" onClick={reimprimirUltimo} title="Reimprimir ticket">
-              <Printer size={18} /> Reimprimir
+            <button className="btn btn-ghost btn-lg" onClick={reimprimirUltimo} title="Imprimir ticket de venta">
+              <Printer size={18} /> Imprimir Ticket
             </button>
           )}
           <button className="btn btn-primary btn-lg" onClick={cerrarVentaExitosa}>

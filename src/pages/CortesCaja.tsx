@@ -524,6 +524,8 @@ function ModalRetiroCaja({ onClose, onSuccess }: { onClose: () => void; onSucces
 
   const [datos, setDatos] = useState<DatosCorte | null>(null);
   const [cargandoDatos, setCargandoDatos] = useState(true);
+  const [usarDenominaciones, setUsarDenominaciones] = useState(false);
+  const [cantidades, setCantidades] = useState<Record<string, number>>({});
   const [monto, setMonto] = useState('');
   const [concepto, setConcepto] = useState('');
   const [pinDueno, setPinDueno] = useState('');
@@ -534,6 +536,11 @@ function ModalRetiroCaja({ onClose, onSuccess }: { onClose: () => void; onSucces
 
   const esAdmin = usuario?.es_admin ?? false;
 
+  const totalDenominaciones = DENOMINACIONES.reduce((sum, d) => {
+    const key = `${d.valor}_${d.tipo}`;
+    return sum + (cantidades[key] || 0) * d.valor;
+  }, 0);
+
   useEffect(() => {
     calcularDatosCorte(fechaInicio, fechaFin)
       .then(setDatos)
@@ -542,7 +549,7 @@ function ModalRetiroCaja({ onClose, onSuccess }: { onClose: () => void; onSucces
   }, []);
 
   const efectivoEsperado = datos?.efectivo_esperado ?? 0;
-  const montoNum = parseFloat(monto) || 0;
+  const montoNum = usarDenominaciones ? totalDenominaciones : (parseFloat(monto) || 0);
   const restante = efectivoEsperado - montoNum;
   const requierePin = montoNum > 500 && !esAdmin;
   const excede = montoNum > efectivoEsperado;
@@ -620,20 +627,76 @@ function ModalRetiroCaja({ onClose, onSuccess }: { onClose: () => void; onSucces
 
               {/* Monto a retirar */}
               <div>
-                <label style={{ fontSize: 11, fontWeight: 700, color: 'var(--color-text-muted)', display: 'block', marginBottom: 6 }}>
-                  MONTO A RETIRAR
-                </label>
-                <input
-                  className="input mono"
-                  type="number"
-                  step="0.01"
-                  min="0"
-                  placeholder="$0.00"
-                  value={monto}
-                  onChange={e => setMonto(e.target.value)}
-                  autoFocus
-                  style={{ width: '100%', fontSize: 26, textAlign: 'center' }}
-                />
+                <button
+                  className="btn btn-ghost btn-sm"
+                  style={{ width: '100%', justifyContent: 'space-between', marginBottom: 8 }}
+                  onClick={() => setUsarDenominaciones(!usarDenominaciones)}
+                >
+                  <span>Monto a retirar {usarDenominaciones ? '(por denominación)' : '(manual)'}</span>
+                  {usarDenominaciones ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+                </button>
+
+                {usarDenominaciones ? (
+                  <div className="card" style={{ padding: '10px 14px' }}>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0 24px' }}>
+                      {['BILLETE', 'MONEDA'].map(tipoD => (
+                        <div key={tipoD}>
+                          <p style={{ fontSize: 11, fontWeight: 700, color: 'var(--color-text-dim)', marginBottom: 8 }}>
+                            {tipoD === 'BILLETE' ? 'BILLETES' : 'MONEDAS'}
+                          </p>
+                          {DENOMINACIONES.filter(d => d.tipo === tipoD).map(d => {
+                            const key = `${d.valor}_${d.tipo}`;
+                            return (
+                              <div key={key} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+                                <span className="mono" style={{ width: 52, fontSize: 13, fontWeight: 600 }}>{d.label}</span>
+                                <span style={{ color: 'var(--color-text-dim)', fontSize: 13 }}>×</span>
+                                <input
+                                  className="input mono"
+                                  type="number"
+                                  min="0"
+                                  step="1"
+                                  placeholder="0"
+                                  value={cantidades[key] || ''}
+                                  onChange={e => setCantidades(prev => ({ ...prev, [key]: parseInt(e.target.value) || 0 }))}
+                                  style={{ width: 64, textAlign: 'center', padding: '4px 8px', fontSize: 13 }}
+                                />
+                                <span className="mono" style={{ fontSize: 12, color: 'var(--color-text-dim)', width: 72, textAlign: 'right' }}>
+                                  {fmt((cantidades[key] || 0) * d.valor)}
+                                </span>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      ))}
+                    </div>
+                    <div style={{
+                      marginTop: 10, paddingTop: 10, borderTop: '1px solid var(--color-border)',
+                      display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                    }}>
+                      <span style={{ fontSize: 13, fontWeight: 700 }}>TOTAL RETIRO</span>
+                      <span className="mono" style={{ fontSize: 20, fontWeight: 800, color: 'var(--color-danger)' }}>
+                        {fmt(totalDenominaciones)}
+                      </span>
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                    <label style={{ fontSize: 11, fontWeight: 700, color: 'var(--color-text-muted)', display: 'block', marginBottom: 6 }}>
+                      MONTO A RETIRAR FÍSICAMENTE
+                    </label>
+                    <input
+                      className="input mono"
+                      type="number"
+                      step="0.01"
+                      min="0"
+                      placeholder="$0.00"
+                      value={monto}
+                      onChange={e => setMonto(e.target.value)}
+                      autoFocus
+                      style={{ width: '100%', fontSize: 26, textAlign: 'center' }}
+                    />
+                  </>
+                )}
               </div>
 
               {/* Quedará en caja — la info clave del flujo */}
