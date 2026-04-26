@@ -114,8 +114,8 @@ pub fn crear_venta(
     let db = state.db.lock().unwrap();
     let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
-    // Nota: se permite stock negativo. Cuando se vende un producto sin existencias,
-    // el stock_actual queda en negativo y debe reponerse vía recepción.
+    // Nota: Aunque el POS permite vender sin existencias (el empleado puede agregar al carrito),
+    // el stock_actual siempre se frena en cero (0) mediante MAX() en lugar de quedar en negativo.
 
     // Generar folio con secuencia dedicada (nunca se duplica)
     let ultimo_folio: i64 = db.query_row(
@@ -172,9 +172,9 @@ pub fn crear_venta(
             return Err(format!("Error al insertar detalle: {}", e));
         }
 
-        // Descontar stock
+        // Descontar stock (no permitir que baje de cero)
         let r = db.execute(
-            "UPDATE productos SET stock_actual = stock_actual - ?, updated_at = ? WHERE id = ?",
+            "UPDATE productos SET stock_actual = MAX(0, stock_actual - ?), updated_at = ? WHERE id = ?",
             rusqlite::params![item.cantidad, now, item.producto_id],
         );
 

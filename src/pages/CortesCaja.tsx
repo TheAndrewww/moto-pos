@@ -12,7 +12,7 @@ import {
 import {
   DollarSign, ArrowDownLeft, ArrowUpRight, Clock,
   CheckCircle, AlertTriangle, X, ChevronDown, ChevronUp,
-  Sunrise,
+  Sunrise, FileText, LogOut, Calculator
 } from 'lucide-react';
 
 // ─── Utilidades ───────────────────────────────────────────
@@ -110,7 +110,12 @@ export default function CortesCaja({
     cargarCortes(50);
   }, []);
 
-  // Triggers desde Dashboard (atajos de teclado F6, F11, F12)
+  // Triggers desde el contenedor padre
+  useEffect(() => { if (triggerMovimiento > 0) setShowModalMov(true); }, [triggerMovimiento]);
+  useEffect(() => { if (triggerParcial > 0) setShowModalParcial(true); }, [triggerParcial]);
+  useEffect(() => { if (triggerDia > 0 && esAdmin) setShowModalDia(true); }, [triggerDia, esAdmin]);
+
+  // Triggers locales (atajos de teclado dentro de la vista misma)
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (showModalMov || showModalParcial || showModalDia) return;
