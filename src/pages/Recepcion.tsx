@@ -221,7 +221,7 @@ export default function Recepcion() {
               // Así no sobrescribimos accidentalmente productos legacy sin costo.
               precio_venta:
                 i.precio_costo > 0 && i.precio_venta > 0 && i.precio_venta !== i.producto.precio_venta
-                  ? i.precio_venta
+                  ? Math.ceil(i.precio_venta)   // garantía: siempre entero hacia arriba
                   : null,
             })),
           },
@@ -359,7 +359,9 @@ export default function Recepcion() {
                       const sinCosto = item.precio_costo <= 0;
                       const aplicarMultiplicador = (factor: number) => {
                         const n = [...items];
-                        n[idx] = { ...n[idx], precio_venta: Number((n[idx].precio_costo * factor).toFixed(2)) };
+                        // Regla del dueño: precio de venta siempre entero hacia arriba
+                        // (sin centavos). Math.ceil(costo × factor).
+                        n[idx] = { ...n[idx], precio_venta: Math.ceil(n[idx].precio_costo * factor) };
                         setItems(n);
                       };
                       return (
@@ -430,9 +432,19 @@ export default function Recepcion() {
                             </div>
                           </td>
                           <td style={{ padding: '4px 8px' }}>
-                            <input className="input mono" type="number" step="0.01" value={item.precio_venta}
+                            <input className="input mono" type="number" step="1" min={0} value={item.precio_venta}
                               style={{ width: 80, padding: '2px 6px', textAlign: 'right', fontSize: 12 }}
-                              onChange={e => { const n = [...items]; n[idx] = { ...n[idx], precio_venta: Number(e.target.value) || 0 }; setItems(n); }} />
+                              onChange={e => {
+                                const v = parseFloat(e.target.value);
+                                const entero = isNaN(v) ? 0 : Math.ceil(v);
+                                const n = [...items];
+                                n[idx] = { ...n[idx], precio_venta: entero };
+                                setItems(n);
+                              }} />
+                            {/* Precio de venta anterior — referencia para el usuario */}
+                            <div style={{ fontSize: 10, color: 'var(--color-text-dim)', textAlign: 'right', marginTop: 2 }}>
+                              Anterior: ${item.producto.precio_venta.toFixed(2)}
+                            </div>
                           </td>
                           <td className="mono" style={{ padding: '8px 12px', textAlign: 'right', fontWeight: 700, color: 'var(--color-primary)' }}>
                             {fmt(item.cantidad * item.precio_costo)}

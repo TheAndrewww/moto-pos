@@ -145,7 +145,7 @@ export default function Catalogo() {
             descripcion: form.descripcion || null,
             categoria_id: form.categoria_id ? Number(form.categoria_id) : null,
             precio_costo: Number(form.precio_costo),
-            precio_venta: Number(form.precio_venta),
+            precio_venta: Math.ceil(Number(form.precio_venta) || 0),
             stock_minimo: Number(form.stock_minimo),
             proveedor_id: form.proveedor_id ? Number(form.proveedor_id) : null,
             foto_url: null,
@@ -162,7 +162,7 @@ export default function Catalogo() {
             codigo: form.codigo || undefined,
             codigo_tipo: form.codigo_tipo || undefined,
             precio_costo: Number(form.precio_costo),
-            precio_venta: Number(form.precio_venta),
+            precio_venta: Math.ceil(Number(form.precio_venta) || 0),
             stock_actual: Number(form.stock_actual),
             stock_minimo: Number(form.stock_minimo),
             proveedor_id: form.proveedor_id ? Number(form.proveedor_id) : undefined,
@@ -337,9 +337,14 @@ export default function Catalogo() {
               )}
               <div>
                 <label style={{ ...labelStyle, color: 'var(--color-primary)' }}>PRECIO DE VENTA *</label>
-                <input className="input mono" type="number" step="0.01" value={form.precio_venta}
-                  onChange={e => setForm(f => ({ ...f, precio_venta: parseFloat(e.target.value) || 0 }))} />
-                {/* Multiplicadores 1.4/1.5/1.7 — calculan precio_venta = costo × factor.
+                <input className="input mono" type="number" step="1" min={0} value={form.precio_venta}
+                  onChange={e => {
+                    // Regla del dueño: precio de venta siempre entero hacia arriba.
+                    const v = parseFloat(e.target.value);
+                    const entero = isNaN(v) ? 0 : Math.ceil(v);
+                    setForm(f => ({ ...f, precio_venta: entero }));
+                  }} />
+                {/* Multiplicadores 1.4/1.5/1.7 — calculan precio_venta = ceil(costo × factor).
                     Solo activos si hay costo > 0 (regla del dueño: no tocar productos
                     sin costo registrado). */}
                 <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 8 }}>
@@ -347,16 +352,17 @@ export default function Catalogo() {
                   {[1.4, 1.5, 1.7].map(m => {
                     const costo = Number(form.precio_costo) || 0;
                     const sinCosto = costo <= 0;
+                    const calc = Math.ceil(costo * m);
                     return (
                       <button
                         key={m}
                         type="button"
                         className="btn btn-ghost btn-sm"
                         disabled={sinCosto}
-                        title={sinCosto ? 'Captura primero el costo' : `Precio venta = costo × ${m} = $${(costo * m).toFixed(2)}`}
+                        title={sinCosto ? 'Captura primero el costo' : `Precio venta = ceil(costo × ${m}) = $${calc}`}
                         onClick={() => setForm(f => ({
                           ...f,
-                          precio_venta: Number(((Number(f.precio_costo) || 0) * m).toFixed(2)),
+                          precio_venta: Math.ceil((Number(f.precio_costo) || 0) * m),
                         }))}
                         style={{
                           padding: '4px 10px', fontSize: 12, fontWeight: 700,
