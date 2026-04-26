@@ -1521,6 +1521,10 @@ async fn crear_recepcion(state: &AppState, args: Value) -> Result<Value, ApiErro
         producto_id: i64,
         cantidad: f64,
         precio_costo: f64,
+        /// Nuevo precio de venta opcional (multiplicadores 1.4/1.5/1.7).
+        /// Si viene Some(v) con v > 0, se actualiza productos.precio_venta.
+        #[serde(default)]
+        precio_venta: Option<f64>,
     }
 
     let a: A = serde_json::from_value(args)
@@ -1576,17 +1580,33 @@ async fn crear_recepcion(state: &AppState, args: Value) -> Result<Value, ApiErro
             .execute(&mut *tx)
             .await?;
 
-        // Sumar al stock + actualizar precio_costo
-        let upd_sql = format!(
-            "UPDATE productos SET stock_actual = stock_actual + $1, \
-             precio_costo = $2, updated_at = {NOW_TEXT} WHERE id = $3"
-        );
-        sqlx::query(&upd_sql)
-            .bind(it.cantidad)
-            .bind(it.precio_costo)
-            .bind(it.producto_id)
-            .execute(&mut *tx)
-            .await?;
+        // Sumar al stock + actualizar precio_costo (y precio_venta si vino > 0).
+        // Si precio_venta viene None / 0, dejamos el existente intacto.
+        let nuevo_pv = it.precio_venta.filter(|v| *v > 0.0);
+        if let Some(pv) = nuevo_pv {
+            let upd_sql = format!(
+                "UPDATE productos SET stock_actual = stock_actual + $1, \
+                 precio_costo = $2, precio_venta = $3, updated_at = {NOW_TEXT} WHERE id = $4"
+            );
+            sqlx::query(&upd_sql)
+                .bind(it.cantidad)
+                .bind(it.precio_costo)
+                .bind(pv)
+                .bind(it.producto_id)
+                .execute(&mut *tx)
+                .await?;
+        } else {
+            let upd_sql = format!(
+                "UPDATE productos SET stock_actual = stock_actual + $1, \
+                 precio_costo = $2, updated_at = {NOW_TEXT} WHERE id = $3"
+            );
+            sqlx::query(&upd_sql)
+                .bind(it.cantidad)
+                .bind(it.precio_costo)
+                .bind(it.producto_id)
+                .execute(&mut *tx)
+                .await?;
+        }
 
         // sync_cursor productos
         sqlx::query(

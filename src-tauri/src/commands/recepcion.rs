@@ -30,6 +30,11 @@ pub struct ItemRecepcion {
     pub producto_id: i64,
     pub cantidad: f64,
     pub precio_costo: f64,
+    /// Nuevo precio de venta. Opcional — si viene `Some(v)` con `v > 0`,
+    /// se actualiza también `productos.precio_venta`. Permite recalcular
+    /// el precio en la recepción usando los multiplicadores 1.4/1.5/1.7.
+    #[serde(default)]
+    pub precio_venta: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -70,15 +75,31 @@ pub fn crear_recepcion(
             rusqlite::params![recep_id, item.producto_id, item.cantidad, item.precio_costo],
         ).map_err(|e| e.to_string())?;
 
-        // Actualizar stock y precio de costo del producto
-        db.execute(
-            r#"UPDATE productos SET
-                stock_actual = stock_actual + ?,
-                precio_costo = ?,
-                updated_at = ?
-               WHERE id = ?"#,
-            rusqlite::params![item.cantidad, item.precio_costo, now, item.producto_id],
-        ).map_err(|e| e.to_string())?;
+        // Actualizar stock y precio de costo del producto.
+        // Si se mandó un precio_venta > 0, también lo actualizamos —
+        // así los multiplicadores 1.4/1.5/1.7 se aplican al recibir.
+        // Si viene None o 0, dejamos el precio_venta existente intacto.
+        let nuevo_pv = item.precio_venta.filter(|v| *v > 0.0);
+        if let Some(pv) = nuevo_pv {
+            db.execute(
+                r#"UPDATE productos SET
+                    stock_actual = stock_actual + ?,
+                    precio_costo = ?,
+                    precio_venta = ?,
+                    updated_at = ?
+                   WHERE id = ?"#,
+                rusqlite::params![item.cantidad, item.precio_costo, pv, now, item.producto_id],
+            ).map_err(|e| e.to_string())?;
+        } else {
+            db.execute(
+                r#"UPDATE productos SET
+                    stock_actual = stock_actual + ?,
+                    precio_costo = ?,
+                    updated_at = ?
+                   WHERE id = ?"#,
+                rusqlite::params![item.cantidad, item.precio_costo, now, item.producto_id],
+            ).map_err(|e| e.to_string())?;
+        }
 
         // Si es contra una orden, actualizar cantidad_recibida del detalle correspondiente
         if let Some(orden_id) = recepcion.orden_id {

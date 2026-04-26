@@ -178,11 +178,11 @@ export default function Catalogo() {
     };
 
     return (
-      <div style={{
+      <div className="pos-modal-overlay" style={{
         position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)',
         display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 100,
       }} onClick={() => { setShowForm(false); setEditando(null); }}>
-        <div className="card animate-fade-in" style={{ width: 520, maxHeight: '85vh', overflow: 'auto', padding: 24 }}
+        <div className="card pos-modal-content animate-fade-in" style={{ width: 520, maxHeight: '85vh', overflow: 'auto', padding: 24 }}
           onClick={(e) => e.stopPropagation()}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
             <h2 style={{ fontSize: 18, fontWeight: 700 }}>
@@ -339,6 +339,35 @@ export default function Catalogo() {
                 <label style={{ ...labelStyle, color: 'var(--color-primary)' }}>PRECIO DE VENTA *</label>
                 <input className="input mono" type="number" step="0.01" value={form.precio_venta}
                   onChange={e => setForm(f => ({ ...f, precio_venta: parseFloat(e.target.value) || 0 }))} />
+                {/* Multiplicadores 1.4/1.5/1.7 — calculan precio_venta = costo × factor.
+                    Solo activos si hay costo > 0 (regla del dueño: no tocar productos
+                    sin costo registrado). */}
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 8 }}>
+                  <span style={{ fontSize: 11, color: 'var(--color-text-muted)', fontWeight: 600 }}>Calcular:</span>
+                  {[1.4, 1.5, 1.7].map(m => {
+                    const costo = Number(form.precio_costo) || 0;
+                    const sinCosto = costo <= 0;
+                    return (
+                      <button
+                        key={m}
+                        type="button"
+                        className="btn btn-ghost btn-sm"
+                        disabled={sinCosto}
+                        title={sinCosto ? 'Captura primero el costo' : `Precio venta = costo × ${m} = $${(costo * m).toFixed(2)}`}
+                        onClick={() => setForm(f => ({
+                          ...f,
+                          precio_venta: Number(((Number(f.precio_costo) || 0) * m).toFixed(2)),
+                        }))}
+                        style={{
+                          padding: '4px 10px', fontSize: 12, fontWeight: 700,
+                          opacity: sinCosto ? 0.4 : 1,
+                          cursor: sinCosto ? 'not-allowed' : 'pointer',
+                        }}>
+                        ×{m}
+                      </button>
+                    );
+                  })}
+                </div>
               </div>
             </div>
 
@@ -406,26 +435,28 @@ export default function Catalogo() {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
       {/* ─── Header toolbar ─── */}
-      <div style={{
+      <div className="pos-page-header" style={{
         padding: '12px 20px',
         borderBottom: '1px solid var(--color-border)',
         background: 'var(--color-surface)',
         display: 'flex', flexDirection: 'column', gap: 10,
       }}>
         {/* Title + button */}
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
             <Package size={20} style={{ color: 'var(--color-primary)' }} />
             <h2 style={{ fontSize: 17, fontWeight: 800, color: 'var(--color-text)' }}>Inventario</h2>
-            <span style={{ fontSize: 12, color: 'var(--color-text-dim)', marginLeft: 4 }}>·</span>
-            <span style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>{totalProductos} productos</span>
-            <span style={{ fontSize: 12, color: 'var(--color-text-dim)' }}>·</span>
-            <span style={{ fontSize: 12, color: stockBajoCount > 0 ? 'var(--color-warning)' : 'var(--color-text-dim)' }}>
-              ⚠️ {stockBajoCount} stock bajo
-            </span>
-            <span style={{ fontSize: 12, color: 'var(--color-text-dim)' }}>·</span>
-            <span style={{ fontSize: 12, color: sinStockCount > 0 ? 'var(--color-danger)' : 'var(--color-text-dim)' }}>
-              🔴 {sinStockCount} sin stock
+            <span className="pos-header-stats" style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
+              <span style={{ fontSize: 12, color: 'var(--color-text-dim)' }}>·</span>
+              <span style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>{totalProductos} productos</span>
+              <span style={{ fontSize: 12, color: 'var(--color-text-dim)' }}>·</span>
+              <span style={{ fontSize: 12, color: stockBajoCount > 0 ? 'var(--color-warning)' : 'var(--color-text-dim)' }}>
+                ⚠️ {stockBajoCount} stock bajo
+              </span>
+              <span style={{ fontSize: 12, color: 'var(--color-text-dim)' }}>·</span>
+              <span style={{ fontSize: 12, color: sinStockCount > 0 ? 'var(--color-danger)' : 'var(--color-text-dim)' }}>
+                🔴 {sinStockCount} sin stock
+              </span>
             </span>
           </div>
           <div style={{ display: 'flex', gap: 8 }}>
@@ -443,7 +474,7 @@ export default function Catalogo() {
         </div>
 
         {/* Search + filters + view toggle */}
-        <div style={{ display: 'flex', gap: 8 }}>
+        <div className="pos-filter-row" style={{ display: 'flex', gap: 8 }}>
           <div style={{ position: 'relative', flex: 1 }}>
             <Search size={16} style={{
               position: 'absolute', left: 12, top: '50%', transform: 'translateY(-50%)',

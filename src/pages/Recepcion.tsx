@@ -51,8 +51,12 @@ interface ItemForm {
   producto: Producto;
   cantidad: number;
   precio_costo: number;
-  pedido_cantidad?: number; // cantidad pendiente de la orden, si aplica
+  precio_venta: number;       // nuevo precio de venta (0 = no actualizar)
+  pedido_cantidad?: number;   // cantidad pendiente de la orden, si aplica
 }
+
+// Multiplicadores estándar para calcular precio de venta a partir del costo.
+const MULTIPLICADORES = [1.4, 1.5, 1.7] as const;
 
 type Vista = 'lista' | 'crear' | 'detalle';
 
@@ -138,6 +142,7 @@ export default function Recepcion() {
             producto: prod,
             cantidad: pendiente,
             precio_costo: d.precio_costo,
+            precio_venta: prod.precio_venta,    // sugerencia: precio actual
             pedido_cantidad: pendiente,
           });
         }
@@ -167,7 +172,12 @@ export default function Recepcion() {
           n[idx] = { ...n[idx], cantidad: n[idx].cantidad + cantidad };
           return n;
         }
-        return [...prev, { producto: prod, cantidad, precio_costo: prod.precio_costo }];
+        return [...prev, {
+          producto: prod,
+          cantidad,
+          precio_costo: prod.precio_costo,
+          precio_venta: prod.precio_venta,    // default = precio actual (no cambia hasta que el usuario lo modifique)
+        }];
       });
       setFlash({ nombre: prod.nombre, cantidad });
       setTimeout(() => setFlash(null), 1200);
@@ -205,6 +215,14 @@ export default function Recepcion() {
               producto_id: i.producto.id,
               cantidad: i.cantidad,
               precio_costo: i.precio_costo,
+              // Solo mandamos precio_venta si:
+              //   1. tiene costo (no se aplica a productos con costo 0 — regla del dueño)
+              //   2. el usuario lo modificó respecto al precio actual del producto
+              // Así no sobrescribimos accidentalmente productos legacy sin costo.
+              precio_venta:
+                i.precio_costo > 0 && i.precio_venta > 0 && i.precio_venta !== i.producto.precio_venta
+                  ? i.precio_venta
+                  : null,
             })),
           },
         });
@@ -327,7 +345,8 @@ export default function Recepcion() {
                       <th style={{ padding: '8px 12px', textAlign: 'left' }}>Producto</th>
                       <th style={{ padding: '8px 6px', width: 120 }}>Cantidad</th>
                       {ordenId && <th style={{ padding: '8px 6px', width: 70 }}>Pedido</th>}
-                      <th style={{ padding: '8px 8px', width: 90 }}>Costo</th>
+                      <th style={{ padding: '8px 8px', width: 200 }}>Costo</th>
+                      <th style={{ padding: '8px 8px', width: 92 }}>Venta</th>
                       <th style={{ padding: '8px 12px', width: 80, textAlign: 'right' }}>Total</th>
                       <th style={{ width: 28 }}></th>
                     </tr>
@@ -335,11 +354,31 @@ export default function Recepcion() {
                   <tbody>
                     {items.map((item, idx) => {
                       const excede = item.pedido_cantidad !== undefined && item.cantidad > item.pedido_cantidad;
+                      // El multiplicador se desactiva si no hay costo (regla del dueño:
+                      // no tocar productos legacy sin costo registrado).
+                      const sinCosto = item.precio_costo <= 0;
+                      const aplicarMultiplicador = (factor: number) => {
+                        const n = [...items];
+                        n[idx] = { ...n[idx], precio_venta: Number((n[idx].precio_costo * factor).toFixed(2)) };
+                        setItems(n);
+                      };
                       return (
                         <tr key={idx} style={{ borderBottom: '1px solid var(--color-border)' }}>
                           <td style={{ padding: '8px 12px' }}>
                             <div style={{ fontWeight: 600, fontSize: 13 }}>{item.producto.nombre}</div>
-                            <div className="mono" style={{ fontSize: 11, color: 'var(--color-text-dim)' }}>{item.producto.codigo}</div>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 2 }}>
+                              <span className="mono" style={{ fontSize: 11, color: 'var(--color-text-dim)' }}>{item.producto.codigo}</span>
+                              <span style={{
+                                fontSize: 10, fontWeight: 700,
+                                padding: '1px 6px', borderRadius: 8,
+                                background: item.producto.stock_actual <= item.producto.stock_minimo
+                                  ? 'rgba(239, 68, 68, 0.15)' : 'rgba(148, 163, 184, 0.15)',
+                                color: item.producto.stock_actual <= item.producto.stock_minimo
+                                  ? 'var(--color-danger)' : 'var(--color-text-muted)',
+                              }}>
+                                Stock: {item.producto.stock_actual}
+                              </span>
+                            </div>
                           </td>
                           <td style={{ padding: '4px 6px' }}>
                             <div style={{ display: 'flex', alignItems: 'center', gap: 2, justifyContent: 'center' }}>
@@ -366,9 +405,34 @@ export default function Recepcion() {
                             </td>
                           )}
                           <td style={{ padding: '4px 8px' }}>
-                            <input className="input mono" type="number" step="0.01" value={item.precio_costo}
-                              style={{ width: 78, padding: '2px 6px', textAlign: 'right', fontSize: 12 }}
-                              onChange={e => { const n = [...items]; n[idx] = { ...n[idx], precio_costo: Number(e.target.value) || 0 }; setItems(n); }} />
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                              <input className="input mono" type="number" step="0.01" value={item.precio_costo}
+                                style={{ width: 78, padding: '2px 6px', textAlign: 'right', fontSize: 12 }}
+                                onChange={e => { const n = [...items]; n[idx] = { ...n[idx], precio_costo: Number(e.target.value) || 0 }; setItems(n); }} />
+                              {/* Multiplicadores 1.4 / 1.5 / 1.7 → calculan precio_venta */}
+                              {MULTIPLICADORES.map(m => (
+                                <button
+                                  key={m}
+                                  type="button"
+                                  className="btn btn-ghost btn-sm"
+                                  disabled={sinCosto}
+                                  title={sinCosto ? 'Captura primero el costo' : `Calcular precio de venta = costo × ${m}`}
+                                  onClick={() => aplicarMultiplicador(m)}
+                                  style={{
+                                    padding: '2px 6px', fontSize: 10, fontWeight: 700,
+                                    minWidth: 32,
+                                    opacity: sinCosto ? 0.4 : 1,
+                                    cursor: sinCosto ? 'not-allowed' : 'pointer',
+                                  }}>
+                                  ×{m}
+                                </button>
+                              ))}
+                            </div>
+                          </td>
+                          <td style={{ padding: '4px 8px' }}>
+                            <input className="input mono" type="number" step="0.01" value={item.precio_venta}
+                              style={{ width: 80, padding: '2px 6px', textAlign: 'right', fontSize: 12 }}
+                              onChange={e => { const n = [...items]; n[idx] = { ...n[idx], precio_venta: Number(e.target.value) || 0 }; setItems(n); }} />
                           </td>
                           <td className="mono" style={{ padding: '8px 12px', textAlign: 'right', fontWeight: 700, color: 'var(--color-primary)' }}>
                             {fmt(item.cantidad * item.precio_costo)}
