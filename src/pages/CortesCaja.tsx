@@ -110,10 +110,17 @@ export default function CortesCaja({
     cargarCortes(50);
   }, []);
 
-  // Triggers desde Dashboard (atajos de teclado F6, F11, Shift+F11)
-  useEffect(() => { if (triggerMovimiento > 0) setShowModalMov(true); }, [triggerMovimiento]);
-  useEffect(() => { if (triggerParcial > 0) setShowModalParcial(true); }, [triggerParcial]);
-  useEffect(() => { if (triggerDia > 0 && esAdmin) setShowModalDia(true); }, [triggerDia, esAdmin]);
+  // Triggers desde Dashboard (atajos de teclado F6, F11, F12)
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (showModalMov || showModalParcial || showModalDia) return;
+      if (e.key === 'F6') { e.preventDefault(); setShowModalMov(true); }
+      if (e.key === 'F11') { e.preventDefault(); setShowModalParcial(true); }
+      if (e.key === 'F12' && esAdmin) { e.preventDefault(); setShowModalDia(true); }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [showModalMov, showModalParcial, showModalDia, esAdmin]);
 
   const recargar = useCallback(async () => {
     await cargarMovimientosPendientes();
@@ -130,7 +137,7 @@ export default function CortesCaja({
         display: 'flex', alignItems: 'center', gap: 12,
         background: 'var(--color-surface)',
       }}>
-        <DollarSign size={20} style={{ color: 'var(--color-success)' }} />
+        <Calculator size={20} style={{ color: 'var(--color-primary)' }} />
         <h2 style={{ fontSize: 16, fontWeight: 800, flex: 1 }}>Cortes de Caja</h2>
 
         <button
@@ -141,19 +148,20 @@ export default function CortesCaja({
           <ArrowDownLeft size={14} /> Movimiento <span style={{ opacity: 0.5, fontSize: 10 }}>F6</span>
         </button>
         <button
-          className="btn btn-ghost btn-sm"
+          className="btn btn-primary btn-sm"
           onClick={() => setShowModalParcial(true)}
           title="F11"
         >
-          <ArrowUpRight size={14} /> Retiro de Caja <span style={{ opacity: 0.5, fontSize: 10 }}>F11</span>
+          <FileText size={14} /> Corte de Turno <span style={{ opacity: 0.5, fontSize: 10 }}>F11</span>
         </button>
         {esAdmin && (
           <button
             className="btn btn-primary btn-sm"
+            style={{ background: 'var(--color-danger)', borderColor: 'var(--color-danger)' }}
             onClick={() => setShowModalDia(true)}
-            title="Shift+F11"
+            title="F12"
           >
-            <CheckCircle size={14} /> Corte del Día <span style={{ opacity: 0.5, fontSize: 10 }}>⇧F11</span>
+            <LogOut size={14} /> Cerrar Caja <span style={{ opacity: 0.5, fontSize: 10 }}>F12</span>
           </button>
         )}
       </div>
@@ -206,7 +214,7 @@ export default function CortesCaja({
         />
       )}
       {showModalParcial && (
-        <ModalRetiroCaja
+        <ModalCorteTurno
           onClose={() => setShowModalParcial(false)}
           onSuccess={recargar}
         />
@@ -510,24 +518,24 @@ function ModalMovimiento({ onClose, onSuccess }: { onClose: () => void; onSucces
   );
 }
 
-// ─── Modal 2: Retiro de Caja (antes "Corte Parcial") ─────────
+// ─── Modal 2: Corte de Turno (Corte Parcial) ─────────
 //
-// A diferencia del corte del día, esto NO toma snapshot ni cierra
-// movimientos. Es un retiro de efectivo a mitad del día: el usuario
-// ve cuánto hay esperado en caja, ingresa cuánto se lleva, y confirma.
-// Bajo el capó crea un `movimiento_caja` tipo RETIRO (igual que F6
-// pero con el contexto del balance actual).
+// Usado al cambiar de turno. Permite contar todo el efectivo (esperado vs contado),
+// calcular la diferencia, y opcionalmente realizar un retiro de ganancias/depósito.
 
-function ModalRetiroCaja({ onClose, onSuccess }: { onClose: () => void; onSuccess: () => void }) {
+function ModalCorteTurno({ onClose, onSuccess }: { onClose: () => void; onSuccess: () => void }) {
   const { usuario } = useAuthStore();
-  const { calcularDatosCorte, crearMovimiento } = useCortesStore();
+  const { calcularDatosCorte, crearCorte, crearMovimiento } = useCortesStore();
 
   const [datos, setDatos] = useState<DatosCorte | null>(null);
   const [cargandoDatos, setCargandoDatos] = useState(true);
-  const [usarDenominaciones, setUsarDenominaciones] = useState(false);
+  const [usarDenominaciones, setUsarDenominaciones] = useState(true);
   const [cantidades, setCantidades] = useState<Record<string, number>>({});
-  const [monto, setMonto] = useState('');
-  const [concepto, setConcepto] = useState('');
+  const [efectivoContadoDirecto, setEfectivoContadoDirecto] = useState('');
+  
+  const [montoRetiro, setMontoRetiro] = useState('');
+  const [conceptoRetiro, setConceptoRetiro] = useState('Retiro por cambio de turno');
+  const [notaDiferencia, setNotaDiferencia] = useState('');
   const [pinDueno, setPinDueno] = useState('');
   const [error, setError] = useState('');
   const [guardando, setGuardando] = useState(false);
@@ -536,11 +544,6 @@ function ModalRetiroCaja({ onClose, onSuccess }: { onClose: () => void; onSucces
 
   const esAdmin = usuario?.es_admin ?? false;
 
-  const totalDenominaciones = DENOMINACIONES.reduce((sum, d) => {
-    const key = `${d.valor}_${d.tipo}`;
-    return sum + (cantidades[key] || 0) * d.valor;
-  }, 0);
-
   useEffect(() => {
     calcularDatosCorte(fechaInicio, fechaFin)
       .then(setDatos)
@@ -548,28 +551,71 @@ function ModalRetiroCaja({ onClose, onSuccess }: { onClose: () => void; onSucces
       .finally(() => setCargandoDatos(false));
   }, []);
 
+  const totalDenominaciones = DENOMINACIONES.reduce((sum, d) => {
+    const key = `${d.valor}_${d.tipo}`;
+    return sum + (cantidades[key] || 0) * d.valor;
+  }, 0);
+
   const efectivoEsperado = datos?.efectivo_esperado ?? 0;
-  const montoNum = usarDenominaciones ? totalDenominaciones : (parseFloat(monto) || 0);
-  const restante = efectivoEsperado - montoNum;
-  const requierePin = montoNum > 500 && !esAdmin;
-  const excede = montoNum > efectivoEsperado;
+  const efectivoContado = usarDenominaciones ? totalDenominaciones : (parseFloat(efectivoContadoDirecto) || 0);
+  const diferencia = datos ? efectivoContado - datos.efectivo_esperado : 0;
+  
+  const huboConteo = usarDenominaciones ? totalDenominaciones > 0 : efectivoContadoDirecto !== '';
+  const requiereNota = huboConteo && diferencia !== 0;
+
+  const numRetiro = parseFloat(montoRetiro) || 0;
+  const requierePin = numRetiro > 500 && !esAdmin;
+  const excedeRetiro = numRetiro > efectivoContado;
+  
+  const fondoSiguiente = efectivoContado - numRetiro;
 
   const handleConfirmar = async () => {
     if (!datos) return;
-    if (montoNum <= 0) { setError('El monto a retirar debe ser mayor a $0'); return; }
-    if (!concepto.trim()) { setError('El concepto es obligatorio'); return; }
-    if (requierePin && pinDueno.length < 4) { setError('Ingresa el PIN del dueño'); return; }
+    if (efectivoContado < 0) { setError('El efectivo contado no puede ser negativo'); return; }
+    if (requiereNota && !notaDiferencia.trim()) { setError('La nota es obligatoria cuando hay diferencia de dinero'); return; }
+    if (excedeRetiro) { setError('No puedes retirar más efectivo del que hay contado en caja'); return; }
+    if (numRetiro > 0 && !conceptoRetiro.trim()) { setError('El concepto del retiro es obligatorio'); return; }
+    if (requierePin && pinDueno.length < 4) { setError('Ingresa el PIN del dueño para el retiro'); return; }
+
+    const denominaciones: DenominacionInput[] | undefined = usarDenominaciones
+      ? DENOMINACIONES
+          .filter(d => (cantidades[`${d.valor}_${d.tipo}`] || 0) > 0)
+          .map(d => ({
+            denominacion: d.valor,
+            tipo: d.tipo,
+            cantidad: cantidades[`${d.valor}_${d.tipo}`] || 0,
+          }))
+      : undefined;
 
     setGuardando(true);
     setError('');
     try {
-      await crearMovimiento({
-        tipo: 'RETIRO',
+      // 1. Si hay retiro, lo creamos PRIMERO para que quede como un Movimiento y afecte saldos futuros cleanly.
+      // Pero, dado que el Corte evalúa la ventana temporal hasta `fechaFin`, no queremos que este 
+      // retiro descuadre este corte en curso. Afortunadamente el corte ya tiene datos `datos` fijados.
+      if (numRetiro > 0) {
+        await crearMovimiento({
+          tipo: 'RETIRO',
+          usuario_id: usuario!.id,
+          monto: numRetiro,
+          concepto: conceptoRetiro.trim(),
+          pin_autorizacion: requierePin ? pinDueno : null,
+        });
+      }
+
+      // 2. Crear el Corte Parcial
+      await crearCorte({
+        tipo: 'PARCIAL',
         usuario_id: usuario!.id,
-        monto: montoNum,
-        concepto: concepto.trim(),
-        pin_autorizacion: requierePin ? pinDueno : null,
+        fecha_inicio: fechaInicio,
+        fecha_fin: fechaFin,
+        datos,
+        efectivo_contado: efectivoContado,
+        nota_diferencia: notaDiferencia.trim() || null,
+        fondo_siguiente: fondoSiguiente,
+        denominaciones,
       });
+
       await onSuccess();
       onClose();
     } catch (e: any) {
@@ -584,18 +630,18 @@ function ModalRetiroCaja({ onClose, onSuccess }: { onClose: () => void; onSucces
       display: 'flex', alignItems: 'flex-start', justifyContent: 'center',
       zIndex: 200, overflowY: 'auto', padding: '20px 0',
     }} onClick={onClose}>
-      <div className="card animate-fade-in" style={{ width: 480, padding: 0, overflow: 'hidden', margin: 'auto' }}
+      <div className="card animate-fade-in" style={{ width: 560, padding: 0, overflow: 'hidden', margin: 'auto' }}
         onClick={e => e.stopPropagation()}>
 
         {/* Header */}
         <div style={{
           padding: '16px 20px', borderBottom: '1px solid var(--color-border)',
           display: 'flex', alignItems: 'center', gap: 10,
-          background: 'rgba(245,158,11,0.08)',
+          background: 'rgba(99,102,241,0.08)',
         }}>
-          <ArrowUpRight size={18} style={{ color: 'var(--color-warning)' }} />
+          <ArrowUpRight size={18} style={{ color: 'var(--color-primary)' }} />
           <div style={{ flex: 1 }}>
-            <h3 style={{ fontSize: 15, fontWeight: 700 }}>Retiro de Caja</h3>
+            <h3 style={{ fontSize: 15, fontWeight: 700 }}>Corte de Turno (Cambio de cajero)</h3>
             <p style={{ fontSize: 11, color: 'var(--color-text-dim)' }}>
               {ahora().substring(0, 16).replace('T', ' ')} · {usuario?.nombre_completo}
             </p>
@@ -606,33 +652,35 @@ function ModalRetiroCaja({ onClose, onSuccess }: { onClose: () => void; onSucces
         <div style={{ padding: 20, display: 'flex', flexDirection: 'column', gap: 16 }}>
           {cargandoDatos && (
             <div style={{ textAlign: 'center', padding: 32, color: 'var(--color-text-dim)' }}>
-              Calculando...
+              Calculando cuadre actual...
             </div>
           )}
 
           {datos && (
             <>
-              {/* Efectivo actualmente en caja */}
+              {/* Efectivo Esperado */}
               <div style={{
                 padding: '14px 16px', borderRadius: 10,
                 background: 'var(--color-surface-2)',
                 border: '1px solid var(--color-border)',
                 display: 'flex', justifyContent: 'space-between', alignItems: 'center',
               }}>
-                <span style={{ fontSize: 13, fontWeight: 600 }}>Efectivo en caja</span>
+                <span style={{ fontSize: 13, fontWeight: 600 }}>Efectivo esperado en caja al momento</span>
                 <span className="mono" style={{ fontSize: 22, fontWeight: 800, color: 'var(--color-primary)' }}>
                   {fmt(efectivoEsperado)}
                 </span>
               </div>
 
-              {/* Monto a retirar */}
+              {/* Conteo de caja */}
               <div>
                 <button
                   className="btn btn-ghost btn-sm"
                   style={{ width: '100%', justifyContent: 'space-between', marginBottom: 8 }}
                   onClick={() => setUsarDenominaciones(!usarDenominaciones)}
                 >
-                  <span>Monto a retirar {usarDenominaciones ? '(por denominación)' : '(manual)'}</span>
+                  <span style={{ fontWeight: 700, color: 'var(--color-text)' }}>
+                    1. CUENTA TODA LA CAJA {usarDenominaciones ? '(Fórmula)' : '(Poner Total)'}
+                  </span>
                   {usarDenominaciones ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
                 </button>
 
@@ -673,67 +721,101 @@ function ModalRetiroCaja({ onClose, onSuccess }: { onClose: () => void; onSucces
                       marginTop: 10, paddingTop: 10, borderTop: '1px solid var(--color-border)',
                       display: 'flex', justifyContent: 'space-between', alignItems: 'center',
                     }}>
-                      <span style={{ fontSize: 13, fontWeight: 700 }}>TOTAL RETIRO</span>
-                      <span className="mono" style={{ fontSize: 20, fontWeight: 800, color: 'var(--color-danger)' }}>
-                        {fmt(totalDenominaciones)}
+                      <span style={{ fontSize: 13, fontWeight: 700 }}>TOTAL CONTADO EN CAJA</span>
+                      <span className="mono" style={{ fontSize: 20, fontWeight: 800, color: 'var(--color-text)' }}>
+                        {fmt(efectivoContado)}
                       </span>
                     </div>
                   </div>
                 ) : (
-                  <>
-                    <label style={{ fontSize: 11, fontWeight: 700, color: 'var(--color-text-muted)', display: 'block', marginBottom: 6 }}>
-                      MONTO A RETIRAR FÍSICAMENTE
-                    </label>
+                  <input
+                    className="input mono"
+                    type="number"
+                    step="0.01"
+                    min="0"
+                    placeholder="$0.00"
+                    value={efectivoContadoDirecto}
+                    onChange={e => setEfectivoContadoDirecto(e.target.value)}
+                    autoFocus
+                    style={{ width: '100%', fontSize: 26, textAlign: 'center' }}
+                  />
+                )}
+              </div>
+
+              {/* Diferencia en tiempo real */}
+              {huboConteo && (
+                <div style={{ marginBottom: 10 }}>
+                  <FilaDiferencia diferencia={diferencia} />
+                </div>
+              )}
+
+              {/* Nota (obligatoria si hay diferencia) */}
+              {requiereNota && (
+                <div>
+                  <label style={{ fontSize: 11, fontWeight: 700, color: 'var(--color-warning)', display: 'block', marginBottom: 6 }}>
+                    NOTA EXPLICATIVA SOBRE LA DIFERENCIA (Obligatoria)
+                  </label>
+                  <textarea
+                    className="input"
+                    placeholder="¿Por qué hay sobrante o faltante?"
+                    value={notaDiferencia}
+                    onChange={e => setNotaDiferencia(e.target.value)}
+                    style={{ width: '100%', minHeight: 60, resize: 'vertical' }}
+                  />
+                </div>
+              )}
+
+              {/* Monto a retirar */}
+              <div>
+                <label style={{ fontSize: 13, fontWeight: 800, color: 'var(--color-text)', display: 'block', marginBottom: 8 }}>
+                  2. ¿CUÁNTO DINERO RETIRAS? (Opcional)
+                </label>
+                <div style={{ display: 'flex', gap: 10, alignItems: 'flex-start' }}>
+                  <div style={{ flex: 1 }}>
                     <input
                       className="input mono"
                       type="number"
                       step="0.01"
                       min="0"
-                      placeholder="$0.00"
-                      value={monto}
-                      onChange={e => setMonto(e.target.value)}
-                      autoFocus
-                      style={{ width: '100%', fontSize: 26, textAlign: 'center' }}
+                      placeholder="Ej. $0.00"
+                      value={montoRetiro}
+                      onChange={e => setMontoRetiro(e.target.value)}
+                      style={{ width: '100%', fontSize: 20, padding: 12 }}
                     />
-                  </>
-                )}
+                  </div>
+                  {numRetiro > 0 && (
+                    <div style={{ flex: 2 }}>
+                      <input
+                        className="input"
+                        placeholder="Concepto del retiro..."
+                        value={conceptoRetiro}
+                        onChange={e => setConceptoRetiro(e.target.value)}
+                        style={{ width: '100%', fontSize: 14, padding: 14 }}
+                      />
+                    </div>
+                  )}
+                </div>
               </div>
 
               {/* Quedará en caja — la info clave del flujo */}
-              {montoNum > 0 && (
-                <div style={{
-                  padding: '14px 16px', borderRadius: 10,
-                  background: excede
-                    ? 'rgba(239, 68, 68, 0.1)'
-                    : 'rgba(34, 197, 94, 0.1)',
-                  border: `1px solid ${excede ? 'var(--color-danger)' : 'var(--color-success)'}`,
-                  display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+              <div style={{
+                padding: '14px 16px', borderRadius: 10,
+                background: excedeRetiro
+                  ? 'rgba(239, 68, 68, 0.1)'
+                  : 'rgba(34, 197, 94, 0.1)',
+                border: `1px solid ${excedeRetiro ? 'var(--color-danger)' : 'var(--color-success)'}`,
+                display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                marginTop: 4
+              }}>
+                <span style={{ fontSize: 13, fontWeight: 800 }}>
+                  {excedeRetiro ? '⚠️ No hay suficiente para retirar' : '3. FONDO PARA EL SIG. TURNO (Se quedará)'}
+                </span>
+                <span className="mono" style={{
+                  fontSize: 24, fontWeight: 900,
+                  color: excedeRetiro ? 'var(--color-danger)' : 'var(--color-success)',
                 }}>
-                  <span style={{ fontSize: 13, fontWeight: 700 }}>
-                    {excede ? '⚠️ Excede el efectivo en caja' : 'Quedará en caja'}
-                  </span>
-                  <span className="mono" style={{
-                    fontSize: 24, fontWeight: 800,
-                    color: excede ? 'var(--color-danger)' : 'var(--color-success)',
-                  }}>
-                    {fmt(restante)}
-                  </span>
-                </div>
-              )}
-
-              {/* Concepto */}
-              <div>
-                <label style={{ fontSize: 11, fontWeight: 700, color: 'var(--color-text-muted)', display: 'block', marginBottom: 6 }}>
-                  CONCEPTO
-                </label>
-                <input
-                  className="input"
-                  placeholder="Ej: Pago a proveedor, gastos, depósito al banco..."
-                  value={concepto}
-                  onChange={e => setConcepto(e.target.value)}
-                  onKeyDown={e => { if (e.key === 'Enter' && !requierePin) handleConfirmar(); }}
-                  style={{ width: '100%' }}
-                />
+                  {fmt(fondoSiguiente)}
+                </span>
               </div>
 
               {/* PIN del dueño si retiro > $500 y no admin */}
@@ -759,9 +841,9 @@ function ModalRetiroCaja({ onClose, onSuccess }: { onClose: () => void; onSucces
             </>
           )}
 
-          {error && <p style={{ fontSize: 12, color: 'var(--color-danger)' }}>{error}</p>}
+          {error && <p style={{ fontSize: 13, fontWeight: 600, color: 'var(--color-danger)', textAlign: 'center' }}>{error}</p>}
 
-          <div style={{ display: 'flex', gap: 8 }}>
+          <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
             <button className="btn btn-ghost" style={{ flex: 1 }} onClick={onClose}>Cancelar</button>
             <button
               className="btn btn-primary"
@@ -769,7 +851,7 @@ function ModalRetiroCaja({ onClose, onSuccess }: { onClose: () => void; onSucces
               onClick={handleConfirmar}
               disabled={cargandoDatos || guardando || !datos}
             >
-              {guardando ? 'Guardando...' : 'Confirmar retiro'}
+              {guardando ? 'Guardando...' : 'Confirmar Corte de Turno'}
             </button>
           </div>
         </div>
@@ -790,7 +872,7 @@ function ModalCorteDelDia({ onClose, onSuccess, fechaObjetivo }: {
 
   const [datos, setDatos] = useState<DatosCorte | null>(null);
   const [cargandoDatos, setCargandoDatos] = useState(true);
-  const [usarDenominaciones, setUsarDenominaciones] = useState(false);
+  const [usarDenominaciones, setUsarDenominaciones] = useState(true);
   const [cantidades, setCantidades] = useState<Record<string, number>>({});
   const [efectivoContadoDirecto, setEfectivoContadoDirecto] = useState('');
   const [nota, setNota] = useState('');
@@ -951,10 +1033,12 @@ function ModalCorteDelDia({ onClose, onSuccess, fechaObjetivo }: {
               <div>
                 <button
                   className="btn btn-ghost btn-sm"
-                  style={{ width: '100%', justifyContent: 'space-between' }}
+                  style={{ width: '100%', justifyContent: 'space-between', marginBottom: 8 }}
                   onClick={() => setUsarDenominaciones(!usarDenominaciones)}
                 >
-                  <span>Contar por denominación (opcional)</span>
+                  <span style={{ fontWeight: 700, color: 'var(--color-text)' }}>
+                    1. CUENTA TODA LA CAJA {usarDenominaciones ? '(Fórmula)' : '(Poner Total)'}
+                  </span>
                   {usarDenominaciones ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
                 </button>
 
