@@ -260,7 +260,7 @@ export default function PuntoDeVenta() {
               <p style={{ fontSize: 18, color: 'var(--color-text-muted)', fontWeight: 600, textTransform: 'uppercase', letterSpacing: 1 }}>
                 Cambio a entregar
               </p>
-              <div className="price-display" style={{ color: 'var(--color-warning)', fontSize: 56, marginTop: 8, lineHeight: 1 }}>
+              <div className="price-display" style={{ color: 'var(--color-danger)', fontSize: 56, marginTop: 8, lineHeight: 1 }}>
                 {fmt(ventaExitosa.cambio)}
               </div>
             </>
