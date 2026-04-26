@@ -82,6 +82,26 @@ pub async fn dispatch(
         "obtener_info_servidor"         => obtener_info_servidor(&state).await?,
         "listar_dispositivos"           => listar_dispositivos(&state).await?,
 
+        // El web NO empuja al servidor (sus cambios viven directamente en
+        // Postgres vía RPC). Devolvemos un estado "siempre conectado, 0
+        // pendientes" para que la página /sincronizacion no se quede vacía.
+        "obtener_estado_sync"           => json!({
+            "activo": true,
+            "remote_url": null,
+            "device_uuid": "web-pos",
+            "sucursal_id": 1,
+            "last_push_at": null,
+            "last_pull_at": null,
+            "pendientes": 0
+        }),
+        "configurar_sync"               => json!({
+            "activo": true, "remote_url": null, "device_uuid": "web-pos",
+            "sucursal_id": 1, "last_push_at": null, "last_pull_at": null, "pendientes": 0
+        }),
+        "desactivar_sync"               => Value::Null,
+        "probar_conexion_remota"        => json!(true),
+        "reenviar_pendientes"           => json!(0),
+
         // ─── Respaldos (no aplican en modo web — el server vive en Postgres
         //     y se respalda con el motor de Railway, no desde el frontend) ──
         "respaldo_auto_si_necesario"    => Value::Null,
@@ -835,28 +855,21 @@ fn obtener_config_descuentos() -> Value {
     })
 }
 
-async fn obtener_info_servidor(state: &AppState) -> Result<Value, ApiError> {
-    let total: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*)::bigint FROM pos_devices",
-    )
-    .fetch_one(&state.pool)
-    .await
-    .unwrap_or(0);
+async fn obtener_info_servidor(_state: &AppState) -> Result<Value, ApiError> {
+    // El servidor LAN para PWA móvil solo existe en el desktop. En el web
+    // devolvemos `activo: false` con la misma forma que ServerInfo en el
+    // frontend para que la página no truene al renderizar.
     Ok(json!({
-        "host": "servidor-remoto",
-        "dispositivos_conectados": total,
-        "tipo": "postgres",
+        "activo": false,
+        "port": 0,
+        "ips": []
     }))
 }
 
-async fn listar_dispositivos(state: &AppState) -> Result<Value, ApiError> {
-    let rows = sqlx::query(
-        "SELECT id, device_uuid, nombre, sucursal_id, last_push_at, last_pull_at \
-         FROM pos_devices ORDER BY id",
-    )
-    .fetch_all(&state.pool)
-    .await?;
-    Ok(json!(rows.iter().map(row_to_json).collect::<Vec<_>>()))
+async fn listar_dispositivos(_state: &AppState) -> Result<Value, ApiError> {
+    // Igual: la lista de dispositivos PWA pertenece al desktop. En web,
+    // arreglo vacío con la forma que el frontend espera.
+    Ok(json!([]))
 }
 
 // =============================================================================

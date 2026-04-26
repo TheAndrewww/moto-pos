@@ -3,7 +3,7 @@
 
 import { useState, useEffect } from 'react';
 import { useAuthStore } from '../store/authStore';
-import { invoke } from '../lib/invokeCompat';
+import { invoke, isTauri } from '../lib/invokeCompat';
 import PuntoDeVenta from './PuntoDeVenta';
 import Catalogo from './Catalogo';
 import UsuariosPage from './Usuarios';
@@ -59,11 +59,9 @@ export default function Dashboard() {
 
   // Verificar corte del día pendiente al iniciar
   useEffect(() => {
-    import('@tauri-apps/api/core').then(({ invoke }) => {
-      invoke<string | null>('verificar_corte_dia_pendiente')
-        .then(fecha => setCortePendiente(fecha))
-        .catch(() => {});
-    });
+    invoke<string | null>('verificar_corte_dia_pendiente')
+      .then(fecha => setCortePendiente(fecha))
+      .catch(() => {});
   }, []);
 
   // Auto-respaldo diario (una vez al arrancar si no hay uno de hoy)
@@ -129,7 +127,7 @@ export default function Dashboard() {
     { id: 'usuarios', label: 'Usuarios', icon: <Users size={18} />, key: '', visible: esAdmin },
     { id: 'cortes', label: 'Cortes de Caja', icon: <DollarSign size={18} />, key: 'F11', visible: true },
     { id: 'reportes', label: 'Reportes', icon: <TrendingUp size={18} />, key: 'F10', visible: esAdmin },
-    { id: 'conexion', label: 'Conexión móvil', icon: <Smartphone size={18} />, key: '', visible: esAdmin },
+    { id: 'conexion', label: 'Conexión móvil', icon: <Smartphone size={18} />, key: '', visible: esAdmin && isTauri() },
     { id: 'sincronizacion', label: 'Sincronización', icon: <Cloud size={18} />, key: '', visible: esAdmin },
     { id: 'ajustes', label: 'Ajustes', icon: <Settings size={18} />, key: '', visible: esAdmin },
   ];

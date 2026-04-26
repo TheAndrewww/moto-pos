@@ -347,6 +347,10 @@ fn bind_json<'q>(
             // ValueRef::Integer → Value::Number, no Value::String.
             if s.is_empty() {
                 q.bind(Option::<String>::None)
+            } else if s.contains('\0') {
+                // Postgres TEXT no acepta NUL bytes (error 22021); SQLite sí.
+                // Limpiamos para no atorar la cola de sync con un registro corrupto.
+                q.bind(s.replace('\0', ""))
             } else {
                 q.bind(s.as_str())
             }
