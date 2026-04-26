@@ -274,8 +274,10 @@ fn producto_row_to_json(row: &sqlx::postgres::PgRow) -> Value {
 //   3. Registra en audit_log (web-side; el desktop tiene su propio audit local)
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct NuevoProductoArgs {
     producto: NuevoProductoIn,
+    #[serde(alias = "usuario_id")]
     usuario_id: i64,
 }
 
@@ -387,8 +389,10 @@ async fn crear_producto(state: &AppState, args: Value) -> Result<Value, ApiError
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ActualizarProductoArgs {
     producto: ActualizarProductoIn,
+    #[serde(alias = "usuario_id")]
     usuario_id: i64,
 }
 
@@ -525,8 +529,11 @@ async fn actualizar_producto(state: &AppState, args: Value) -> Result<Value, Api
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct EliminarProductoArgs {
+    #[serde(alias = "producto_id")]
     producto_id: i64,
+    #[serde(alias = "usuario_id")]
     usuario_id: i64,
 }
 
@@ -584,10 +591,14 @@ async fn eliminar_producto(state: &AppState, args: &Value) -> Result<Value, ApiE
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct AjustarStockArgs {
+    #[serde(alias = "producto_id")]
     producto_id: i64,
+    #[serde(alias = "nuevo_stock")]
     nuevo_stock: f64,
     motivo: String,
+    #[serde(alias = "usuario_id")]
     usuario_id: i64,
 }
 
@@ -687,7 +698,9 @@ async fn generar_codigo_interno(state: &AppState) -> Result<Value, ApiError> {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct HistorialArgs {
+    #[serde(alias = "producto_id")]
     producto_id: i64,
 }
 
@@ -927,7 +940,13 @@ async fn buscar_ventas(state: &AppState, args: &Value) -> Result<Value, ApiError
 }
 
 #[derive(Deserialize)]
-struct VentaIdArg { id: i64 }
+struct VentaIdArg {
+    // Aceptamos las tres variantes: el frontend manda `ventaId` (camelCase
+    // que Tauri genera a partir de `venta_id`), pero algunas pantallas
+    // mandan `id` directo o `venta_id` snake.
+    #[serde(alias = "ventaId", alias = "venta_id")]
+    id: i64,
+}
 
 async fn obtener_detalle_venta(state: &AppState, args: &Value) -> Result<Value, ApiError> {
     use rust_decimal::prelude::ToPrimitive;
