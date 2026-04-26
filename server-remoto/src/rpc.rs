@@ -1243,12 +1243,24 @@ async fn crear_venta(state: &AppState, args: Value) -> Result<Value, ApiError> {
 
 async fn obtener_estadisticas_dia(state: &AppState, _args: &Value) -> Result<Value, ApiError> {
     use rust_decimal::prelude::ToPrimitive;
+    // Misma shape que el comando Tauri `obtener_estadisticas_dia`:
+    //   { total_ventas, num_transacciones, efectivo, tarjeta, transferencia,
+    //     producto_top_nombre, producto_top_cantidad }
+    // El frontend hace `stats.total_ventas.toFixed(2)` etc., así que
+    // CUALQUIER campo faltante revienta el render del Dashboard.
+    let dec = |row: &sqlx::postgres::PgRow, name: &str| -> f64 {
+        row.try_get::<rust_decimal::Decimal, _>(name).ok()
+            .and_then(|d| d.to_f64()).unwrap_or(0.0)
+    };
+
     let row = sqlx::query(
         r#"
         SELECT
-          COALESCE(SUM(total), 0)::numeric AS total_dia,
-          COUNT(*)::bigint                 AS num_ventas,
-          COALESCE(SUM(descuento), 0)::numeric AS descuento_dia
+          COALESCE(SUM(total), 0)::numeric AS total_ventas,
+          COUNT(*)::bigint                 AS num_transacciones,
+          COALESCE(SUM(CASE WHEN metodo_pago = 'efectivo'      THEN total ELSE 0 END), 0)::numeric AS efectivo,
+          COALESCE(SUM(CASE WHEN metodo_pago = 'tarjeta'       THEN total ELSE 0 END), 0)::numeric AS tarjeta,
+          COALESCE(SUM(CASE WHEN metodo_pago = 'transferencia' THEN total ELSE 0 END), 0)::numeric AS transferencia
         FROM ventas
         WHERE deleted_at IS NULL AND anulada = 0
           AND substr(fecha, 1, 10)
@@ -1258,16 +1270,43 @@ async fn obtener_estadisticas_dia(state: &AppState, _args: &Value) -> Result<Val
     .fetch_one(&state.pool)
     .await?;
 
-    let total: f64 = row.try_get::<rust_decimal::Decimal, _>("total_dia")
-        .ok().and_then(|d| d.to_f64()).unwrap_or(0.0);
-    let desc: f64 = row.try_get::<rust_decimal::Decimal, _>("descuento_dia")
-        .ok().and_then(|d| d.to_f64()).unwrap_or(0.0);
-    let num: i64 = row.try_get("num_ventas").unwrap_or(0);
+    let num: i64 = row.try_get("num_transacciones").unwrap_or(0);
+
+    // Producto top del día
+    let top = sqlx::query(
+        r#"
+        SELECT p.nombre, SUM(vd.cantidad)::numeric AS qty
+          FROM venta_detalle vd
+          JOIN ventas v   ON v.id = vd.venta_id
+          JOIN productos p ON p.id = vd.producto_id
+         WHERE v.deleted_at IS NULL AND v.anulada = 0
+           AND substr(v.fecha, 1, 10)
+               = to_char(now() AT TIME ZONE 'America/Mexico_City', 'YYYY-MM-DD')
+         GROUP BY vd.producto_id, p.nombre
+         ORDER BY qty DESC
+         LIMIT 1
+        "#,
+    )
+    .fetch_optional(&state.pool)
+    .await?;
+
+    let (top_nombre, top_cant): (Option<String>, f64) = match top {
+        Some(r) => (
+            r.try_get::<String, _>("nombre").ok(),
+            r.try_get::<rust_decimal::Decimal, _>("qty").ok()
+                .and_then(|d| d.to_f64()).unwrap_or(0.0),
+        ),
+        None => (None, 0.0),
+    };
 
     Ok(json!({
-        "total_ventas_dia": total,
-        "num_ventas_dia":   num,
-        "total_descuentos_dia": desc,
+        "total_ventas":           dec(&row, "total_ventas"),
+        "num_transacciones":      num,
+        "efectivo":               dec(&row, "efectivo"),
+        "tarjeta":                dec(&row, "tarjeta"),
+        "transferencia":          dec(&row, "transferencia"),
+        "producto_top_nombre":    top_nombre,
+        "producto_top_cantidad":  top_cant,
     }))
 }
 
