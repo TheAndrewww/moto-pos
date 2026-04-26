@@ -66,6 +66,14 @@ pub async fn dispatch(
         "listar_usuarios"               => listar_usuarios(&state).await?,
         "listar_roles"                  => listar_roles(),
 
+        // ─── Productos (mutaciones) ──────────────────────────
+        "crear_producto"                => crear_producto(&state, args).await?,
+        "actualizar_producto"           => actualizar_producto(&state, args).await?,
+        "eliminar_producto"             => eliminar_producto(&state, &args).await?,
+        "ajustar_stock"                 => ajustar_stock(&state, &args).await?,
+        "generar_codigo_interno"        => generar_codigo_interno(&state).await?,
+        "historial_precios_producto"    => historial_precios_producto(&state, &args).await?,
+
         // ─── Config / sistema ────────────────────────────────
         "obtener_config_negocio"        => obtener_config_negocio(),
         "obtener_config_descuentos"     => obtener_config_descuentos(),
@@ -233,6 +241,481 @@ fn producto_row_to_json(row: &sqlx::postgres::PgRow) -> Value {
         "foto_url":          row.try_get::<Option<String>, _>("foto_url").ok().flatten(),
         "activo":            row.get::<i32, _>("activo") != 0,
     })
+}
+
+// =============================================================================
+// PRODUCTOS — MUTACIONES (web puede crear/editar/eliminar/ajustar stock)
+// =============================================================================
+//
+// Toda mutación:
+//   1. Escribe en Postgres con updated_at = NOW_TEXT
+//   2. Inserta entrada en sync_cursor (origen 'web-pos') para que el desktop
+//      la jale en su próximo pull
+//   3. Registra en audit_log (web-side; el desktop tiene su propio audit local)
+
+#[derive(Deserialize)]
+struct NuevoProductoArgs {
+    producto: NuevoProductoIn,
+    usuario_id: i64,
+}
+
+#[derive(Deserialize)]
+struct NuevoProductoIn {
+    codigo: Option<String>,
+    codigo_tipo: Option<String>,
+    nombre: String,
+    descripcion: Option<String>,
+    categoria_id: Option<i64>,
+    precio_costo: f64,
+    precio_venta: f64,
+    stock_actual: f64,
+    stock_minimo: f64,
+    proveedor_id: Option<i64>,
+    foto_url: Option<String>,
+}
+
+async fn crear_producto(state: &AppState, args: Value) -> Result<Value, ApiError> {
+    let a: NuevoProductoArgs = serde_json::from_value(args)
+        .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
+    let p = a.producto;
+
+    let mut tx = state.pool.begin().await?;
+
+    // Generar código si no se proporcionó (atómico vía codigo_secuencia)
+    let codigo = match p.codigo.filter(|c| !c.is_empty()) {
+        Some(c) => c,
+        None => {
+            let nuevo: i64 = sqlx::query_scalar(
+                "UPDATE codigo_secuencia SET ultimo_valor = ultimo_valor + 1 \
+                 WHERE id = 1 RETURNING ultimo_valor",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            format!("MR-{:05}", nuevo)
+        }
+    };
+
+    let codigo_tipo = p.codigo_tipo.clone().unwrap_or_else(|| "INTERNO".to_string());
+    let search_text = format!(
+        "{} {} {}",
+        codigo.to_lowercase(),
+        p.nombre.to_lowercase(),
+        p.descripcion.as_deref().unwrap_or("").to_lowercase(),
+    );
+    let uuid = uuid::Uuid::now_v7().to_string();
+
+    let ins_sql = format!(
+        r#"
+        INSERT INTO productos
+            (uuid, codigo, codigo_tipo, nombre, descripcion, categoria_id,
+             precio_costo, precio_venta, stock_actual, stock_minimo,
+             proveedor_id, foto_url, search_text, activo,
+             created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 1,
+                {NOW_TEXT}, {NOW_TEXT})
+        RETURNING id, uuid, codigo, codigo_tipo, nombre, descripcion,
+                  categoria_id, precio_costo, precio_venta, stock_actual,
+                  stock_minimo, proveedor_id, foto_url, activo
+        "#
+    );
+    let row = sqlx::query(&ins_sql)
+        .bind(&uuid)
+        .bind(&codigo)
+        .bind(&codigo_tipo)
+        .bind(&p.nombre)
+        .bind(p.descripcion.as_deref())
+        .bind(p.categoria_id)
+        .bind(p.precio_costo)
+        .bind(p.precio_venta)
+        .bind(p.stock_actual)
+        .bind(p.stock_minimo)
+        .bind(p.proveedor_id)
+        .bind(p.foto_url.as_deref())
+        .bind(&search_text)
+        .fetch_one(&mut *tx)
+        .await?;
+    let id: i64 = row.get("id");
+
+    // sync_cursor → desktop pull
+    sqlx::query(
+        "INSERT INTO sync_cursor (tabla, uuid, sucursal_id, origen_device) \
+         VALUES ('productos', $1, 1, $2)",
+    )
+    .bind(&uuid)
+    .bind(WEB_ORIGIN)
+    .execute(&mut *tx)
+    .await?;
+
+    // Bitácora web
+    let audit_sql = format!(
+        r#"INSERT INTO audit_log
+           (usuario_id, accion, tabla_afectada, registro_id,
+            descripcion_legible, origen, fecha)
+           VALUES ($1, 'PRODUCTO_CREADO', 'productos', $2, $3, 'WEB', {NOW_TEXT})"#
+    );
+    let _ = sqlx::query(&audit_sql)
+        .bind(a.usuario_id)
+        .bind(id)
+        .bind(format!("Producto creado: {} ({})", p.nombre, codigo))
+        .execute(&mut *tx)
+        .await;
+
+    tx.commit().await?;
+
+    // Devolver shape `Producto` (compatible con el store del frontend)
+    Ok(producto_row_to_json(&row))
+}
+
+#[derive(Deserialize)]
+struct ActualizarProductoArgs {
+    producto: ActualizarProductoIn,
+    usuario_id: i64,
+}
+
+#[derive(Deserialize)]
+struct ActualizarProductoIn {
+    id: i64,
+    codigo: String,
+    nombre: String,
+    descripcion: Option<String>,
+    categoria_id: Option<i64>,
+    precio_costo: f64,
+    precio_venta: f64,
+    stock_minimo: f64,
+    proveedor_id: Option<i64>,
+    foto_url: Option<String>,
+}
+
+async fn actualizar_producto(state: &AppState, args: Value) -> Result<Value, ApiError> {
+    use rust_decimal::prelude::ToPrimitive;
+    let a: ActualizarProductoArgs = serde_json::from_value(args)
+        .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
+    let p = a.producto;
+
+    let mut tx = state.pool.begin().await?;
+
+    // Capturar precio anterior + datos para bitácora antes del UPDATE
+    let prev = sqlx::query(
+        "SELECT uuid, nombre, precio_costo, precio_venta \
+         FROM productos WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(p.id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| ApiError::NotFound)?;
+
+    let uuid: String = prev.get("uuid");
+    let nombre_ant: String = prev.get("nombre");
+    let precio_costo_ant = prev
+        .try_get::<rust_decimal::Decimal, _>("precio_costo")
+        .ok()
+        .and_then(|d| d.to_f64())
+        .unwrap_or(0.0);
+    let precio_venta_ant = prev
+        .try_get::<rust_decimal::Decimal, _>("precio_venta")
+        .ok()
+        .and_then(|d| d.to_f64())
+        .unwrap_or(0.0);
+
+    let search_text = format!(
+        "{} {} {}",
+        p.codigo.to_lowercase(),
+        p.nombre.to_lowercase(),
+        p.descripcion.as_deref().unwrap_or("").to_lowercase(),
+    );
+
+    let upd_sql = format!(
+        r#"
+        UPDATE productos SET
+            codigo = $1, nombre = $2, descripcion = $3, categoria_id = $4,
+            precio_costo = $5, precio_venta = $6,
+            stock_minimo = $7, proveedor_id = $8, foto_url = $9,
+            search_text = $10, updated_at = {NOW_TEXT}
+        WHERE id = $11 AND deleted_at IS NULL
+        "#
+    );
+    sqlx::query(&upd_sql)
+        .bind(&p.codigo)
+        .bind(&p.nombre)
+        .bind(p.descripcion.as_deref())
+        .bind(p.categoria_id)
+        .bind(p.precio_costo)
+        .bind(p.precio_venta)
+        .bind(p.stock_minimo)
+        .bind(p.proveedor_id)
+        .bind(p.foto_url.as_deref())
+        .bind(&search_text)
+        .bind(p.id)
+        .execute(&mut *tx)
+        .await?;
+
+    sqlx::query(
+        "INSERT INTO sync_cursor (tabla, uuid, sucursal_id, origen_device) \
+         VALUES ('productos', $1, 1, $2)",
+    )
+    .bind(&uuid)
+    .bind(WEB_ORIGIN)
+    .execute(&mut *tx)
+    .await?;
+
+    let datos_ant_str = format!(
+        "{} | costo:{:.2} | venta:{:.2}",
+        nombre_ant, precio_costo_ant, precio_venta_ant
+    );
+    let audit_sql = format!(
+        r#"INSERT INTO audit_log
+           (usuario_id, accion, tabla_afectada, registro_id,
+            datos_anteriores, descripcion_legible, origen, fecha)
+           VALUES ($1, 'PRODUCTO_EDITADO', 'productos', $2, $3, $4, 'WEB', {NOW_TEXT})"#
+    );
+    let _ = sqlx::query(&audit_sql)
+        .bind(a.usuario_id)
+        .bind(p.id)
+        .bind(&datos_ant_str)
+        .bind(format!("Producto editado: {}", p.nombre))
+        .execute(&mut *tx)
+        .await;
+
+    // Si cambió el precio de venta, dejar registro dedicado para historial_precios
+    if (p.precio_venta - precio_venta_ant).abs() > 0.001 {
+        let json_ant = format!("{{\"precio_venta\":{:.2}}}", precio_venta_ant);
+        let json_new = format!("{{\"precio_venta\":{:.2}}}", p.precio_venta);
+        let descr = format!(
+            "Precio de '{}' cambió de ${:.2} a ${:.2}",
+            p.nombre, precio_venta_ant, p.precio_venta
+        );
+        let pa_sql = format!(
+            r#"INSERT INTO audit_log
+               (usuario_id, accion, tabla_afectada, registro_id,
+                datos_anteriores, datos_nuevos, descripcion_legible, origen, fecha)
+               VALUES ($1, 'PRECIO_ACTUALIZADO', 'productos', $2, $3, $4, $5, 'WEB', {NOW_TEXT})"#
+        );
+        let _ = sqlx::query(&pa_sql)
+            .bind(a.usuario_id)
+            .bind(p.id)
+            .bind(&json_ant)
+            .bind(&json_new)
+            .bind(&descr)
+            .execute(&mut *tx)
+            .await;
+    }
+
+    tx.commit().await?;
+    Ok(json!(true))
+}
+
+#[derive(Deserialize)]
+struct EliminarProductoArgs {
+    producto_id: i64,
+    usuario_id: i64,
+}
+
+async fn eliminar_producto(state: &AppState, args: &Value) -> Result<Value, ApiError> {
+    let a: EliminarProductoArgs = serde_json::from_value(args.clone())
+        .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
+
+    let mut tx = state.pool.begin().await?;
+
+    // Capturar uuid + nombre antes del soft-delete
+    let prev = sqlx::query(
+        "SELECT uuid, nombre FROM productos \
+         WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(a.producto_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| ApiError::NotFound)?;
+    let uuid: String = prev.get("uuid");
+    let nombre: String = prev.get("nombre");
+
+    let upd_sql = format!(
+        "UPDATE productos SET activo = 0, deleted_at = {NOW_TEXT}, \
+         updated_at = {NOW_TEXT} WHERE id = $1"
+    );
+    sqlx::query(&upd_sql)
+        .bind(a.producto_id)
+        .execute(&mut *tx)
+        .await?;
+
+    sqlx::query(
+        "INSERT INTO sync_cursor (tabla, uuid, sucursal_id, origen_device) \
+         VALUES ('productos', $1, 1, $2)",
+    )
+    .bind(&uuid)
+    .bind(WEB_ORIGIN)
+    .execute(&mut *tx)
+    .await?;
+
+    let audit_sql = format!(
+        r#"INSERT INTO audit_log
+           (usuario_id, accion, tabla_afectada, registro_id,
+            descripcion_legible, origen, fecha)
+           VALUES ($1, 'PRODUCTO_ELIMINADO', 'productos', $2, $3, 'WEB', {NOW_TEXT})"#
+    );
+    let _ = sqlx::query(&audit_sql)
+        .bind(a.usuario_id)
+        .bind(a.producto_id)
+        .bind(format!("Producto eliminado: {}", nombre))
+        .execute(&mut *tx)
+        .await;
+
+    tx.commit().await?;
+    Ok(json!(true))
+}
+
+#[derive(Deserialize)]
+struct AjustarStockArgs {
+    producto_id: i64,
+    nuevo_stock: f64,
+    motivo: String,
+    usuario_id: i64,
+}
+
+async fn ajustar_stock(state: &AppState, args: &Value) -> Result<Value, ApiError> {
+    use rust_decimal::prelude::ToPrimitive;
+    let a: AjustarStockArgs = serde_json::from_value(args.clone())
+        .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
+    if a.motivo.trim().is_empty() {
+        return Err(ApiError::BadRequest("El motivo es obligatorio".into()));
+    }
+
+    let mut tx = state.pool.begin().await?;
+
+    let prev = sqlx::query(
+        "SELECT uuid, nombre, stock_actual FROM productos \
+         WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(a.producto_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| ApiError::NotFound)?;
+    let uuid: String = prev.get("uuid");
+    let nombre: String = prev.get("nombre");
+    let stock_anterior = prev
+        .try_get::<rust_decimal::Decimal, _>("stock_actual")
+        .ok()
+        .and_then(|d| d.to_f64())
+        .unwrap_or(0.0);
+
+    let upd_sql = format!(
+        "UPDATE productos SET stock_actual = $1, updated_at = {NOW_TEXT} WHERE id = $2"
+    );
+    sqlx::query(&upd_sql)
+        .bind(a.nuevo_stock)
+        .bind(a.producto_id)
+        .execute(&mut *tx)
+        .await?;
+
+    let upd_suc_sql = format!(
+        "UPDATE stock_sucursal SET stock_actual = $1, updated_at = {NOW_TEXT} \
+         WHERE producto_id = $2 AND sucursal_id = 1"
+    );
+    let _ = sqlx::query(&upd_suc_sql)
+        .bind(a.nuevo_stock)
+        .bind(a.producto_id)
+        .execute(&mut *tx)
+        .await;
+
+    sqlx::query(
+        "INSERT INTO sync_cursor (tabla, uuid, sucursal_id, origen_device) \
+         VALUES ('productos', $1, 1, $2)",
+    )
+    .bind(&uuid)
+    .bind(WEB_ORIGIN)
+    .execute(&mut *tx)
+    .await?;
+
+    let diff = a.nuevo_stock - stock_anterior;
+    let signo = if diff >= 0.0 { "+" } else { "" };
+    let json_ant = format!("{{\"stock_actual\":{}}}", stock_anterior);
+    let motivo_san = a.motivo.replace('\\', "\\\\").replace('"', "\\\"");
+    let json_new = format!(
+        "{{\"stock_actual\":{},\"motivo\":\"{}\"}}",
+        a.nuevo_stock, motivo_san
+    );
+    let descr = format!(
+        "Stock ajustado: {} ({}{}) — {}",
+        nombre, signo, diff, a.motivo.trim()
+    );
+    let audit_sql = format!(
+        r#"INSERT INTO audit_log
+           (usuario_id, accion, tabla_afectada, registro_id,
+            datos_anteriores, datos_nuevos, descripcion_legible, origen, fecha)
+           VALUES ($1, 'STOCK_AJUSTADO', 'productos', $2, $3, $4, $5, 'WEB', {NOW_TEXT})"#
+    );
+    let _ = sqlx::query(&audit_sql)
+        .bind(a.usuario_id)
+        .bind(a.producto_id)
+        .bind(&json_ant)
+        .bind(&json_new)
+        .bind(&descr)
+        .execute(&mut *tx)
+        .await;
+
+    tx.commit().await?;
+    Ok(json!(true))
+}
+
+async fn generar_codigo_interno(state: &AppState) -> Result<Value, ApiError> {
+    // Solo previsualiza el siguiente sin consumirlo (no incrementa).
+    let next: i64 = sqlx::query_scalar(
+        "SELECT ultimo_valor + 1 FROM codigo_secuencia WHERE id = 1",
+    )
+    .fetch_one(&state.pool)
+    .await?;
+    Ok(json!(format!("MR-{:05}", next)))
+}
+
+#[derive(Deserialize)]
+struct HistorialArgs {
+    producto_id: i64,
+}
+
+async fn historial_precios_producto(state: &AppState, args: &Value) -> Result<Value, ApiError> {
+    let a: HistorialArgs = serde_json::from_value(args.clone())
+        .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
+
+    let rows = sqlx::query(
+        r#"
+        SELECT a.fecha, a.datos_anteriores, a.datos_nuevos,
+               COALESCE(u.nombre_completo, 'Desconocido') AS usuario
+        FROM audit_log a
+        LEFT JOIN usuarios u ON u.id = a.usuario_id
+        WHERE a.accion = 'PRECIO_ACTUALIZADO'
+          AND a.tabla_afectada = 'productos'
+          AND a.registro_id = $1
+        ORDER BY a.fecha DESC
+        "#,
+    )
+    .bind(a.producto_id)
+    .fetch_all(&state.pool)
+    .await?;
+
+    let extraer = |s: &str| -> f64 {
+        let key = "\"precio_venta\":";
+        if let Some(i) = s.find(key) {
+            let rest = &s[i + key.len()..];
+            let end = rest.find(|c: char| c == ',' || c == '}').unwrap_or(rest.len());
+            rest[..end].trim().parse::<f64>().unwrap_or(0.0)
+        } else {
+            0.0
+        }
+    };
+
+    let items: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            let ant: Option<String> = r.try_get("datos_anteriores").ok().flatten();
+            let new_: Option<String> = r.try_get("datos_nuevos").ok().flatten();
+            json!({
+                "fecha":           r.get::<String, _>("fecha"),
+                "precio_anterior": extraer(&ant.unwrap_or_default()),
+                "precio_nuevo":    extraer(&new_.unwrap_or_default()),
+                "usuario_nombre":  r.get::<String, _>("usuario"),
+            })
+        })
+        .collect();
+    Ok(json!(items))
 }
 
 // =============================================================================
