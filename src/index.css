@@ -367,6 +367,40 @@
 
 .pos-sidebar-backdrop { display: none; }
 
+/* FAB (Floating Action Button) — oculto por defecto, visible en móvil */
+.pos-fab {
+  display: none;
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 85;
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  background: var(--color-primary);
+  color: #fff;
+  border: none;
+  cursor: pointer;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 6px 18px rgba(0,0,0,0.25);
+}
+.pos-fab:active { transform: scale(0.95); }
+.pos-fab .pos-fab-badge {
+  position: absolute;
+  top: -4px;
+  right: -4px;
+  background: var(--color-secondary);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  border-radius: 12px;
+  padding: 2px 7px;
+  min-width: 22px;
+  text-align: center;
+  border: 2px solid var(--color-bg);
+}
+
 /* ============================================================
    MEDIA QUERY MOBILE (≤768px)
    ============================================================ */
@@ -436,6 +470,116 @@
   /* Grids comunes que se aplastan en mobile → 1 columna */
   .grid-2-mobile-1, .stats-grid {
     grid-template-columns: 1fr !important;
+  }
+
+  /* ─── INPUTS: anti-zoom iOS (font-size >= 16px) ───────── */
+  input, textarea, select {
+    font-size: 16px !important;
+  }
+
+  /* ─── PUNTO DE VENTA — mobile ────────────────────────── */
+  .pos-pdv-grid {
+    grid-template-columns: 1fr !important;
+  }
+  /* Carrito como bottom sheet en móvil: oculto por defecto */
+  .pos-pdv-cart {
+    position: fixed !important;
+    inset: 48px 0 0 0;
+    z-index: 90;
+    background: var(--color-surface) !important;
+    transform: translateY(100%);
+    transition: transform 0.22s ease;
+    box-shadow: 0 -4px 16px rgba(0,0,0,0.18);
+    border-left: none !important;
+  }
+  .pos-pdv-cart.open { transform: translateY(0); }
+
+  /* FAB para abrir el carrito (solo móvil) */
+  .pos-fab {
+    display: inline-flex !important;
+  }
+
+  /* Botón cerrar carrito en bottom sheet */
+  .pos-cart-close {
+    display: flex !important;
+  }
+
+  /* Items del carrito → layout más compacto, sin columna de subtotal grande */
+  .cart-item {
+    grid-template-columns: 1fr !important;
+    gap: 6px !important;
+    padding: 8px 10px !important;
+    border-bottom: 1px solid var(--color-border);
+    border-radius: 0 !important;
+  }
+  .cart-item > * { text-align: left !important; }
+
+  /* ─── HEADERS DE PÁGINA — wrap ────────────────────────── */
+  .pos-page-header,
+  .pos-filter-row {
+    flex-wrap: wrap !important;
+    gap: 8px !important;
+  }
+  .pos-filter-row > select.input,
+  .pos-filter-row > input.input {
+    width: 100% !important;
+    flex: 1 1 100% !important;
+  }
+  .pos-filter-row > .pos-filter-search { flex: 1 1 100% !important; }
+  .pos-filter-row > div[role="filter-fixed"] { flex: 1 1 100% !important; }
+
+  /* ─── TABLAS GENÉRICAS → CARDS ───────────────────────── */
+  .responsive-table thead { display: none; }
+  .responsive-table,
+  .responsive-table tbody,
+  .responsive-table tr,
+  .responsive-table td {
+    display: block;
+    width: 100%;
+  }
+  .responsive-table tr {
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--color-border);
+    background: var(--color-surface);
+  }
+  .responsive-table td {
+    padding: 3px 0 !important;
+    text-align: left !important;
+    font-size: 13px;
+  }
+  .responsive-table td[data-label]::before {
+    content: attr(data-label) ': ';
+    font-weight: 700;
+    color: var(--color-text-muted);
+    font-size: 11px;
+    margin-right: 6px;
+    text-transform: uppercase;
+  }
+
+  /* ─── ETIQUETAS — layout mobile ──────────────────────── */
+  .etiquetas-content-grid {
+    grid-template-columns: 1fr !important;
+    grid-template-rows: auto auto !important;
+  }
+
+  /* ─── DASHBOARD HOME — stats 2 columnas ──────────────── */
+  .dashboard-stats-grid {
+    grid-template-columns: repeat(2, 1fr) !important;
+  }
+  .dashboard-payment-grid {
+    grid-template-columns: 1fr !important;
+  }
+
+  /* ─── MODALES — full-screen friendly ─────────────────── */
+  .pos-modal-content {
+    width: 100% !important;
+    max-width: 100% !important;
+    max-height: 100vh !important;
+    border-radius: 0 !important;
+  }
+  .pos-modal-overlay {
+    padding: 0 !important;
+    align-items: stretch !important;
   }
 
   /* ─── RECEPCIÓN — mobile ─────────────────────────────── */
@@ -518,5 +662,41 @@
   }
   .recepcion-list-row > span {
     min-width: auto !important;
+  }
+}
+
+/* ============================================================
+   MEDIA QUERY TABLET (≤1024px)
+   Reduce sidebar width, achica paddings — sin colapsar layout
+   ============================================================ */
+@media (max-width: 1024px) and (min-width: 769px) {
+  .pos-dashboard {
+    grid-template-columns: 180px 1fr;
+  }
+  .pos-pdv-grid {
+    grid-template-columns: 1fr 320px !important;
+  }
+}
+
+/* ============================================================
+   MEDIA QUERY MOBILE CHICO (≤480px)
+   Achica títulos y paddings extra
+   ============================================================ */
+@media (max-width: 480px) {
+  .price-display {
+    font-size: 30px !important;
+  }
+  .pos-page-header h2 {
+    font-size: 15px !important;
+  }
+  /* En móvil chico, ocultar badges decorativos del header */
+  .pos-page-header .pos-header-stats {
+    width: 100%;
+    font-size: 11px !important;
+  }
+  /* FAB un poco más chico para no tapar */
+  .pos-fab {
+    width: 52px;
+    height: 52px;
   }
 }

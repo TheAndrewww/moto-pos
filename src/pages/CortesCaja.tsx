@@ -145,7 +145,7 @@ export default function CortesCaja({
           onClick={() => setShowModalParcial(true)}
           title="F11"
         >
-          <Clock size={14} /> Corte Parcial <span style={{ opacity: 0.5, fontSize: 10 }}>F11</span>
+          <ArrowUpRight size={14} /> Retiro de Caja <span style={{ opacity: 0.5, fontSize: 10 }}>F11</span>
         </button>
         {esAdmin && (
           <button
@@ -206,7 +206,7 @@ export default function CortesCaja({
         />
       )}
       {showModalParcial && (
-        <ModalCorteParcial
+        <ModalRetiroCaja
           onClose={() => setShowModalParcial(false)}
           onSuccess={recargar}
         />
@@ -510,21 +510,29 @@ function ModalMovimiento({ onClose, onSuccess }: { onClose: () => void; onSucces
   );
 }
 
-// ─── Modal 2: Corte Parcial ───────────────────────────────
+// ─── Modal 2: Retiro de Caja (antes "Corte Parcial") ─────────
+//
+// A diferencia del corte del día, esto NO toma snapshot ni cierra
+// movimientos. Es un retiro de efectivo a mitad del día: el usuario
+// ve cuánto hay esperado en caja, ingresa cuánto se lleva, y confirma.
+// Bajo el capó crea un `movimiento_caja` tipo RETIRO (igual que F6
+// pero con el contexto del balance actual).
 
-function ModalCorteParcial({ onClose, onSuccess }: { onClose: () => void; onSuccess: () => void }) {
+function ModalRetiroCaja({ onClose, onSuccess }: { onClose: () => void; onSuccess: () => void }) {
   const { usuario } = useAuthStore();
-  const { calcularDatosCorte, crearCorte, cargando } = useCortesStore();
+  const { calcularDatosCorte, crearMovimiento } = useCortesStore();
 
   const [datos, setDatos] = useState<DatosCorte | null>(null);
   const [cargandoDatos, setCargandoDatos] = useState(true);
-  const [usarDenominaciones, setUsarDenominaciones] = useState(false);
-  const [cantidades, setCantidades] = useState<Record<string, number>>({});
-  const [efectivoContadoDirecto, setEfectivoContadoDirecto] = useState('');
-  const [nota, setNota] = useState('');
+  const [monto, setMonto] = useState('');
+  const [concepto, setConcepto] = useState('');
+  const [pinDueno, setPinDueno] = useState('');
   const [error, setError] = useState('');
+  const [guardando, setGuardando] = useState(false);
   const [fechaInicio] = useState(fechaHoyInicio);
   const [fechaFin] = useState(ahora);
+
+  const esAdmin = usuario?.es_admin ?? false;
 
   useEffect(() => {
     calcularDatosCorte(fechaInicio, fechaFin)
@@ -533,50 +541,33 @@ function ModalCorteParcial({ onClose, onSuccess }: { onClose: () => void; onSucc
       .finally(() => setCargandoDatos(false));
   }, []);
 
-  const totalDenominaciones = DENOMINACIONES.reduce((sum, d) => {
-    const key = `${d.valor}_${d.tipo}`;
-    return sum + (cantidades[key] || 0) * d.valor;
-  }, 0);
-
-  const contadoNum = usarDenominaciones
-    ? totalDenominaciones
-    : parseFloat(efectivoContadoDirecto) || 0;
-  const diferencia = datos ? contadoNum - datos.efectivo_esperado : 0;
-  const huboConteo = usarDenominaciones ? totalDenominaciones > 0 : efectivoContadoDirecto !== '';
-  const requiereNota = huboConteo && diferencia !== 0;
+  const efectivoEsperado = datos?.efectivo_esperado ?? 0;
+  const montoNum = parseFloat(monto) || 0;
+  const restante = efectivoEsperado - montoNum;
+  const requierePin = montoNum > 500 && !esAdmin;
+  const excede = montoNum > efectivoEsperado;
 
   const handleConfirmar = async () => {
     if (!datos) return;
-    if (contadoNum < 0) { setError('El efectivo contado no puede ser negativo'); return; }
-    if (requiereNota && !nota.trim()) { setError('La nota es obligatoria cuando hay diferencia'); return; }
+    if (montoNum <= 0) { setError('El monto a retirar debe ser mayor a $0'); return; }
+    if (!concepto.trim()) { setError('El concepto es obligatorio'); return; }
+    if (requierePin && pinDueno.length < 4) { setError('Ingresa el PIN del dueño'); return; }
 
-    const denominaciones: DenominacionInput[] | undefined = usarDenominaciones
-      ? DENOMINACIONES
-          .filter(d => (cantidades[`${d.valor}_${d.tipo}`] || 0) > 0)
-          .map(d => ({
-            denominacion: d.valor,
-            tipo: d.tipo,
-            cantidad: cantidades[`${d.valor}_${d.tipo}`] || 0,
-          }))
-      : undefined;
-
+    setGuardando(true);
     setError('');
     try {
-      await crearCorte({
-        tipo: 'PARCIAL',
+      await crearMovimiento({
+        tipo: 'RETIRO',
         usuario_id: usuario!.id,
-        fecha_inicio: fechaInicio,
-        fecha_fin: fechaFin,
-        datos,
-        efectivo_contado: contadoNum,
-        nota_diferencia: nota.trim() || null,
-        fondo_siguiente: contadoNum,
-        denominaciones,
+        monto: montoNum,
+        concepto: concepto.trim(),
+        pin_autorizacion: requierePin ? pinDueno : null,
       });
       await onSuccess();
       onClose();
     } catch (e: any) {
       setError(String(e));
+      setGuardando(false);
     }
   };
 
@@ -586,18 +577,18 @@ function ModalCorteParcial({ onClose, onSuccess }: { onClose: () => void; onSucc
       display: 'flex', alignItems: 'flex-start', justifyContent: 'center',
       zIndex: 200, overflowY: 'auto', padding: '20px 0',
     }} onClick={onClose}>
-      <div className="card animate-fade-in" style={{ width: 560, padding: 0, overflow: 'hidden', margin: 'auto' }}
+      <div className="card animate-fade-in" style={{ width: 480, padding: 0, overflow: 'hidden', margin: 'auto' }}
         onClick={e => e.stopPropagation()}>
 
         {/* Header */}
         <div style={{
           padding: '16px 20px', borderBottom: '1px solid var(--color-border)',
           display: 'flex', alignItems: 'center', gap: 10,
-          background: 'rgba(99,102,241,0.08)',
+          background: 'rgba(245,158,11,0.08)',
         }}>
-          <Clock size={18} style={{ color: 'var(--color-primary)' }} />
+          <ArrowUpRight size={18} style={{ color: 'var(--color-warning)' }} />
           <div style={{ flex: 1 }}>
-            <h3 style={{ fontSize: 15, fontWeight: 700 }}>Corte Parcial</h3>
+            <h3 style={{ fontSize: 15, fontWeight: 700 }}>Retiro de Caja</h3>
             <p style={{ fontSize: 11, color: 'var(--color-text-dim)' }}>
               {ahora().substring(0, 16).replace('T', ' ')} · {usuario?.nombre_completo}
             </p>
@@ -605,7 +596,7 @@ function ModalCorteParcial({ onClose, onSuccess }: { onClose: () => void; onSucc
           <button className="btn btn-ghost btn-sm" onClick={onClose}><X size={16} /></button>
         </div>
 
-        <div style={{ padding: 20, display: 'flex', flexDirection: 'column', gap: 16, maxHeight: '80vh', overflowY: 'auto' }}>
+        <div style={{ padding: 20, display: 'flex', flexDirection: 'column', gap: 16 }}>
           {cargandoDatos && (
             <div style={{ textAlign: 'center', padding: 32, color: 'var(--color-text-dim)' }}>
               Calculando...
@@ -614,138 +605,91 @@ function ModalCorteParcial({ onClose, onSuccess }: { onClose: () => void; onSucc
 
           {datos && (
             <>
-              {/* Resumen de ventas */}
-              <SeccionResumen titulo="VENTAS DEL TURNO">
-                <FilaResumen label="Efectivo" valor={fmt(datos.total_ventas_efectivo)} color="var(--color-success)" />
-                <FilaResumen label="Tarjeta" valor={fmt(datos.total_ventas_tarjeta)} />
-                <FilaResumen label="Transferencia" valor={fmt(datos.total_ventas_transferencia)} />
-                <FilaResumen label={`Total (${datos.num_transacciones} ventas)`} valor={fmt(datos.total_ventas)} bold />
-                {datos.total_anulaciones > 0 && (
-                  <FilaResumen label="Anulaciones" valor={`-${fmt(datos.total_anulaciones)}`} color="var(--color-danger)" />
-                )}
-              </SeccionResumen>
-
-              {/* Movimientos de caja */}
-              {datos.movimientos.length > 0 && (
-                <SeccionResumen titulo="MOVIMIENTOS DE CAJA">
-                  <ListaMovimientosDetalle movimientos={datos.movimientos} />
-                  <div style={{ margin: '8px 0 6px', borderTop: '1px solid var(--color-border)' }} />
-                  {datos.total_entradas_efectivo > 0 && (
-                    <FilaResumen label="Total entradas" valor={`+${fmt(datos.total_entradas_efectivo)}`} color="var(--color-success)" />
-                  )}
-                  {datos.total_retiros_efectivo > 0 && (
-                    <FilaResumen label="Total retiros" valor={`-${fmt(datos.total_retiros_efectivo)}`} color="var(--color-danger)" />
-                  )}
-                </SeccionResumen>
-              )}
-
-              {/* Efectivo esperado */}
+              {/* Efectivo actualmente en caja */}
               <div style={{
-                padding: '12px 16px', borderRadius: 10,
+                padding: '14px 16px', borderRadius: 10,
                 background: 'var(--color-surface-2)',
                 border: '1px solid var(--color-border)',
                 display: 'flex', justifyContent: 'space-between', alignItems: 'center',
               }}>
-                <span style={{ fontSize: 13, fontWeight: 600 }}>Efectivo esperado en caja</span>
+                <span style={{ fontSize: 13, fontWeight: 600 }}>Efectivo en caja</span>
                 <span className="mono" style={{ fontSize: 22, fontWeight: 800, color: 'var(--color-primary)' }}>
-                  {fmt(datos.efectivo_esperado)}
+                  {fmt(efectivoEsperado)}
                 </span>
               </div>
 
-              {/* DENOMINACIONES (opcional) */}
+              {/* Monto a retirar */}
               <div>
-                <button
-                  className="btn btn-ghost btn-sm"
-                  style={{ width: '100%', justifyContent: 'space-between' }}
-                  onClick={() => setUsarDenominaciones(!usarDenominaciones)}
-                >
-                  <span>Contar por denominación (opcional)</span>
-                  {usarDenominaciones ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
-                </button>
-
-                {usarDenominaciones && (
-                  <div className="card" style={{ marginTop: 10, padding: '10px 14px' }}>
-                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0 24px' }}>
-                      {['BILLETE', 'MONEDA'].map(tipoD => (
-                        <div key={tipoD}>
-                          <p style={{ fontSize: 11, fontWeight: 700, color: 'var(--color-text-dim)', marginBottom: 8 }}>
-                            {tipoD === 'BILLETE' ? 'BILLETES' : 'MONEDAS'}
-                          </p>
-                          {DENOMINACIONES.filter(d => d.tipo === tipoD).map(d => {
-                            const key = `${d.valor}_${d.tipo}`;
-                            return (
-                              <div key={key} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
-                                <span className="mono" style={{ width: 52, fontSize: 13, fontWeight: 600 }}>{d.label}</span>
-                                <span style={{ color: 'var(--color-text-dim)', fontSize: 13 }}>×</span>
-                                <input
-                                  className="input mono"
-                                  type="number"
-                                  min="0"
-                                  step="1"
-                                  placeholder="0"
-                                  value={cantidades[key] || ''}
-                                  onChange={e => setCantidades(prev => ({ ...prev, [key]: parseInt(e.target.value) || 0 }))}
-                                  style={{ width: 64, textAlign: 'center', padding: '4px 8px', fontSize: 13 }}
-                                />
-                                <span className="mono" style={{ fontSize: 12, color: 'var(--color-text-dim)', width: 72, textAlign: 'right' }}>
-                                  {fmt((cantidades[key] || 0) * d.valor)}
-                                </span>
-                              </div>
-                            );
-                          })}
-                        </div>
-                      ))}
-                    </div>
-                    <div style={{
-                      marginTop: 10, paddingTop: 10, borderTop: '1px solid var(--color-border)',
-                      display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-                    }}>
-                      <span style={{ fontSize: 13, fontWeight: 700 }}>TOTAL CONTADO</span>
-                      <span className="mono" style={{ fontSize: 20, fontWeight: 800, color: 'var(--color-success)' }}>
-                        {fmt(totalDenominaciones)}
-                      </span>
-                    </div>
-                  </div>
-                )}
+                <label style={{ fontSize: 11, fontWeight: 700, color: 'var(--color-text-muted)', display: 'block', marginBottom: 6 }}>
+                  MONTO A RETIRAR
+                </label>
+                <input
+                  className="input mono"
+                  type="number"
+                  step="0.01"
+                  min="0"
+                  placeholder="$0.00"
+                  value={monto}
+                  onChange={e => setMonto(e.target.value)}
+                  autoFocus
+                  style={{ width: '100%', fontSize: 26, textAlign: 'center' }}
+                />
               </div>
 
-              {/* Input directo (si no usa denominaciones) */}
-              {!usarDenominaciones && (
-                <div>
-                  <label style={{ fontSize: 11, fontWeight: 700, color: 'var(--color-text-muted)', display: 'block', marginBottom: 6 }}>
-                    EFECTIVO CONTADO (lo que hay físicamente)
-                  </label>
-                  <input
-                    className="input mono"
-                    type="number"
-                    step="0.01"
-                    min="0"
-                    placeholder="$0.00"
-                    value={efectivoContadoDirecto}
-                    onChange={e => setEfectivoContadoDirecto(e.target.value)}
-                    autoFocus
-                    style={{ width: '100%', fontSize: 24, textAlign: 'center' }}
-                  />
+              {/* Quedará en caja — la info clave del flujo */}
+              {montoNum > 0 && (
+                <div style={{
+                  padding: '14px 16px', borderRadius: 10,
+                  background: excede
+                    ? 'rgba(239, 68, 68, 0.1)'
+                    : 'rgba(34, 197, 94, 0.1)',
+                  border: `1px solid ${excede ? 'var(--color-danger)' : 'var(--color-success)'}`,
+                  display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                }}>
+                  <span style={{ fontSize: 13, fontWeight: 700 }}>
+                    {excede ? '⚠️ Excede el efectivo en caja' : 'Quedará en caja'}
+                  </span>
+                  <span className="mono" style={{
+                    fontSize: 24, fontWeight: 800,
+                    color: excede ? 'var(--color-danger)' : 'var(--color-success)',
+                  }}>
+                    {fmt(restante)}
+                  </span>
                 </div>
               )}
 
-              {/* Diferencia en tiempo real */}
-              {huboConteo && (
-                <FilaDiferencia diferencia={diferencia} />
-              )}
+              {/* Concepto */}
+              <div>
+                <label style={{ fontSize: 11, fontWeight: 700, color: 'var(--color-text-muted)', display: 'block', marginBottom: 6 }}>
+                  CONCEPTO
+                </label>
+                <input
+                  className="input"
+                  placeholder="Ej: Pago a proveedor, gastos, depósito al banco..."
+                  value={concepto}
+                  onChange={e => setConcepto(e.target.value)}
+                  onKeyDown={e => { if (e.key === 'Enter' && !requierePin) handleConfirmar(); }}
+                  style={{ width: '100%' }}
+                />
+              </div>
 
-              {/* Nota (obligatoria si hay diferencia) */}
-              {requiereNota && (
-                <div>
-                  <label style={{ fontSize: 11, fontWeight: 700, color: 'var(--color-warning)', display: 'block', marginBottom: 6 }}>
-                    NOTA EXPLICATIVA (obligatoria)
-                  </label>
-                  <textarea
-                    className="input"
-                    placeholder="¿Por qué hay diferencia?"
-                    value={nota}
-                    onChange={e => setNota(e.target.value)}
-                    style={{ width: '100%', minHeight: 72, resize: 'vertical' }}
+              {/* PIN del dueño si retiro > $500 y no admin */}
+              {requierePin && (
+                <div style={{
+                  padding: 12, background: 'rgba(245,158,11,0.1)',
+                  borderRadius: 8, border: '1px solid rgba(245,158,11,0.3)',
+                }}>
+                  <p style={{ fontSize: 12, color: 'var(--color-warning)', fontWeight: 600, marginBottom: 8 }}>
+                    Retiro mayor a $500 — Se requiere PIN del dueño
+                  </p>
+                  <input
+                    className="input mono"
+                    type="password"
+                    maxLength={4}
+                    placeholder="PIN (4 dígitos)"
+                    value={pinDueno}
+                    onChange={e => setPinDueno(e.target.value)}
+                    style={{ width: '100%', textAlign: 'center', letterSpacing: 8, fontSize: 20 }}
                   />
                 </div>
               )}
@@ -760,9 +704,9 @@ function ModalCorteParcial({ onClose, onSuccess }: { onClose: () => void; onSucc
               className="btn btn-primary"
               style={{ flex: 2 }}
               onClick={handleConfirmar}
-              disabled={cargandoDatos || cargando || !datos}
+              disabled={cargandoDatos || guardando || !datos}
             >
-              {cargando ? 'Guardando...' : 'Confirmar corte'}
+              {guardando ? 'Guardando...' : 'Confirmar retiro'}
             </button>
           </div>
         </div>

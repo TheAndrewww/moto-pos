@@ -5,7 +5,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { useProductStore } from '../store/productStore';
 import { useVentaStore, useVentaActiva, type MetodoPago } from '../store/ventaStore';
 import { useAuthStore } from '../store/authStore';
-import { Search, X, Minus, Plus, Trash2, CreditCard, Banknote, ArrowRightLeft, CheckCircle2, User, Percent, Lock, Plus as PlusIcon, Printer, FileText, Save } from 'lucide-react';
+import { Search, X, Minus, Plus, Trash2, CreditCard, Banknote, ArrowRightLeft, CheckCircle2, User, Percent, Lock, Plus as PlusIcon, Printer, FileText, Save, ShoppingCart } from 'lucide-react';
 import { invoke } from '../lib/invokeCompat';
 import { imprimirTicket, type ConfigNegocio, type TicketData } from '../utils/ticket';
 
@@ -33,6 +33,7 @@ export default function PuntoDeVenta() {
   const [pinError, setPinError] = useState(false);
   const [confirmCerrarTab, setConfirmCerrarTab] = useState<string | null>(null);
   const [presupGuardado, setPresupGuardado] = useState<{ folio: string } | null>(null);
+  const [mobileCartOpen, setMobileCartOpen] = useState(false);
   const [maxDescVendedor, setMaxDescVendedor] = useState(15);
   const [configNegocio, setConfigNegocio] = useState<ConfigNegocio | null>(null);
   const [ultimoTicket, setUltimoTicket] = useState<TicketData | null>(null);
@@ -145,6 +146,7 @@ export default function PuntoDeVenta() {
     try {
       const venta = await procesarVenta(usuario.id);
       setShowCobro(false);
+      setMobileCartOpen(false);
 
       const ticket: TicketData = {
         folio: venta.folio,
@@ -390,7 +392,7 @@ export default function PuntoDeVenta() {
         </div>
       </div>
 
-    <div style={{ display: 'grid', gridTemplateColumns: '1fr 360px', gridTemplateRows: 'minmax(0, 1fr)', flex: 1, minHeight: 0, gap: 0 }}>
+    <div className="pos-pdv-grid" style={{ display: 'grid', gridTemplateColumns: '1fr 360px', gridTemplateRows: 'minmax(0, 1fr)', flex: 1, minHeight: 0, gap: 0 }}>
       {/* ─── Panel Izquierdo: Productos ─── */}
       <div style={{ display: 'flex', flexDirection: 'column', borderRight: '1px solid var(--color-border)', minHeight: 0, minWidth: 0 }}>
         {/* Barra de escaneo */}
@@ -516,7 +518,22 @@ export default function PuntoDeVenta() {
       </div>
 
       {/* ─── Panel Derecho: Resumen + Cobro ─── */}
-      <div style={{ display: 'flex', flexDirection: 'column', background: 'var(--color-surface)', minHeight: 0, minWidth: 0 }}>
+      <div className={`pos-pdv-cart${mobileCartOpen ? ' open' : ''}`} style={{ display: 'flex', flexDirection: 'column', background: 'var(--color-surface)', minHeight: 0, minWidth: 0 }}>
+        {/* Header móvil con botón cerrar (sólo se ve en mobile via CSS) */}
+        <button
+          onClick={() => setMobileCartOpen(false)}
+          aria-label="Cerrar carrito"
+          className="pos-cart-close"
+          style={{
+            display: 'none', alignItems: 'center', gap: 8, padding: '10px 14px',
+            background: 'var(--color-surface-2)', border: 'none', borderBottom: '1px solid var(--color-border)',
+            cursor: 'pointer', fontSize: 14, fontWeight: 700, color: 'var(--color-text)',
+            justifyContent: 'space-between', width: '100%',
+          }}
+        >
+          <span>Resumen del carrito</span>
+          <X size={18} />
+        </button>
         {/* Cliente */}
         <div style={{
           padding: '10px 16px',
@@ -677,12 +694,12 @@ export default function PuntoDeVenta() {
 
       {/* ─── Modal de Búsqueda ─── */}
       {showBusqueda && (
-        <div style={{
+        <div className="pos-modal-overlay" style={{
           position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)',
           display: 'flex', alignItems: 'flex-start', justifyContent: 'center',
           paddingTop: 60, zIndex: 100,
         }} onClick={() => setShowBusqueda(false)}>
-          <div className="card animate-fade-in" style={{ width: 600, maxHeight: '70vh', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}
+          <div className="card pos-modal-content animate-fade-in" style={{ width: 600, maxHeight: '70vh', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}
             onClick={(e) => e.stopPropagation()}>
             <div style={{ padding: '12px 16px', borderBottom: '1px solid var(--color-border)', display: 'flex', gap: 8, alignItems: 'center' }}>
               <Search size={18} style={{ color: 'var(--color-text-dim)' }} />
@@ -914,6 +931,19 @@ export default function PuntoDeVenta() {
           </div>
         );
       })()}
+
+      {/* ─── FAB para abrir el carrito en móvil ─── */}
+      <button
+        className="pos-fab"
+        onClick={() => setMobileCartOpen(true)}
+        aria-label="Abrir carrito"
+        title="Abrir carrito"
+      >
+        <ShoppingCart size={24} />
+        {numItems() > 0 && (
+          <span className="pos-fab-badge">{numItems()}</span>
+        )}
+      </button>
     </div>
     </div>
   );
