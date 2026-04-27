@@ -173,10 +173,10 @@ export default function Pedidos() {
         </div>
 
         {/* Body 2 columnas */}
-        <div style={{ flex: 1, display: 'grid', gridTemplateColumns: '1fr 420px', minHeight: 0 }}>
+        <div className="pos-pedidos-grid" style={{ flex: 1, display: 'grid', gridTemplateColumns: '1fr 420px', minHeight: 0 }}>
           {/* Izquierda — proveedor + catálogo */}
           <div style={{ display: 'flex', flexDirection: 'column', minHeight: 0, borderRight: '1px solid var(--color-border)' }}>
-            <div style={{ padding: '12px 16px', borderBottom: '1px solid var(--color-border)', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+            <div className="pos-2col-grid" style={{ padding: '12px 16px', borderBottom: '1px solid var(--color-border)', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
               <div>
                 <label style={labelStyle}>PROVEEDOR</label>
                 <select className="input" value={proveedorId}
@@ -384,14 +384,14 @@ export default function Pedidos() {
         </div>
 
         <div style={{ flex: 1, overflow: 'auto', padding: 20 }}>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12, marginBottom: 20 }}>
+          <div className="pos-stats-4" style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12, marginBottom: 20 }}>
             <Tile label="Fecha" value={formatFecha(orden.fecha)} />
             <Tile label="Proveedor" value={orden.proveedor_nombre || '—'} />
             <Tile label="Creó" value={orden.usuario_nombre} />
             <Tile label="Costo estimado" value={fmt(totalCostoEstimado)} highlight />
           </div>
 
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 12, marginBottom: 16 }}>
+          <div className="pos-stats-3" style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 12, marginBottom: 16 }}>
             <Tile label="Productos" value={String(items.length)} />
             <Tile label="Unidades pedidas" value={String(totalPedido)} />
             <Tile label="Unidades recibidas" value={String(totalRecibido)}
@@ -399,7 +399,7 @@ export default function Pedidos() {
           </div>
 
           <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
-            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+            <table className="responsive-table" style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
               <thead>
                 <tr style={{ background: 'var(--color-surface-2)', fontSize: 11, fontWeight: 600, color: 'var(--color-text-dim)', textTransform: 'uppercase' }}>
                   <th style={{ padding: '8px 12px', textAlign: 'left' }}>Producto</th>
@@ -415,18 +415,18 @@ export default function Pedidos() {
                   const completo = i.cantidad_recibida >= i.cantidad_pedida;
                   return (
                     <tr key={i.id} style={{ borderBottom: '1px solid var(--color-border)' }}>
-                      <td style={{ padding: '8px 12px' }}>
+                      <td data-label="Producto" style={{ padding: '8px 12px' }}>
                         <div style={{ fontWeight: 600 }}>{i.producto_nombre}</div>
                         <div className="mono" style={{ fontSize: 11, color: 'var(--color-text-dim)' }}>{i.producto_codigo}</div>
                       </td>
-                      <td className="mono" style={{ padding: '8px 12px', textAlign: 'center' }}>{i.cantidad_pedida}</td>
-                      <td className="mono" style={{ padding: '8px 12px', textAlign: 'center', fontWeight: 700, color: completo ? '#22b378' : 'var(--color-warning)' }}>
+                      <td data-label="Pedido" className="mono" style={{ padding: '8px 12px', textAlign: 'center' }}>{i.cantidad_pedida}</td>
+                      <td data-label="Recibido" className="mono" style={{ padding: '8px 12px', textAlign: 'center', fontWeight: 700, color: completo ? '#22b378' : 'var(--color-warning)' }}>
                         {i.cantidad_recibida}
                       </td>
-                      <td className="mono" style={{ padding: '8px 12px', textAlign: 'center', color: pendiente > 0 ? 'var(--color-warning)' : 'var(--color-text-dim)' }}>
+                      <td data-label="Pendiente" className="mono" style={{ padding: '8px 12px', textAlign: 'center', color: pendiente > 0 ? 'var(--color-warning)' : 'var(--color-text-dim)' }}>
                         {pendiente > 0 ? pendiente : '—'}
                       </td>
-                      <td className="mono" style={{ padding: '8px 12px', textAlign: 'right' }}>{fmt(i.precio_costo)}</td>
+                      <td data-label="Costo" className="mono" style={{ padding: '8px 12px', textAlign: 'right' }}>{fmt(i.precio_costo)}</td>
                     </tr>
                   );
                 })}
@@ -497,6 +497,7 @@ export default function Pedidos() {
               const est = ESTADOS[o.estado] || ESTADOS.borrador;
               return (
                 <div key={o.id}
+                  className="pos-list-row"
                   style={{
                     display: 'flex', alignItems: 'center', gap: 14,
                     padding: '12px 20px', borderBottom: '1px solid var(--color-border)',

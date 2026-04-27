@@ -468,8 +468,75 @@
   .modal-body, .modal-content { width: 100% !important; max-width: 100% !important; }
 
   /* Grids comunes que se aplastan en mobile → 1 columna */
-  .grid-2-mobile-1, .stats-grid {
+  .grid-2-mobile-1, .stats-grid, .pos-2col-grid, .pos-split-grid {
     grid-template-columns: 1fr !important;
+  }
+
+  /* Stat tiles 4 columnas → 2 columnas en mobile */
+  .pos-stats-4 { grid-template-columns: repeat(2, 1fr) !important; }
+  .pos-stats-3 { grid-template-columns: repeat(2, 1fr) !important; }
+
+  /* Pedidos: layout 1fr 420px → vertical, derecha visible debajo */
+  .pos-pedidos-grid {
+    grid-template-columns: 1fr !important;
+    grid-template-rows: auto auto !important;
+    overflow: auto !important;
+  }
+  .pos-pedidos-grid > div:first-child {
+    border-right: none !important;
+    border-bottom: 1px solid var(--color-border);
+  }
+
+  /* Reportes: header (titulo + rango fechas) flex-wrap */
+  .pos-reportes-header {
+    flex-wrap: wrap !important;
+    gap: 8px !important;
+  }
+  .pos-reportes-rango {
+    flex-wrap: wrap !important;
+    gap: 6px !important;
+    width: 100%;
+  }
+  .pos-reportes-rango input.input {
+    flex: 1 1 calc(50% - 8px);
+    width: auto !important;
+    min-width: 0;
+  }
+
+  /* Tabs scrollables horizontal en mobile */
+  .pos-tabs-scroll {
+    overflow-x: auto;
+    flex-wrap: nowrap !important;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+  .pos-tabs-scroll::-webkit-scrollbar { display: none; }
+  .pos-tabs-scroll button { flex-shrink: 0; }
+
+  /* HistorialVentas: filtros col → wrap */
+  .pos-hist-filtros {
+    gap: 8px !important;
+  }
+  .pos-hist-filtros > div { flex: 1 1 calc(50% - 8px) !important; min-width: 0; }
+  .pos-hist-filtros > div input { width: 100% !important; }
+  .pos-hist-filtros > button { flex: 1 1 calc(50% - 8px); }
+
+  /* Pedidos lista: rows con flex-wrap */
+  .pos-list-row {
+    flex-wrap: wrap !important;
+    gap: 6px !important;
+    padding: 12px 14px !important;
+  }
+  .pos-list-row > span {
+    min-width: auto !important;
+  }
+
+  /* Modales que usan width:600 / 720 fixed → ocupar pantalla */
+  .pos-modal-fluid {
+    width: 100% !important;
+    max-width: 100% !important;
+    border-radius: 0 !important;
+    max-height: 100vh !important;
   }
 
   /* ─── INPUTS: anti-zoom iOS (font-size >= 16px) ───────── */
@@ -676,6 +743,10 @@
   .pos-pdv-grid {
     grid-template-columns: 1fr 320px !important;
   }
+  .pos-pedidos-grid {
+    grid-template-columns: 1fr 360px !important;
+  }
+  .pos-stats-4 { grid-template-columns: repeat(4, 1fr) !important; }
 }
 
 /* ============================================================

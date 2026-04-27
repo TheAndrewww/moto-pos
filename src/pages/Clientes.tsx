@@ -101,11 +101,11 @@ export default function ClientesPage() {
     };
 
     return (
-      <div style={{
+      <div className="pos-modal-overlay" style={{
         position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)',
         display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 100,
       }} onClick={() => { setShowForm(false); setEditando(null); }}>
-        <div className="card animate-fade-in" style={{ width: 480, padding: 24 }}
+        <div className="card animate-fade-in pos-modal-content" style={{ width: 480, maxWidth: 480, padding: 24 }}
           onClick={e => e.stopPropagation()}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
             <h2 style={{ fontSize: 18, fontWeight: 700 }}>

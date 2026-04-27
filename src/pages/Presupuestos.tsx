@@ -183,11 +183,11 @@ export default function Presupuestos({ onIrAVenta }: PresupuestosProps = {}) {
     const est = ESTADOS[presup.estado] || ESTADOS.pendiente;
 
     return (
-      <div style={{
+      <div className="pos-modal-overlay" style={{
         position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)',
         display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 100,
       }} onClick={() => setDetalle(null)}>
-        <div className="card animate-fade-in" style={{ width: 600, maxHeight: '85vh', overflow: 'auto', padding: 24 }}
+        <div className="card animate-fade-in pos-modal-content pos-modal-fluid" style={{ width: 600, maxWidth: 600, maxHeight: '85vh', overflow: 'auto', padding: 24 }}
           onClick={e => e.stopPropagation()}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
             <div>
@@ -232,7 +232,7 @@ export default function Presupuestos({ onIrAVenta }: PresupuestosProps = {}) {
           </div>
 
           {/* Items */}
-          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+          <table className="responsive-table" style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
             <thead>
               <tr style={{ background: 'var(--color-surface-2)', fontSize: 11, fontWeight: 600, color: 'var(--color-text-dim)', textTransform: 'uppercase' }}>
                 <th style={{ padding: '6px 10px', textAlign: 'left' }}>Producto</th>
@@ -245,11 +245,11 @@ export default function Presupuestos({ onIrAVenta }: PresupuestosProps = {}) {
             <tbody>
               {items.map(i => (
                 <tr key={i.id} style={{ borderBottom: '1px solid var(--color-border)' }}>
-                  <td style={{ padding: '6px 10px' }}>{i.descripcion}</td>
-                  <td className="mono" style={{ padding: '6px 10px', textAlign: 'center' }}>{i.cantidad}</td>
-                  <td className="mono" style={{ padding: '6px 10px', textAlign: 'center' }}>{fmt(i.precio_unitario)}</td>
-                  <td className="mono" style={{ padding: '6px 10px', textAlign: 'center' }}>{i.descuento_porcentaje > 0 ? `${i.descuento_porcentaje}%` : '—'}</td>
-                  <td className="mono" style={{ padding: '6px 10px', textAlign: 'right', fontWeight: 700 }}>{fmt(i.subtotal)}</td>
+                  <td data-label="Producto" style={{ padding: '6px 10px' }}>{i.descripcion}</td>
+                  <td data-label="Cant." className="mono" style={{ padding: '6px 10px', textAlign: 'center' }}>{i.cantidad}</td>
+                  <td data-label="Precio" className="mono" style={{ padding: '6px 10px', textAlign: 'center' }}>{fmt(i.precio_unitario)}</td>
+                  <td data-label="Desc%" className="mono" style={{ padding: '6px 10px', textAlign: 'center' }}>{i.descuento_porcentaje > 0 ? `${i.descuento_porcentaje}%` : '—'}</td>
+                  <td data-label="Subtotal" className="mono" style={{ padding: '6px 10px', textAlign: 'right', fontWeight: 700 }}>{fmt(i.subtotal)}</td>
                 </tr>
               ))}
             </tbody>
@@ -324,6 +324,7 @@ export default function Presupuestos({ onIrAVenta }: PresupuestosProps = {}) {
               return (
                 <div
                   key={p.id}
+                  className="pos-list-row"
                   style={{
                     display: 'flex', alignItems: 'center', gap: 14,
                     padding: '12px 20px', borderBottom: '1px solid var(--color-border)',

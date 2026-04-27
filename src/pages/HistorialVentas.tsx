@@ -119,7 +119,7 @@ export default function HistorialVentas() {
       {tab === 'ventas' && (
         <>
           {/* Filtros */}
-          <div style={{
+          <div className="pos-hist-filtros" style={{
             padding: '12px 20px', borderBottom: '1px solid var(--color-border)',
             background: 'var(--color-surface-2)', display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'end',
           }}>
@@ -173,7 +173,7 @@ export default function HistorialVentas() {
 
           {/* Tabla ventas */}
           <div style={{ flex: 1, overflow: 'auto' }}>
-            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+            <table className="responsive-table" style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
               <thead style={{ position: 'sticky', top: 0, background: 'var(--color-surface)', zIndex: 1 }}>
                 <tr style={{ borderBottom: '1px solid var(--color-border)' }}>
                   <th style={thStyle}>Folio</th>
@@ -205,14 +205,14 @@ export default function HistorialVentas() {
                     }}
                     onClick={() => abrirDetalle(v)}
                   >
-                    <td style={tdStyle}><code style={{ fontSize: 12 }}>{v.folio}</code></td>
-                    <td style={tdStyle}>{formatFecha(v.fecha)}</td>
-                    <td style={tdStyle}>{v.usuario_nombre}</td>
-                    <td style={tdStyle}>{v.cliente_nombre || '—'}</td>
-                    <td style={tdStyle}>{v.metodo_pago}</td>
-                    <td style={{ ...tdStyle, textAlign: 'right', fontWeight: 600 }}>{fmt(v.total)}</td>
-                    <td style={{ ...tdStyle, textAlign: 'center' }}>{v.num_productos}</td>
-                    <td style={tdStyle}>
+                    <td data-label="Folio" style={tdStyle}><code style={{ fontSize: 12 }}>{v.folio}</code></td>
+                    <td data-label="Fecha" style={tdStyle}>{formatFecha(v.fecha)}</td>
+                    <td data-label="Cajero" style={tdStyle}>{v.usuario_nombre}</td>
+                    <td data-label="Cliente" style={tdStyle}>{v.cliente_nombre || '—'}</td>
+                    <td data-label="Pago" style={tdStyle}>{v.metodo_pago}</td>
+                    <td data-label="Total" style={{ ...tdStyle, textAlign: 'right', fontWeight: 600 }}>{fmt(v.total)}</td>
+                    <td data-label="Items" style={{ ...tdStyle, textAlign: 'center' }}>{v.num_productos}</td>
+                    <td data-label="Estado" style={tdStyle}>
                       {v.anulada ? (
                         <span style={{
                           fontSize: 11, padding: '2px 8px', borderRadius: 10,
@@ -240,7 +240,7 @@ export default function HistorialVentas() {
 
       {tab === 'devoluciones' && (
         <div style={{ flex: 1, overflow: 'auto' }}>
-          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+          <table className="responsive-table" style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
             <thead style={{ position: 'sticky', top: 0, background: 'var(--color-surface)', zIndex: 1 }}>
               <tr style={{ borderBottom: '1px solid var(--color-border)' }}>
                 <th style={thStyle}>Folio</th>
@@ -263,16 +263,16 @@ export default function HistorialVentas() {
               )}
               {devoluciones.map((d: DevolucionResumen) => (
                 <tr key={d.id} style={{ borderBottom: '1px solid var(--color-border)' }}>
-                  <td style={tdStyle}><code style={{ fontSize: 12 }}>{d.folio}</code></td>
-                  <td style={tdStyle}><code style={{ fontSize: 12 }}>{d.venta_folio}</code></td>
-                  <td style={tdStyle}>{formatFecha(d.fecha)}</td>
-                  <td style={tdStyle}>{d.usuario_nombre}</td>
-                  <td style={tdStyle}>{d.autorizado_por_nombre || '—'}</td>
-                  <td style={tdStyle}>{d.motivo}</td>
-                  <td style={{ ...tdStyle, textAlign: 'right', fontWeight: 600, color: 'var(--color-primary)' }}>
+                  <td data-label="Folio" style={tdStyle}><code style={{ fontSize: 12 }}>{d.folio}</code></td>
+                  <td data-label="Venta" style={tdStyle}><code style={{ fontSize: 12 }}>{d.venta_folio}</code></td>
+                  <td data-label="Fecha" style={tdStyle}>{formatFecha(d.fecha)}</td>
+                  <td data-label="Usuario" style={tdStyle}>{d.usuario_nombre}</td>
+                  <td data-label="Autorizó" style={tdStyle}>{d.autorizado_por_nombre || '—'}</td>
+                  <td data-label="Motivo" style={tdStyle}>{d.motivo}</td>
+                  <td data-label="Monto" style={{ ...tdStyle, textAlign: 'right', fontWeight: 600, color: 'var(--color-primary)' }}>
                     -{fmt(d.total_devuelto)}
                   </td>
-                  <td style={{ ...tdStyle, textAlign: 'center' }}>{d.num_items}</td>
+                  <td data-label="Items" style={{ ...tdStyle, textAlign: 'center' }}>{d.num_items}</td>
                 </tr>
               ))}
             </tbody>
@@ -793,6 +793,7 @@ function ModalWrapper({
   return (
     <div
       onClick={onClose}
+      className="pos-modal-overlay"
       style={{
         position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)',
         display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -801,6 +802,7 @@ function ModalWrapper({
     >
       <div
         onClick={(e) => e.stopPropagation()}
+        className="pos-modal-content pos-modal-fluid"
         style={{
           background: 'var(--color-surface)', borderRadius: 10,
           boxShadow: '0 10px 40px rgba(0,0,0,0.3)',

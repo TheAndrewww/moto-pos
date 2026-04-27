@@ -221,7 +221,7 @@ export default function Reportes() {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
       {/* Header */}
-      <div style={{
+      <div className="pos-reportes-header" style={{
         padding: '12px 20px', borderBottom: '1px solid var(--color-border)',
         background: 'var(--color-surface)', display: 'flex', alignItems: 'center',
         justifyContent: 'space-between',
@@ -236,7 +236,7 @@ export default function Reportes() {
         </div>
 
         {/* Rango de fechas */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <div className="pos-reportes-rango" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           {rangos.map(r => (
             <button
               key={r.label}
@@ -267,7 +267,7 @@ export default function Reportes() {
       </div>
 
       {/* Tabs */}
-      <div style={{
+      <div className="pos-tabs-scroll" style={{
         display: 'flex', gap: 0, borderBottom: '2px solid var(--color-border)',
         background: 'var(--color-surface)', padding: '0 20px',
       }}>
@@ -298,7 +298,7 @@ export default function Reportes() {
         ) : (
           <>
             {/* Resumen rápido */}
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 14, marginBottom: 24 }}>
+            <div className="pos-stats-4" style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 14, marginBottom: 24 }}>
               <MiniCard label="Total Ventas" value={fmt(totalGeneral)} />
               <MiniCard label="Transacciones" value={String(ventas.length)} />
               <MiniCard label="Promedio / Venta" value={ventas.length > 0 ? fmt(totalGeneral / ventas.length) : '$0.00'} />
@@ -455,7 +455,7 @@ function GraficaVendedores({ data, totalGeneral }: { data: { nombre: string; tot
   const pieData = data.map(d => ({ name: d.nombre, value: d.total }));
 
   return (
-    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20 }}>
+    <div className="pos-2col-grid" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20 }}>
       <div className="card" style={{ padding: 20 }}>
         <h3 style={{ fontSize: 14, fontWeight: 700, marginBottom: 16, color: 'var(--color-text-muted)' }}>
           VENTAS POR VENDEDOR
@@ -540,7 +540,7 @@ function GraficaMetodoPago({ data, totalGeneral }: { data: { metodo: string; lab
   }));
 
   return (
-    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20 }}>
+    <div className="pos-2col-grid" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20 }}>
       <div className="card" style={{ padding: 20 }}>
         <h3 style={{ fontSize: 14, fontWeight: 700, marginBottom: 16, color: 'var(--color-text-muted)' }}>
           VENTAS POR MÉTODO DE PAGO

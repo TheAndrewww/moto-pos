@@ -299,7 +299,7 @@ export default function Catalogo() {
             </div>
 
             {/* Código + Categoría */}
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+            <div className="pos-2col-grid" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
               <div>
                 <label style={labelStyle}>CÓDIGO {editando ? '' : '(vacío = autogenerar MR-XXXXX)'}</label>
                 <input className="input" value={form.codigo}
@@ -378,7 +378,7 @@ export default function Catalogo() {
             </div>
 
             {/* Stock */}
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12 }}>
+            <div className="pos-stats-3" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12 }}>
               <div>
                 <label style={labelStyle}>{editando ? 'STOCK ACTUAL' : 'STOCK INICIAL'}</label>
                 <input className="input mono" type="number" step="1" value={form.stock_actual}
@@ -863,11 +863,11 @@ export default function Catalogo() {
 
       {/* Modal Confirmar Eliminar */}
       {confirmarEliminar && (
-        <div style={{
+        <div className="pos-modal-overlay" style={{
           position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', zIndex: 1000,
           display: 'flex', alignItems: 'center', justifyContent: 'center'
         }} onClick={() => setConfirmarEliminar(null)}>
-          <div className="card animate-fade-in" style={{ width: 400, padding: 24, textAlign: 'center' }} onClick={e => e.stopPropagation()}>
+          <div className="card animate-fade-in pos-modal-content" style={{ width: 400, maxWidth: 400, padding: 24, textAlign: 'center' }} onClick={e => e.stopPropagation()}>
             <Trash2 size={48} style={{ color: 'var(--color-danger)', margin: '0 auto 16px' }} strokeWidth={1.5} />
             <h3 style={{ fontSize: 18, fontWeight: 700, marginBottom: 12 }}>¿Estás seguro?</h3>
             <p style={{ fontSize: 14, color: 'var(--color-text-dim)', marginBottom: 24 }}>
@@ -946,6 +946,7 @@ function AjustarStockModal({
 
   return (
     <div
+      className="pos-modal-overlay"
       style={{
         position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)',
         display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 100,
@@ -953,8 +954,8 @@ function AjustarStockModal({
       onClick={onClose}
     >
       <div
-        className="card animate-fade-in"
-        style={{ width: 440, padding: 24 }}
+        className="card animate-fade-in pos-modal-content"
+        style={{ width: 440, maxWidth: 440, padding: 24 }}
         onClick={(e) => e.stopPropagation()}
       >
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
@@ -969,7 +970,7 @@ function AjustarStockModal({
         </div>
 
         <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+          <div className="pos-2col-grid" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
             <div>
               <label style={labelStyle}>STOCK ACTUAL</label>
               <input className="input mono" value={producto.stock_actual} disabled
@@ -1076,11 +1077,11 @@ function ImportarModal({ onClose, onDone }: { onClose: () => void; onDone: () =>
   };
 
   return (
-    <div style={{
+    <div className="pos-modal-overlay" style={{
       position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', zIndex: 1000,
       display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20,
     }}>
-      <div style={{ background: 'var(--color-surface)', borderRadius: 12, padding: 24, width: 560, maxHeight: '90vh', overflowY: 'auto' }}>
+      <div className="pos-modal-content pos-modal-fluid" style={{ background: 'var(--color-surface)', borderRadius: 12, padding: 24, width: 560, maxWidth: 560, maxHeight: '90vh', overflowY: 'auto' }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
           <h3 style={{ fontSize: 18, fontWeight: 800 }}>📥 Importar catálogo CSV</h3>
           <button className="btn-icon" onClick={onClose}><X size={18} /></button>

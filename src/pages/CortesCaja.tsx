@@ -256,7 +256,7 @@ function TabMovimientos({ movimientos, onNuevo }: { movimientos: MovimientoCaja[
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
       {/* Resumen rápido */}
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 8 }}>
+      <div className="pos-2col-grid" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 8 }}>
         <div className="card" style={{ padding: '12px 16px', display: 'flex', alignItems: 'center', gap: 10 }}>
           <ArrowDownLeft size={18} style={{ color: 'var(--color-success)' }} />
           <div>
@@ -424,11 +424,11 @@ function ModalMovimiento({ onClose, onSuccess }: { onClose: () => void; onSucces
   };
 
   return (
-    <div style={{
+    <div className="pos-modal-overlay" style={{
       position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.65)',
       display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 200,
     }} onClick={onClose}>
-      <div className="card animate-fade-in" style={{ width: 400, padding: 24 }}
+      <div className="card animate-fade-in pos-modal-content" style={{ width: 400, maxWidth: 400, padding: 24 }}
         onClick={e => e.stopPropagation()}>
 
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 20 }}>
@@ -630,12 +630,12 @@ function ModalCorteTurno({ onClose, onSuccess }: { onClose: () => void; onSucces
   };
 
   return (
-    <div style={{
+    <div className="pos-modal-overlay" style={{
       position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.65)',
       display: 'flex', alignItems: 'flex-start', justifyContent: 'center',
       zIndex: 200, overflowY: 'auto', padding: '20px 0',
     }} onClick={onClose}>
-      <div className="card animate-fade-in" style={{ width: 560, padding: 0, overflow: 'hidden', margin: 'auto' }}
+      <div className="card animate-fade-in pos-modal-content pos-modal-fluid" style={{ width: 560, maxWidth: 560, padding: 0, overflow: 'hidden', margin: 'auto' }}
         onClick={e => e.stopPropagation()}>
 
         {/* Header */}
@@ -691,7 +691,7 @@ function ModalCorteTurno({ onClose, onSuccess }: { onClose: () => void; onSucces
 
                 {usarDenominaciones ? (
                   <div className="card" style={{ padding: '10px 14px' }}>
-                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0 24px' }}>
+                    <div className="pos-2col-grid" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0 24px' }}>
                       {['BILLETE', 'MONEDA'].map(tipoD => (
                         <div key={tipoD}>
                           <p style={{ fontSize: 11, fontWeight: 700, color: 'var(--color-text-dim)', marginBottom: 8 }}>
@@ -947,12 +947,12 @@ function ModalCorteDelDia({ onClose, onSuccess, fechaObjetivo }: {
   };
 
   return (
-    <div style={{
+    <div className="pos-modal-overlay" style={{
       position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.75)',
       display: 'flex', alignItems: 'flex-start', justifyContent: 'center',
       zIndex: 200, overflowY: 'auto', padding: '20px 0',
     }} onClick={onClose}>
-      <div className="card animate-fade-in" style={{ width: 600, padding: 0, overflow: 'hidden', margin: 'auto' }}
+      <div className="card animate-fade-in pos-modal-content pos-modal-fluid" style={{ width: 600, maxWidth: 600, padding: 0, overflow: 'hidden', margin: 'auto' }}
         onClick={e => e.stopPropagation()}>
 
         {/* Header */}
@@ -1295,12 +1295,12 @@ export function ModalAperturaCaja({ onSuccess, onClose, bloqueante = true }: Mod
   };
 
   return (
-    <div style={{
+    <div className="pos-modal-overlay" style={{
       position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.85)',
       display: 'flex', alignItems: 'center', justifyContent: 'center',
       zIndex: 9999,
     }} onClick={handleBackdrop}>
-      <div className="card animate-fade-in" style={{ width: 440, padding: 0, overflow: 'hidden' }}
+      <div className="card animate-fade-in pos-modal-content" style={{ width: 440, maxWidth: 440, padding: 0, overflow: 'hidden' }}
         onClick={e => e.stopPropagation()}>
 
         <div style={{
