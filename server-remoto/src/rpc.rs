@@ -27,6 +27,10 @@ use crate::AppState;
 
 const WEB_ORIGIN: &str = "web-pos";
 
+/// Etiqueta de `origen` para registros creados desde el POS web.
+/// Las filas con `origen='desktop'` provienen del cliente Tauri (vía sync).
+const ORIGEN_WEB: &str = "web";
+
 /// Expresión SQL para timestamp TEXT igual al POS.
 const NOW_TEXT: &str = "to_char(now() AT TIME ZONE 'America/Mexico_City', 'YYYY-MM-DD HH24:MI:SS')";
 
@@ -111,10 +115,14 @@ pub async fn dispatch(
         // ─── Cortes / caja ───────────────────────────────────
         "obtener_apertura_hoy"          => obtener_apertura_hoy(&state).await?,
         "crear_apertura_caja"           => crear_apertura_caja(&state, &args).await?,
-        "verificar_corte_dia_pendiente" => Value::Null,
-        "listar_movimientos_sin_corte"  => json!([]),
-        "listar_cortes"                 => json!([]),
-        "obtener_fondo_sugerido"        => json!(2000.0),
+        "verificar_corte_dia_pendiente" => verificar_corte_dia_pendiente(&state).await?,
+        "listar_movimientos_sin_corte"  => listar_movimientos_sin_corte(&state).await?,
+        "listar_cortes"                 => listar_cortes(&state, &args).await?,
+        "obtener_detalle_corte"         => obtener_detalle_corte(&state, &args).await?,
+        "obtener_fondo_sugerido"        => obtener_fondo_sugerido(&state).await?,
+        "crear_movimiento_caja"         => crear_movimiento_caja(&state, args).await?,
+        "calcular_datos_corte"          => calcular_datos_corte(&state, &args).await?,
+        "crear_corte"                   => crear_corte(&state, args).await?,
 
         // ─── Ventas ──────────────────────────────────────────
         "buscar_ventas"                 => buscar_ventas(&state, &args).await?,
@@ -2338,6 +2346,9 @@ async fn cambiar_estado_orden(state: &AppState, args: &Value) -> Result<Value, A
 
 async fn obtener_apertura_hoy(state: &AppState) -> Result<Value, ApiError> {
     use rust_decimal::prelude::ToPrimitive;
+    // Filtramos por origen='web' para que la "caja web" tenga su propio ciclo
+    // independiente del desktop. Si el desktop ya hizo su apertura del día
+    // (origen='desktop'), eso no impide que el web abra su propia caja.
     let row = sqlx::query(
         r#"
         SELECT a.id, a.usuario_id, u.nombre_completo AS usuario_nombre,
@@ -2345,6 +2356,7 @@ async fn obtener_apertura_hoy(state: &AppState) -> Result<Value, ApiError> {
         FROM aperturas_caja a
         JOIN usuarios u ON u.id = a.usuario_id
         WHERE a.deleted_at IS NULL
+          AND a.origen = 'web'
           AND substr(a.fecha, 1, 10)
               = to_char(now() AT TIME ZONE 'America/Mexico_City', 'YYYY-MM-DD')
         ORDER BY a.id DESC LIMIT 1
@@ -2386,17 +2398,18 @@ async fn crear_apertura_caja(state: &AppState, args: &Value) -> Result<Value, Ap
         return Err(ApiError::BadRequest("El fondo no puede ser negativo".into()));
     }
 
-    // Validar que no exista ya una apertura para hoy.
+    // Solo bloqueamos si YA hay una apertura de la caja web hoy. La apertura
+    // del desktop (origen='desktop') es de otra caja y no debe bloquear ésta.
     let existe: i64 = sqlx::query_scalar(
         "SELECT COUNT(*)::bigint FROM aperturas_caja \
-         WHERE deleted_at IS NULL \
+         WHERE deleted_at IS NULL AND origen = 'web' \
            AND substr(fecha, 1, 10) \
                = to_char(now() AT TIME ZONE 'America/Mexico_City', 'YYYY-MM-DD')",
     )
     .fetch_one(&state.pool)
     .await?;
     if existe > 0 {
-        return Err(ApiError::BadRequest("Ya existe una apertura de caja para hoy".into()));
+        return Err(ApiError::BadRequest("Ya existe una apertura de caja web para hoy".into()));
     }
 
     let sucursal_id: i64 = 1;
@@ -2404,8 +2417,8 @@ async fn crear_apertura_caja(state: &AppState, args: &Value) -> Result<Value, Ap
     let sql = format!(
         r#"
         INSERT INTO aperturas_caja
-          (uuid, sucursal_id, usuario_id, fondo_declarado, nota, fecha, updated_at)
-        VALUES ($1, $2, $3, $4, $5, {NOW_TEXT}, {NOW_TEXT})
+          (uuid, sucursal_id, usuario_id, fondo_declarado, nota, origen, fecha, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, {NOW_TEXT}, {NOW_TEXT})
         RETURNING id, fecha
         "#
     );
@@ -2415,6 +2428,7 @@ async fn crear_apertura_caja(state: &AppState, args: &Value) -> Result<Value, Ap
         .bind(d.usuario_id)
         .bind(d.fondo_declarado)
         .bind(d.nota.as_deref())
+        .bind(ORIGEN_WEB)
         .fetch_one(&state.pool)
         .await?;
 
@@ -2449,6 +2463,727 @@ async fn crear_apertura_caja(state: &AppState, args: &Value) -> Result<Value, Ap
         "nota":            d.nota,
         "fecha":           fecha,
     }))
+}
+
+// =============================================================================
+// CORTES DE CAJA — módulo completo (web only, origen='web')
+// =============================================================================
+//
+// Filtros: TODOS los queries de cortes/movimientos en este módulo agregan
+//   `WHERE origen = 'web'`
+// para mantener la caja web independiente del flujo desktop. El desktop ya
+// hizo sus cortes en SQLite y los pushea a postgres con origen='desktop' —
+// no los queremos contar ni mezclar aquí.
+
+/// Helper local: f64 desde columna NUMERIC.
+fn pg_dec(row: &sqlx::postgres::PgRow, name: &str) -> f64 {
+    use rust_decimal::prelude::ToPrimitive;
+    row.try_get::<rust_decimal::Decimal, _>(name).ok()
+        .and_then(|d| d.to_f64()).unwrap_or(0.0)
+}
+
+const RETIRO_LIMITE_SIN_PIN: f64 = 500.0;
+
+async fn crear_movimiento_caja(state: &AppState, args: Value) -> Result<Value, ApiError> {
+    #[derive(Deserialize)]
+    struct A { datos: NuevoMov }
+    #[derive(Deserialize)]
+    struct NuevoMov {
+        tipo: String,
+        usuario_id: i64,
+        monto: f64,
+        concepto: String,
+        #[serde(default)] autorizado_por: Option<i64>,
+        #[serde(default)] pin_autorizacion: Option<String>,
+    }
+
+    let a: A = serde_json::from_value(args)
+        .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
+    let d = a.datos;
+
+    if d.monto <= 0.0 {
+        return Err(ApiError::BadRequest("El monto debe ser mayor a cero".into()));
+    }
+    if d.concepto.trim().is_empty() {
+        return Err(ApiError::BadRequest("El concepto es obligatorio".into()));
+    }
+    if d.tipo != "ENTRADA" && d.tipo != "RETIRO" {
+        return Err(ApiError::BadRequest("Tipo inválido (debe ser ENTRADA o RETIRO)".into()));
+    }
+
+    let sucursal_id: i64 = 1;
+
+    // Si es RETIRO grande y el solicitante NO es admin, exigir PIN del dueño
+    let rol_id: i64 = sqlx::query_scalar(
+        "SELECT rol_id FROM usuarios WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(d.usuario_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .unwrap_or(3);
+    let solicitante_es_admin = rol_es_admin(rol_id);
+
+    let autorizado_por_validado: Option<i64> =
+        if d.tipo == "RETIRO" && d.monto > RETIRO_LIMITE_SIN_PIN && !solicitante_es_admin {
+            let pin = d.pin_autorizacion.as_deref().unwrap_or("").trim();
+            if pin.is_empty() {
+                return Err(ApiError::BadRequest(format!(
+                    "Retiros mayores a ${:.0} requieren PIN del dueño",
+                    RETIRO_LIMITE_SIN_PIN
+                )));
+            }
+            match buscar_dueno_por_pin(state, pin).await? {
+                Some(id) => Some(id),
+                None => return Err(ApiError::BadRequest("PIN del dueño incorrecto".into())),
+            }
+        } else if d.tipo == "RETIRO" && d.monto > RETIRO_LIMITE_SIN_PIN && solicitante_es_admin {
+            Some(d.usuario_id)
+        } else {
+            d.autorizado_por
+        };
+
+    let new_uuid = uuid::Uuid::now_v7().to_string();
+    let sql = format!(
+        r#"
+        INSERT INTO movimientos_caja
+          (uuid, sucursal_id, tipo, usuario_id, monto, concepto,
+           autorizado_por, origen, fecha, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, 'web', {NOW_TEXT}, {NOW_TEXT})
+        RETURNING id, fecha
+        "#
+    );
+    let row = sqlx::query(&sql)
+        .bind(&new_uuid)
+        .bind(sucursal_id)
+        .bind(&d.tipo)
+        .bind(d.usuario_id)
+        .bind(d.monto)
+        .bind(&d.concepto)
+        .bind(autorizado_por_validado)
+        .fetch_one(&state.pool)
+        .await?;
+
+    let id: i64 = row.get("id");
+    let fecha: String = row.get("fecha");
+
+    let usuario_nombre: String = sqlx::query_scalar(
+        "SELECT nombre_completo FROM usuarios WHERE id = $1",
+    )
+    .bind(d.usuario_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .unwrap_or_else(|| "Desconocido".into());
+
+    // sync_cursor para que el desktop lo jale
+    sqlx::query(
+        "INSERT INTO sync_cursor (tabla, uuid, sucursal_id, origen_device) \
+         VALUES ('movimientos_caja', $1, $2, $3)",
+    )
+    .bind(&new_uuid)
+    .bind(sucursal_id)
+    .bind(WEB_ORIGIN)
+    .execute(&state.pool)
+    .await?;
+
+    Ok(json!({
+        "id":              id,
+        "tipo":            d.tipo,
+        "usuario_id":      d.usuario_id,
+        "usuario_nombre":  usuario_nombre,
+        "monto":           d.monto,
+        "concepto":        d.concepto,
+        "autorizado_por":  autorizado_por_validado,
+        "corte_id":        Value::Null,
+        "fecha":           fecha,
+    }))
+}
+
+async fn listar_movimientos_sin_corte(state: &AppState) -> Result<Value, ApiError> {
+    let rows = sqlx::query(
+        r#"
+        SELECT m.id, m.tipo, m.usuario_id, u.nombre_completo AS usuario_nombre,
+               m.monto, m.concepto, m.autorizado_por, m.corte_id, m.fecha
+        FROM movimientos_caja m
+        JOIN usuarios u ON u.id = m.usuario_id
+        WHERE m.corte_id IS NULL
+          AND m.deleted_at IS NULL
+          AND m.origen = 'web'
+        ORDER BY m.fecha DESC
+        "#,
+    )
+    .fetch_all(&state.pool)
+    .await?;
+
+    Ok(json!(rows.iter().map(|r| json!({
+        "id":             r.get::<i64, _>("id"),
+        "tipo":           r.get::<String, _>("tipo"),
+        "usuario_id":     r.get::<i64, _>("usuario_id"),
+        "usuario_nombre": r.try_get::<Option<String>, _>("usuario_nombre").ok().flatten().unwrap_or_default(),
+        "monto":          pg_dec(r, "monto"),
+        "concepto":       r.get::<String, _>("concepto"),
+        "autorizado_por": r.try_get::<Option<i64>, _>("autorizado_por").ok().flatten(),
+        "corte_id":       r.try_get::<Option<i64>, _>("corte_id").ok().flatten(),
+        "fecha":          r.get::<String, _>("fecha"),
+    })).collect::<Vec<_>>()))
+}
+
+async fn calcular_datos_corte(state: &AppState, args: &Value) -> Result<Value, ApiError> {
+    #[derive(Deserialize)]
+    struct A {
+        // Frontend manda camelCase via invokeCompat (sin conversion en web).
+        #[serde(rename = "fechaInicio")] fecha_inicio: String,
+        #[serde(rename = "fechaFin")] fecha_fin: String,
+    }
+    let a: A = serde_json::from_value(args.clone())
+        .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
+
+    // Importante: las VENTAS no tienen columna `origen` (no quisimos migrar la
+    // tabla más grande). Las ventas hechas desde web se insertan en la misma
+    // tabla que las del desktop. Para el corte web, sumamos TODAS las ventas
+    // del rango, asumiendo que el web lleva su propio rango de fechas que no
+    // se traslapa con el corte parcial del desktop.
+    //
+    // En la práctica: el primer corte del día web considera ventas desde la
+    // apertura de la caja web (o, si no hay apertura web, desde el último
+    // corte web). El frontend ya pasa fecha_inicio = última apertura/corte.
+
+    let efectivo: f64 = sqlx::query_scalar::<_, rust_decimal::Decimal>(
+        "SELECT COALESCE(SUM(total), 0)::numeric FROM ventas \
+         WHERE fecha BETWEEN $1 AND $2 AND anulada = 0 \
+           AND metodo_pago = 'efectivo' AND deleted_at IS NULL",
+    )
+    .bind(&a.fecha_inicio).bind(&a.fecha_fin)
+    .fetch_one(&state.pool).await
+    .ok().and_then(|d| { use rust_decimal::prelude::ToPrimitive; d.to_f64() })
+    .unwrap_or(0.0);
+
+    let tarjeta: f64 = sqlx::query_scalar::<_, rust_decimal::Decimal>(
+        "SELECT COALESCE(SUM(total), 0)::numeric FROM ventas \
+         WHERE fecha BETWEEN $1 AND $2 AND anulada = 0 \
+           AND metodo_pago = 'tarjeta' AND deleted_at IS NULL",
+    )
+    .bind(&a.fecha_inicio).bind(&a.fecha_fin)
+    .fetch_one(&state.pool).await
+    .ok().and_then(|d| { use rust_decimal::prelude::ToPrimitive; d.to_f64() })
+    .unwrap_or(0.0);
+
+    let transferencia: f64 = sqlx::query_scalar::<_, rust_decimal::Decimal>(
+        "SELECT COALESCE(SUM(total), 0)::numeric FROM ventas \
+         WHERE fecha BETWEEN $1 AND $2 AND anulada = 0 \
+           AND metodo_pago = 'transferencia' AND deleted_at IS NULL",
+    )
+    .bind(&a.fecha_inicio).bind(&a.fecha_fin)
+    .fetch_one(&state.pool).await
+    .ok().and_then(|d| { use rust_decimal::prelude::ToPrimitive; d.to_f64() })
+    .unwrap_or(0.0);
+
+    let agg = sqlx::query(
+        "SELECT COUNT(*)::bigint AS n, \
+                COALESCE(SUM(total), 0)::numeric AS total, \
+                COALESCE(SUM(descuento), 0)::numeric AS desc \
+         FROM ventas \
+         WHERE fecha BETWEEN $1 AND $2 AND anulada = 0 AND deleted_at IS NULL",
+    )
+    .bind(&a.fecha_inicio).bind(&a.fecha_fin)
+    .fetch_one(&state.pool).await?;
+    let num_transacciones: i64 = agg.try_get("n").unwrap_or(0);
+    let total_ventas: f64 = pg_dec(&agg, "total");
+    let total_descuentos: f64 = pg_dec(&agg, "desc");
+
+    let total_anulaciones: f64 = sqlx::query_scalar::<_, rust_decimal::Decimal>(
+        "SELECT COALESCE(SUM(total), 0)::numeric FROM ventas \
+         WHERE fecha BETWEEN $1 AND $2 AND anulada = 1 AND deleted_at IS NULL",
+    )
+    .bind(&a.fecha_inicio).bind(&a.fecha_fin)
+    .fetch_one(&state.pool).await
+    .ok().and_then(|d| { use rust_decimal::prelude::ToPrimitive; d.to_f64() })
+    .unwrap_or(0.0);
+
+    // Movimientos sin corte (origen=web)
+    let mov_rows = sqlx::query(
+        r#"
+        SELECT m.id, m.tipo, m.usuario_id, u.nombre_completo AS usuario_nombre,
+               m.monto, m.concepto, m.autorizado_por, m.corte_id, m.fecha
+        FROM movimientos_caja m
+        JOIN usuarios u ON u.id = m.usuario_id
+        WHERE m.corte_id IS NULL
+          AND m.deleted_at IS NULL
+          AND m.origen = 'web'
+        ORDER BY m.fecha ASC
+        "#,
+    )
+    .fetch_all(&state.pool)
+    .await?;
+
+    let movimientos: Vec<Value> = mov_rows.iter().map(|r| json!({
+        "id":             r.get::<i64, _>("id"),
+        "tipo":           r.get::<String, _>("tipo"),
+        "usuario_id":     r.get::<i64, _>("usuario_id"),
+        "usuario_nombre": r.try_get::<Option<String>, _>("usuario_nombre").ok().flatten().unwrap_or_default(),
+        "monto":          pg_dec(r, "monto"),
+        "concepto":       r.get::<String, _>("concepto"),
+        "autorizado_por": r.try_get::<Option<i64>, _>("autorizado_por").ok().flatten(),
+        "corte_id":       r.try_get::<Option<i64>, _>("corte_id").ok().flatten(),
+        "fecha":          r.get::<String, _>("fecha"),
+    })).collect();
+
+    let total_entradas: f64 = mov_rows.iter()
+        .filter(|r| r.get::<String, _>("tipo") == "ENTRADA")
+        .map(|r| pg_dec(r, "monto")).sum();
+    let total_retiros: f64 = mov_rows.iter()
+        .filter(|r| r.get::<String, _>("tipo") == "RETIRO")
+        .map(|r| pg_dec(r, "monto")).sum();
+
+    // Fondo inicial: apertura web del día > último fondo_siguiente del último
+    // corte web > 0.
+    let dia: &str = if a.fecha_inicio.len() >= 10 { &a.fecha_inicio[..10] } else { "" };
+    let fondo_apertura: Option<f64> = sqlx::query_scalar::<_, rust_decimal::Decimal>(
+        "SELECT fondo_declarado::numeric FROM aperturas_caja \
+         WHERE substr(fecha, 1, 10) = $1 \
+           AND origen = 'web' AND deleted_at IS NULL \
+         LIMIT 1",
+    )
+    .bind(dia)
+    .fetch_optional(&state.pool).await?
+    .and_then(|d| { use rust_decimal::prelude::ToPrimitive; d.to_f64() });
+
+    let fondo_inicial: f64 = match fondo_apertura {
+        Some(f) => f,
+        None => sqlx::query_scalar::<_, rust_decimal::Decimal>(
+            "SELECT fondo_siguiente::numeric FROM cortes \
+             WHERE origen = 'web' AND deleted_at IS NULL \
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .fetch_optional(&state.pool).await?
+        .and_then(|d| { use rust_decimal::prelude::ToPrimitive; d.to_f64() })
+        .unwrap_or(0.0),
+    };
+
+    let efectivo_esperado = fondo_inicial + efectivo + total_entradas - total_retiros;
+
+    // Vendedores
+    let vrows = sqlx::query(
+        r#"
+        SELECT v.usuario_id, u.nombre_completo AS usuario_nombre,
+               COUNT(*)::bigint AS num_ventas,
+               COALESCE(SUM(v.total), 0)::numeric AS total,
+               MIN(v.fecha) AS hora_inicio,
+               MAX(v.fecha) AS hora_fin
+        FROM ventas v
+        JOIN usuarios u ON u.id = v.usuario_id
+        WHERE v.fecha BETWEEN $1 AND $2 AND v.anulada = 0 AND v.deleted_at IS NULL
+        GROUP BY v.usuario_id, u.nombre_completo
+        ORDER BY total DESC
+        "#,
+    )
+    .bind(&a.fecha_inicio).bind(&a.fecha_fin)
+    .fetch_all(&state.pool)
+    .await?;
+
+    let vendedores: Vec<Value> = vrows.iter().map(|r| json!({
+        "usuario_id":     r.get::<i64, _>("usuario_id"),
+        "usuario_nombre": r.try_get::<Option<String>, _>("usuario_nombre").ok().flatten().unwrap_or_default(),
+        "num_ventas":     r.try_get::<i64, _>("num_ventas").unwrap_or(0),
+        "total_vendido":  pg_dec(r, "total"),
+        "hora_inicio":    r.try_get::<Option<String>, _>("hora_inicio").ok().flatten().unwrap_or_default(),
+        "hora_fin":       r.try_get::<Option<String>, _>("hora_fin").ok().flatten().unwrap_or_default(),
+    })).collect();
+
+    Ok(json!({
+        "fecha_inicio":               a.fecha_inicio,
+        "fecha_fin":                  a.fecha_fin,
+        "fondo_inicial":              fondo_inicial,
+        "total_ventas_efectivo":      efectivo,
+        "total_ventas_tarjeta":       tarjeta,
+        "total_ventas_transferencia": transferencia,
+        "total_ventas":               total_ventas,
+        "num_transacciones":          num_transacciones,
+        "total_descuentos":           total_descuentos,
+        "total_anulaciones":          total_anulaciones,
+        "total_entradas_efectivo":    total_entradas,
+        "total_retiros_efectivo":     total_retiros,
+        "efectivo_esperado":          efectivo_esperado,
+        "movimientos":                movimientos,
+        "vendedores":                 vendedores,
+    }))
+}
+
+async fn crear_corte(state: &AppState, args: Value) -> Result<Value, ApiError> {
+    #[derive(Deserialize)]
+    struct A { datos: NuevoCorteWeb }
+    #[derive(Deserialize)]
+    struct NuevoCorteWeb {
+        tipo: String,
+        usuario_id: i64,
+        fecha_inicio: String,
+        fecha_fin: String,
+        datos: DatosCorteWeb,
+        efectivo_contado: f64,
+        #[serde(default)] nota_diferencia: Option<String>,
+        fondo_siguiente: f64,
+        #[serde(default)] denominaciones: Option<Vec<DenomInput>>,
+    }
+    #[derive(Deserialize)]
+    struct DatosCorteWeb {
+        fondo_inicial: f64,
+        total_ventas_efectivo: f64,
+        total_ventas_tarjeta: f64,
+        total_ventas_transferencia: f64,
+        total_ventas: f64,
+        num_transacciones: i64,
+        total_descuentos: f64,
+        total_anulaciones: f64,
+        total_entradas_efectivo: f64,
+        total_retiros_efectivo: f64,
+        efectivo_esperado: f64,
+        #[serde(default)] vendedores: Vec<VendedorInput>,
+    }
+    #[derive(Deserialize)]
+    struct VendedorInput {
+        usuario_id: i64,
+        num_ventas: i64,
+        total_vendido: f64,
+        hora_inicio: String,
+        hora_fin: String,
+    }
+    #[derive(Deserialize)]
+    struct DenomInput {
+        denominacion: f64,
+        tipo: String,
+        cantidad: i64,
+    }
+
+    let a: A = serde_json::from_value(args)
+        .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
+    let c = a.datos;
+
+    if c.tipo != "PARCIAL" && c.tipo != "DIA" {
+        return Err(ApiError::BadRequest("Tipo inválido (PARCIAL o DIA)".into()));
+    }
+
+    let sucursal_id: i64 = 1;
+    let mut tx = state.pool.begin().await?;
+
+    // Solo un corte DIA web por día
+    if c.tipo == "DIA" {
+        let dia = if c.fecha_inicio.len() >= 10 { &c.fecha_inicio[..10] } else { "" };
+        let existe: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM cortes \
+             WHERE tipo = 'DIA' AND origen = 'web' AND deleted_at IS NULL \
+               AND substr(created_at, 1, 10) = $1",
+        )
+        .bind(dia)
+        .fetch_one(&mut *tx).await?;
+        if existe > 0 {
+            return Err(ApiError::BadRequest(
+                "Ya existe un corte del día (web) para esta fecha".into(),
+            ));
+        }
+    }
+
+    let diferencia = c.efectivo_contado - c.datos.efectivo_esperado;
+    let new_uuid = uuid::Uuid::now_v7().to_string();
+
+    let ins_sql = format!(
+        r#"
+        INSERT INTO cortes
+          (uuid, sucursal_id, tipo, usuario_id, fecha_inicio, fecha_fin,
+           fondo_inicial, total_ventas_efectivo, total_ventas_tarjeta,
+           total_ventas_transferencia, total_ventas, num_transacciones,
+           total_descuentos, total_anulaciones, total_entradas_efectivo,
+           total_retiros_efectivo, efectivo_esperado, efectivo_contado,
+           diferencia, nota_diferencia, fondo_siguiente, origen,
+           created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6,
+                $7, $8, $9, $10, $11, $12,
+                $13, $14, $15, $16, $17, $18,
+                $19, $20, $21, 'web',
+                {NOW_TEXT}, {NOW_TEXT})
+        RETURNING id, created_at
+        "#
+    );
+    let row = sqlx::query(&ins_sql)
+        .bind(&new_uuid)
+        .bind(sucursal_id)
+        .bind(&c.tipo)
+        .bind(c.usuario_id)
+        .bind(&c.fecha_inicio)
+        .bind(&c.fecha_fin)
+        .bind(c.datos.fondo_inicial)
+        .bind(c.datos.total_ventas_efectivo)
+        .bind(c.datos.total_ventas_tarjeta)
+        .bind(c.datos.total_ventas_transferencia)
+        .bind(c.datos.total_ventas)
+        .bind(c.datos.num_transacciones)
+        .bind(c.datos.total_descuentos)
+        .bind(c.datos.total_anulaciones)
+        .bind(c.datos.total_entradas_efectivo)
+        .bind(c.datos.total_retiros_efectivo)
+        .bind(c.datos.efectivo_esperado)
+        .bind(c.efectivo_contado)
+        .bind(diferencia)
+        .bind(c.nota_diferencia.as_deref())
+        .bind(c.fondo_siguiente)
+        .fetch_one(&mut *tx)
+        .await?;
+    let corte_id: i64 = row.get("id");
+    let created_at: String = row.get("created_at");
+
+    // Asociar movimientos pendientes web a este corte
+    sqlx::query(
+        "UPDATE movimientos_caja \
+         SET corte_id = $1, updated_at = $2 \
+         WHERE corte_id IS NULL AND origen = 'web' AND deleted_at IS NULL",
+    )
+    .bind(corte_id)
+    .bind(&created_at)
+    .execute(&mut *tx)
+    .await?;
+
+    // Denominaciones
+    if let Some(denoms) = &c.denominaciones {
+        for d in denoms {
+            if d.cantidad > 0 {
+                let subtotal = d.denominacion * d.cantidad as f64;
+                let den_uuid = uuid::Uuid::now_v7().to_string();
+                let dsql = format!(
+                    r#"
+                    INSERT INTO corte_denominaciones
+                      (uuid, corte_id, denominacion, tipo, cantidad, subtotal, updated_at)
+                    VALUES ($1, $2, $3, $4, $5, $6, {NOW_TEXT})
+                    "#
+                );
+                sqlx::query(&dsql)
+                    .bind(&den_uuid)
+                    .bind(corte_id)
+                    .bind(d.denominacion)
+                    .bind(&d.tipo)
+                    .bind(d.cantidad)
+                    .bind(subtotal)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+    }
+
+    // Vendedores (solo en corte DIA)
+    if c.tipo == "DIA" {
+        for v in &c.datos.vendedores {
+            let vu_uuid = uuid::Uuid::now_v7().to_string();
+            let vsql = format!(
+                r#"
+                INSERT INTO corte_vendedores
+                  (uuid, corte_id, usuario_id, num_ventas, total_vendido,
+                   hora_inicio, hora_fin, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, {NOW_TEXT})
+                "#
+            );
+            sqlx::query(&vsql)
+                .bind(&vu_uuid)
+                .bind(corte_id)
+                .bind(v.usuario_id)
+                .bind(v.num_ventas)
+                .bind(v.total_vendido)
+                .bind(&v.hora_inicio)
+                .bind(&v.hora_fin)
+                .execute(&mut *tx)
+                .await?;
+        }
+    }
+
+    // sync_cursor para que el desktop jale el corte
+    sqlx::query(
+        "INSERT INTO sync_cursor (tabla, uuid, sucursal_id, origen_device) \
+         VALUES ('cortes', $1, $2, $3)",
+    )
+    .bind(&new_uuid)
+    .bind(sucursal_id)
+    .bind(WEB_ORIGIN)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    Ok(json!({
+        "id":                corte_id,
+        "tipo":              c.tipo,
+        "diferencia":        diferencia,
+        "efectivo_esperado": c.datos.efectivo_esperado,
+        "efectivo_contado":  c.efectivo_contado,
+        "fondo_siguiente":   c.fondo_siguiente,
+        "created_at":        created_at,
+    }))
+}
+
+async fn listar_cortes(state: &AppState, args: &Value) -> Result<Value, ApiError> {
+    #[derive(Deserialize, Default)]
+    struct A { #[serde(default)] limite: Option<i64> }
+    let a: A = serde_json::from_value(args.clone()).unwrap_or_default();
+    let limite = a.limite.unwrap_or(50);
+
+    let rows = sqlx::query(
+        r#"
+        SELECT c.id, c.tipo, u.nombre_completo AS usuario_nombre, c.created_at,
+               c.efectivo_esperado, c.efectivo_contado, c.diferencia, c.fondo_siguiente
+        FROM cortes c
+        JOIN usuarios u ON u.id = c.usuario_id
+        WHERE c.origen = 'web' AND c.deleted_at IS NULL
+        ORDER BY c.created_at DESC
+        LIMIT $1
+        "#,
+    )
+    .bind(limite)
+    .fetch_all(&state.pool)
+    .await?;
+
+    Ok(json!(rows.iter().map(|r| json!({
+        "id":                r.get::<i64, _>("id"),
+        "tipo":              r.get::<String, _>("tipo"),
+        "usuario_nombre":    r.try_get::<Option<String>, _>("usuario_nombre").ok().flatten().unwrap_or_default(),
+        "created_at":        r.get::<String, _>("created_at"),
+        "efectivo_esperado": pg_dec(r, "efectivo_esperado"),
+        "efectivo_contado":  pg_dec(r, "efectivo_contado"),
+        "diferencia":        pg_dec(r, "diferencia"),
+        "fondo_siguiente":   pg_dec(r, "fondo_siguiente"),
+    })).collect::<Vec<_>>()))
+}
+
+async fn obtener_detalle_corte(state: &AppState, args: &Value) -> Result<Value, ApiError> {
+    #[derive(Deserialize)]
+    struct A { id: i64 }
+    let a: A = serde_json::from_value(args.clone())
+        .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
+
+    let cab = sqlx::query(
+        r#"
+        SELECT c.id, c.tipo, u.nombre_completo AS usuario_nombre, c.created_at,
+               c.efectivo_esperado, c.efectivo_contado, c.diferencia, c.fondo_siguiente
+        FROM cortes c
+        JOIN usuarios u ON u.id = c.usuario_id
+        WHERE c.id = $1 AND c.deleted_at IS NULL
+        "#,
+    )
+    .bind(a.id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or(ApiError::NotFound)?;
+
+    let denoms = sqlx::query(
+        "SELECT denominacion, tipo, cantidad, subtotal \
+         FROM corte_denominaciones \
+         WHERE corte_id = $1 AND deleted_at IS NULL \
+         ORDER BY denominacion DESC",
+    )
+    .bind(a.id)
+    .fetch_all(&state.pool).await.unwrap_or_default();
+
+    let movs = sqlx::query(
+        r#"
+        SELECT m.id, m.tipo, m.usuario_id, u.nombre_completo AS usuario_nombre,
+               m.monto, m.concepto, m.autorizado_por, m.corte_id, m.fecha
+        FROM movimientos_caja m
+        JOIN usuarios u ON u.id = m.usuario_id
+        WHERE m.corte_id = $1 AND m.deleted_at IS NULL
+        ORDER BY m.fecha ASC
+        "#,
+    )
+    .bind(a.id)
+    .fetch_all(&state.pool).await.unwrap_or_default();
+
+    let vends = sqlx::query(
+        r#"
+        SELECT cv.usuario_id, u.nombre_completo AS usuario_nombre,
+               cv.num_ventas, cv.total_vendido, cv.hora_inicio, cv.hora_fin
+        FROM corte_vendedores cv
+        JOIN usuarios u ON u.id = cv.usuario_id
+        WHERE cv.corte_id = $1 AND cv.deleted_at IS NULL
+        ORDER BY cv.total_vendido DESC
+        "#,
+    )
+    .bind(a.id)
+    .fetch_all(&state.pool).await.unwrap_or_default();
+
+    Ok(json!({
+        "corte": {
+            "id":                cab.get::<i64, _>("id"),
+            "tipo":              cab.get::<String, _>("tipo"),
+            "usuario_nombre":    cab.try_get::<Option<String>, _>("usuario_nombre").ok().flatten().unwrap_or_default(),
+            "created_at":        cab.get::<String, _>("created_at"),
+            "efectivo_esperado": pg_dec(&cab, "efectivo_esperado"),
+            "efectivo_contado":  pg_dec(&cab, "efectivo_contado"),
+            "diferencia":        pg_dec(&cab, "diferencia"),
+            "fondo_siguiente":   pg_dec(&cab, "fondo_siguiente"),
+        },
+        "denominaciones": denoms.iter().map(|r| json!({
+            "denominacion": pg_dec(r, "denominacion"),
+            "tipo":         r.get::<String, _>("tipo"),
+            "cantidad":     r.try_get::<i64, _>("cantidad").unwrap_or(0),
+            "subtotal":     pg_dec(r, "subtotal"),
+        })).collect::<Vec<_>>(),
+        "movimientos": movs.iter().map(|r| json!({
+            "id":             r.get::<i64, _>("id"),
+            "tipo":           r.get::<String, _>("tipo"),
+            "usuario_id":     r.get::<i64, _>("usuario_id"),
+            "usuario_nombre": r.try_get::<Option<String>, _>("usuario_nombre").ok().flatten().unwrap_or_default(),
+            "monto":          pg_dec(r, "monto"),
+            "concepto":       r.get::<String, _>("concepto"),
+            "autorizado_por": r.try_get::<Option<i64>, _>("autorizado_por").ok().flatten(),
+            "corte_id":       r.try_get::<Option<i64>, _>("corte_id").ok().flatten(),
+            "fecha":          r.get::<String, _>("fecha"),
+        })).collect::<Vec<_>>(),
+        "vendedores": vends.iter().map(|r| json!({
+            "usuario_id":     r.get::<i64, _>("usuario_id"),
+            "usuario_nombre": r.try_get::<Option<String>, _>("usuario_nombre").ok().flatten().unwrap_or_default(),
+            "num_ventas":     r.try_get::<i64, _>("num_ventas").unwrap_or(0),
+            "total_vendido":  pg_dec(r, "total_vendido"),
+            "hora_inicio":    r.try_get::<Option<String>, _>("hora_inicio").ok().flatten().unwrap_or_default(),
+            "hora_fin":       r.try_get::<Option<String>, _>("hora_fin").ok().flatten().unwrap_or_default(),
+        })).collect::<Vec<_>>(),
+    }))
+}
+
+async fn obtener_fondo_sugerido(state: &AppState) -> Result<Value, ApiError> {
+    let fondo: Option<f64> = sqlx::query_scalar::<_, rust_decimal::Decimal>(
+        "SELECT fondo_siguiente::numeric FROM cortes \
+         WHERE tipo = 'DIA' AND origen = 'web' AND deleted_at IS NULL \
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .fetch_optional(&state.pool).await?
+    .and_then(|d| { use rust_decimal::prelude::ToPrimitive; d.to_f64() });
+
+    Ok(json!(fondo.unwrap_or(2000.0)))
+}
+
+async fn verificar_corte_dia_pendiente(state: &AppState) -> Result<Value, ApiError> {
+    // Día más reciente con ventas (cualquier origen) anterior a HOY que NO
+    // tenga corte DIA web. Igual que el desktop pero filtrando origen='web'
+    // en cortes — porque desde la web sólo nos interesa el corte web.
+    let pendiente: Option<String> = sqlx::query_scalar(
+        r#"
+        SELECT substr(v.fecha, 1, 10) AS dia
+        FROM ventas v
+        WHERE substr(v.fecha, 1, 10)
+              < to_char(now() AT TIME ZONE 'America/Mexico_City', 'YYYY-MM-DD')
+          AND v.deleted_at IS NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM cortes c
+              WHERE c.tipo = 'DIA'
+                AND c.origen = 'web'
+                AND c.deleted_at IS NULL
+                AND substr(c.fecha_fin, 1, 10) = substr(v.fecha, 1, 10)
+          )
+        GROUP BY dia
+        ORDER BY dia DESC
+        LIMIT 1
+        "#,
+    )
+    .fetch_optional(&state.pool)
+    .await?;
+
+    Ok(match pendiente {
+        Some(s) => json!(s),
+        None => Value::Null,
+    })
 }
 
 /// Busca un usuario admin/dueño por PIN comparando contra el bcrypt hash.
