@@ -1039,7 +1039,10 @@ async fn obtener_detalle_venta(state: &AppState, args: &Value) -> Result<Value, 
 
 #[derive(Deserialize)]
 struct CrearVentaArgs {
-    datos: NuevaVentaWeb,
+    // El cliente desktop manda `{ venta: {...} }` (param de Tauri).
+    // Mantenemos `datos` como alias por compatibilidad con clientes viejos.
+    #[serde(alias = "datos")]
+    venta: NuevaVentaWeb,
 }
 
 #[derive(Deserialize)]
@@ -1071,7 +1074,7 @@ struct ItemVentaWeb {
 async fn crear_venta(state: &AppState, args: Value) -> Result<Value, ApiError> {
     let a: CrearVentaArgs = serde_json::from_value(args)
         .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
-    let d = a.datos;
+    let d = a.venta;
 
     if d.items.is_empty() {
         return Err(ApiError::BadRequest("La venta no tiene items".into()));
