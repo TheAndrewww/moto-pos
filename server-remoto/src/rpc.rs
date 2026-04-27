@@ -1879,18 +1879,19 @@ async fn crear_devolucion(state: &AppState, args: Value) -> Result<Value, ApiErr
     .await?
     .ok_or_else(|| ApiError::BadRequest("Venta no encontrada o está anulada".into()))?;
 
-    // Si el usuario no es admin/dueño, requiere autorizado_por
-    let es_admin: i32 = sqlx::query_scalar(
-        "SELECT r.es_admin FROM usuarios u \
-         JOIN roles r ON r.id = u.rol_id \
-         WHERE u.id = $1",
+    // Si el usuario no es admin/dueño, requiere autorizado_por.
+    // Postgres no tiene tabla `roles`; usamos la convención del POS:
+    // rol_id 1 = dueño, 2 = gerente (admin), 3 = vendedor.
+    let rol_id: i64 = sqlx::query_scalar(
+        "SELECT rol_id FROM usuarios WHERE id = $1 AND deleted_at IS NULL",
     )
     .bind(d.usuario_id)
     .fetch_optional(&mut *tx)
     .await?
-    .unwrap_or(0);
+    .unwrap_or(3);
+    let es_admin = rol_es_admin(rol_id);
 
-    if es_admin == 0 && d.autorizado_por.is_none() {
+    if !es_admin && d.autorizado_por.is_none() {
         return Err(ApiError::BadRequest(
             "Se requiere autorización del dueño para registrar devoluciones".into(),
         ));
