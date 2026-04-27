@@ -129,7 +129,11 @@ pub async fn dispatch(
 
         // ─── Presupuestos (stub) ─────────────────────────────
         "listar_presupuestos"           => json!([]),
-        "listar_devoluciones"           => json!([]),
+
+        // ─── Devoluciones ────────────────────────────────────
+        "listar_devoluciones"           => listar_devoluciones(&state, &args).await?,
+        "obtener_detalle_devolucion"    => obtener_detalle_devolucion(&state, &args).await?,
+        "crear_devolucion"              => crear_devolucion(&state, args).await?,
 
         // ─── Recepciones ─────────────────────────────────────
         "listar_recepciones"            => listar_recepciones(&state).await?,
@@ -1700,6 +1704,396 @@ async fn crear_recepcion(state: &AppState, args: Value) -> Result<Value, ApiErro
         "fecha":            fecha,
         "notas":            r.notas,
         "total_items":      total_items,
+    }))
+}
+
+// =============================================================================
+// DEVOLUCIONES
+// =============================================================================
+
+async fn listar_devoluciones(state: &AppState, args: &Value) -> Result<Value, ApiError> {
+    use rust_decimal::prelude::ToPrimitive;
+
+    #[derive(Deserialize, Default)]
+    struct A { #[serde(default)] limite: Option<i64> }
+    let a: A = serde_json::from_value(args.clone()).unwrap_or_default();
+    let limite = a.limite.unwrap_or(100);
+
+    let rows = sqlx::query(
+        r#"
+        SELECT d.id, d.folio, d.venta_id, v.folio AS venta_folio,
+               u.nombre_completo AS usuario_nombre,
+               ua.nombre_completo AS autorizado_por_nombre,
+               d.motivo, d.total_devuelto,
+               (SELECT COUNT(*) FROM devolucion_detalle dd
+                  WHERE dd.devolucion_id = d.id AND dd.deleted_at IS NULL) AS num_items,
+               d.fecha
+        FROM devoluciones d
+        JOIN ventas v       ON v.id = d.venta_id
+        JOIN usuarios u     ON u.id = d.usuario_id
+        LEFT JOIN usuarios ua ON ua.id = d.autorizado_por
+        WHERE d.deleted_at IS NULL
+        ORDER BY d.fecha DESC
+        LIMIT $1
+        "#,
+    )
+    .bind(limite)
+    .fetch_all(&state.pool)
+    .await?;
+
+    Ok(json!(rows.iter().map(|r| json!({
+        "id":                    r.get::<i64, _>("id"),
+        "folio":                 r.get::<String, _>("folio"),
+        "venta_id":              r.get::<i64, _>("venta_id"),
+        "venta_folio":           r.get::<String, _>("venta_folio"),
+        "usuario_nombre":        r.try_get::<Option<String>, _>("usuario_nombre").ok().flatten().unwrap_or_default(),
+        "autorizado_por_nombre": r.try_get::<Option<String>, _>("autorizado_por_nombre").ok().flatten(),
+        "motivo":                r.get::<String, _>("motivo"),
+        "total_devuelto":        r.try_get::<rust_decimal::Decimal, _>("total_devuelto").ok()
+                                    .and_then(|d| d.to_f64()).unwrap_or(0.0),
+        "num_items":             r.get::<i64, _>("num_items"),
+        "fecha":                 r.get::<String, _>("fecha"),
+    })).collect::<Vec<_>>()))
+}
+
+async fn obtener_detalle_devolucion(state: &AppState, args: &Value) -> Result<Value, ApiError> {
+    use rust_decimal::prelude::ToPrimitive;
+
+    #[derive(Deserialize)]
+    struct A { id: i64 }
+    let a: A = serde_json::from_value(args.clone())
+        .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
+
+    let cab = sqlx::query(
+        r#"
+        SELECT d.id, d.folio, d.venta_id, v.folio AS venta_folio,
+               u.nombre_completo AS usuario_nombre,
+               ua.nombre_completo AS autorizado_por_nombre,
+               d.motivo, d.total_devuelto,
+               (SELECT COUNT(*) FROM devolucion_detalle dd
+                  WHERE dd.devolucion_id = d.id AND dd.deleted_at IS NULL) AS num_items,
+               d.fecha
+        FROM devoluciones d
+        JOIN ventas v       ON v.id = d.venta_id
+        JOIN usuarios u     ON u.id = d.usuario_id
+        LEFT JOIN usuarios ua ON ua.id = d.autorizado_por
+        WHERE d.id = $1 AND d.deleted_at IS NULL
+        "#,
+    )
+    .bind(a.id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or(ApiError::NotFound)?;
+
+    let items = sqlx::query(
+        r#"
+        SELECT dd.producto_id, p.codigo, p.nombre,
+               dd.cantidad, dd.precio_unitario, dd.subtotal
+        FROM devolucion_detalle dd
+        JOIN productos p ON p.id = dd.producto_id
+        WHERE dd.devolucion_id = $1 AND dd.deleted_at IS NULL
+        ORDER BY dd.id
+        "#,
+    )
+    .bind(a.id)
+    .fetch_all(&state.pool)
+    .await
+    .unwrap_or_default();
+
+    let dec = |r: &sqlx::postgres::PgRow, name: &str| -> f64 {
+        r.try_get::<rust_decimal::Decimal, _>(name).ok()
+            .and_then(|d| d.to_f64()).unwrap_or(0.0)
+    };
+
+    Ok(json!({
+        "devolucion": {
+            "id":                    cab.get::<i64, _>("id"),
+            "folio":                 cab.get::<String, _>("folio"),
+            "venta_id":              cab.get::<i64, _>("venta_id"),
+            "venta_folio":           cab.get::<String, _>("venta_folio"),
+            "usuario_nombre":        cab.try_get::<Option<String>, _>("usuario_nombre").ok().flatten().unwrap_or_default(),
+            "autorizado_por_nombre": cab.try_get::<Option<String>, _>("autorizado_por_nombre").ok().flatten(),
+            "motivo":                cab.get::<String, _>("motivo"),
+            "total_devuelto":        dec(&cab, "total_devuelto"),
+            "num_items":             cab.get::<i64, _>("num_items"),
+            "fecha":                 cab.get::<String, _>("fecha"),
+        },
+        "items": items.iter().map(|r| json!({
+            "producto_id":     r.get::<i64, _>("producto_id"),
+            "codigo":          r.try_get::<Option<String>, _>("codigo").ok().flatten().unwrap_or_default(),
+            "nombre":          r.try_get::<Option<String>, _>("nombre").ok().flatten().unwrap_or_default(),
+            "cantidad":        dec(r, "cantidad"),
+            "precio_unitario": dec(r, "precio_unitario"),
+            "subtotal":        dec(r, "subtotal"),
+        })).collect::<Vec<_>>(),
+    }))
+}
+
+async fn crear_devolucion(state: &AppState, args: Value) -> Result<Value, ApiError> {
+    use rust_decimal::prelude::ToPrimitive;
+
+    #[derive(Deserialize)]
+    struct A {
+        // El cliente desktop manda `{ datos: {...} }` (param de Tauri).
+        datos: NuevaDevolucionWeb,
+    }
+    #[derive(Deserialize)]
+    struct NuevaDevolucionWeb {
+        venta_id: i64,
+        usuario_id: i64,
+        #[serde(default)] autorizado_por: Option<i64>,
+        motivo: String,
+        items: Vec<ItemDevolucionWeb>,
+    }
+    #[derive(Deserialize)]
+    struct ItemDevolucionWeb {
+        venta_detalle_id: i64,
+        cantidad: f64,
+    }
+
+    let a: A = serde_json::from_value(args)
+        .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
+    let d = a.datos;
+
+    if d.motivo.trim().is_empty() {
+        return Err(ApiError::BadRequest("El motivo es obligatorio".into()));
+    }
+    if d.items.is_empty() {
+        return Err(ApiError::BadRequest("Debe incluir al menos un producto a devolver".into()));
+    }
+    for it in &d.items {
+        if it.cantidad <= 0.0 {
+            return Err(ApiError::BadRequest("Las cantidades deben ser mayores a 0".into()));
+        }
+    }
+
+    let sucursal_id: i64 = 1;
+    let mut tx = state.pool.begin().await?;
+
+    // Verificar venta no anulada y obtener su folio
+    let venta_folio: String = sqlx::query_scalar(
+        "SELECT folio FROM ventas WHERE id = $1 AND anulada = 0 AND deleted_at IS NULL",
+    )
+    .bind(d.venta_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| ApiError::BadRequest("Venta no encontrada o está anulada".into()))?;
+
+    // Si el usuario no es admin/dueño, requiere autorizado_por
+    let es_admin: i32 = sqlx::query_scalar(
+        "SELECT r.es_admin FROM usuarios u \
+         JOIN roles r ON r.id = u.rol_id \
+         WHERE u.id = $1",
+    )
+    .bind(d.usuario_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .unwrap_or(0);
+
+    if es_admin == 0 && d.autorizado_por.is_none() {
+        return Err(ApiError::BadRequest(
+            "Se requiere autorización del dueño para registrar devoluciones".into(),
+        ));
+    }
+
+    // Validar cantidades contra cada venta_detalle
+    let mut total_devuelto: f64 = 0.0;
+    // (venta_detalle_id, producto_id, cantidad, precio_unitario, subtotal)
+    let mut items_validados: Vec<(i64, i64, f64, f64, f64)> = Vec::new();
+
+    for item in &d.items {
+        let row = sqlx::query(
+            "SELECT venta_id, producto_id, cantidad, precio_final \
+             FROM venta_detalle \
+             WHERE id = $1 AND deleted_at IS NULL",
+        )
+        .bind(item.venta_detalle_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| ApiError::BadRequest(
+            format!("Partida de venta no encontrada: id={}", item.venta_detalle_id)
+        ))?;
+
+        let vd_venta_id: i64 = row.get("venta_id");
+        let prod_id: i64 = row.get("producto_id");
+        let cantidad_orig: f64 = row.try_get::<rust_decimal::Decimal, _>("cantidad")
+            .ok().and_then(|d| d.to_f64()).unwrap_or(0.0);
+        let precio_final: f64 = row.try_get::<rust_decimal::Decimal, _>("precio_final")
+            .ok().and_then(|d| d.to_f64()).unwrap_or(0.0);
+
+        if vd_venta_id != d.venta_id {
+            return Err(ApiError::BadRequest(
+                "Una de las partidas no pertenece a la venta".into(),
+            ));
+        }
+
+        let ya_devuelto: f64 = sqlx::query_scalar::<_, rust_decimal::Decimal>(
+            "SELECT COALESCE(SUM(cantidad), 0)::numeric \
+             FROM devolucion_detalle \
+             WHERE venta_detalle_id = $1 AND deleted_at IS NULL",
+        )
+        .bind(item.venta_detalle_id)
+        .fetch_one(&mut *tx)
+        .await
+        .ok()
+        .and_then(|d| d.to_f64())
+        .unwrap_or(0.0);
+
+        let disponible = cantidad_orig - ya_devuelto;
+        if item.cantidad > disponible + 0.0001 {
+            return Err(ApiError::BadRequest(format!(
+                "Cantidad excede lo disponible (vendido {}, ya devuelto {}, queda {})",
+                cantidad_orig, ya_devuelto, disponible
+            )));
+        }
+
+        let subtotal = item.cantidad * precio_final;
+        total_devuelto += subtotal;
+        items_validados.push((
+            item.venta_detalle_id, prod_id, item.cantidad, precio_final, subtotal,
+        ));
+    }
+
+    // Generar folio D-YYYYMMDD-NNNN (mismo patrón que ventas para evitar colisión
+    // con folios del desktop, que usan D-NNNNNN sin fecha).
+    let hoy: String = sqlx::query_scalar(
+        "SELECT to_char(now() AT TIME ZONE 'America/Mexico_City', 'YYYYMMDD')",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    let count_hoy: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(*)::bigint FROM devoluciones
+           WHERE folio LIKE $1 AND deleted_at IS NULL"#,
+    )
+    .bind(format!("D-{}-%", hoy))
+    .fetch_one(&mut *tx)
+    .await?;
+    let folio = format!("D-{}-{:04}", hoy, count_hoy + 1);
+
+    // Insertar devolución
+    let dev_uuid = uuid::Uuid::now_v7().to_string();
+    let ins_sql = format!(
+        r#"
+        INSERT INTO devoluciones
+          (uuid, sucursal_id, folio, venta_id, usuario_id, autorizado_por,
+           motivo, total_devuelto, fecha, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, {NOW_TEXT}, {NOW_TEXT})
+        RETURNING id, fecha
+        "#
+    );
+    let drow = sqlx::query(&ins_sql)
+        .bind(&dev_uuid)
+        .bind(sucursal_id)
+        .bind(&folio)
+        .bind(d.venta_id)
+        .bind(d.usuario_id)
+        .bind(d.autorizado_por)
+        .bind(&d.motivo)
+        .bind(total_devuelto)
+        .fetch_one(&mut *tx)
+        .await?;
+    let devolucion_id: i64 = drow.get("id");
+    let fecha: String = drow.get("fecha");
+
+    // Insertar detalle + restaurar stock
+    for (vd_id, prod_id, cantidad, precio, subtotal) in &items_validados {
+        let det_uuid = uuid::Uuid::now_v7().to_string();
+        let det_sql = format!(
+            r#"
+            INSERT INTO devolucion_detalle
+              (uuid, devolucion_id, venta_detalle_id, producto_id,
+               cantidad, precio_unitario, subtotal, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, {NOW_TEXT})
+            "#
+        );
+        sqlx::query(&det_sql)
+            .bind(&det_uuid)
+            .bind(devolucion_id)
+            .bind(vd_id)
+            .bind(prod_id)
+            .bind(cantidad)
+            .bind(precio)
+            .bind(subtotal)
+            .execute(&mut *tx)
+            .await?;
+
+        let upd_sql = format!(
+            "UPDATE productos SET stock_actual = stock_actual + $1, \
+             updated_at = {NOW_TEXT} WHERE id = $2"
+        );
+        sqlx::query(&upd_sql)
+            .bind(cantidad)
+            .bind(prod_id)
+            .execute(&mut *tx)
+            .await?;
+
+        // sync_cursor productos (stock cambió)
+        sqlx::query(
+            "INSERT INTO sync_cursor (tabla, uuid, sucursal_id, origen_device) \
+             SELECT 'productos', p.uuid, $1, $2 FROM productos p WHERE p.id = $3",
+        )
+        .bind(sucursal_id)
+        .bind(WEB_ORIGIN)
+        .bind(*prod_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    // Movimiento de caja (RETIRO) por el monto devuelto
+    let concepto = format!(
+        "Devolución {} de venta {} — {}",
+        folio, venta_folio, d.motivo
+    );
+    let mov_uuid = uuid::Uuid::now_v7().to_string();
+    let mov_sql = format!(
+        r#"
+        INSERT INTO movimientos_caja
+          (uuid, sucursal_id, tipo, usuario_id, monto, concepto,
+           autorizado_por, fecha, updated_at)
+        VALUES ($1, $2, 'RETIRO', $3, $4, $5, $6, {NOW_TEXT}, {NOW_TEXT})
+        RETURNING id
+        "#
+    );
+    let mrow = sqlx::query(&mov_sql)
+        .bind(&mov_uuid)
+        .bind(sucursal_id)
+        .bind(d.usuario_id)
+        .bind(total_devuelto)
+        .bind(&concepto)
+        .bind(d.autorizado_por)
+        .fetch_one(&mut *tx)
+        .await?;
+    let mov_id: i64 = mrow.get("id");
+
+    // Vincular movimiento a la devolución
+    sqlx::query(
+        "UPDATE devoluciones SET movimiento_caja_id = $1 WHERE id = $2",
+    )
+    .bind(mov_id)
+    .bind(devolucion_id)
+    .execute(&mut *tx)
+    .await?;
+
+    // sync_cursor para devolución y movimiento
+    sqlx::query(
+        "INSERT INTO sync_cursor (tabla, uuid, sucursal_id, origen_device) \
+         VALUES ('devoluciones', $1, $2, $3), \
+                ('movimientos_caja', $4, $2, $3)",
+    )
+    .bind(&dev_uuid)
+    .bind(sucursal_id)
+    .bind(WEB_ORIGIN)
+    .bind(&mov_uuid)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    Ok(json!({
+        "id":             devolucion_id,
+        "folio":          folio,
+        "total_devuelto": total_devuelto,
+        "fecha":          fecha,
     }))
 }
 
