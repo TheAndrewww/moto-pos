@@ -5,7 +5,6 @@ use rusqlite::{Connection, Result};
 
 type MigrationFn = fn(&Connection) -> Result<()>;
 
-/// Lista ordenada de migraciones. Índice 0 = migración que lleva de v0 → v1.
 const MIGRATIONS: &[MigrationFn] = &[
     migracion_001_listas_precio_y_clientes_activo,
     migracion_002_eliminar_listas_precio,
@@ -16,6 +15,7 @@ const MIGRATIONS: &[MigrationFn] = &[
     migracion_007_uuid_auto_y_backfill,
     migracion_008_reparar_esquema_sync,
     migracion_009_proveedores_activo,
+    migracion_010_limpiar_movimientos_caja_ventas,
 ];
 
 pub fn aplicar_migraciones(conn: &Connection) -> Result<()> {
@@ -702,5 +702,20 @@ fn migracion_008_reparar_esquema_sync(conn: &Connection) -> Result<()> {
         let _ = conn.execute_batch(&trig);
     }
 
+    Ok(())
+}
+
+// ─── Migración 010 ────────────────────────────────────────
+// Eliminar movimientos de caja que fueron autogenerados por ventas o
+// anulaciones en versiones anteriores (< 0.1.8).
+// Estos registros causaban un doble conteo de efectivo, porque la nueva
+// lógica lee el efectivo directamente de la tabla `ventas` y también
+// sumaba las entradas/retiros de la tabla `movimientos_caja`.
+// Solo borramos los "pendientes" (corte_id IS NULL) para limpiar el turno actual.
+fn migracion_010_limpiar_movimientos_caja_ventas(conn: &Connection) -> Result<()> {
+    let _ = conn.execute(
+        "DELETE FROM movimientos_caja WHERE corte_id IS NULL AND (concepto LIKE 'Venta %' OR concepto LIKE 'Anulación venta %')",
+        [],
+    );
     Ok(())
 }
