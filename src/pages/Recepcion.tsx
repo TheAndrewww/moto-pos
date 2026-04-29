@@ -6,7 +6,7 @@ import { useProductStore, type Producto } from '../store/productStore';
 import { useAuthStore } from '../store/authStore';
 import {
   TruckIcon, Plus, Search, Eye, RefreshCw, Trash2, PackagePlus,
-  ArrowLeft, Minus, PlusIcon, Barcode, ClipboardList, X, QrCode
+  ArrowLeft, Minus, PlusIcon, ClipboardList, X, QrCode
 } from 'lucide-react';
 
 interface RecepcionRow {
@@ -184,19 +184,6 @@ export default function Recepcion() {
       setTimeout(() => setFlash(null), 1200);
     }, []);
 
-    const handleScan = (e: React.KeyboardEvent<HTMLInputElement>) => {
-      if (e.key !== 'Enter') return;
-      const code = (e.target as HTMLInputElement).value.trim();
-      if (!code) return;
-      (e.target as HTMLInputElement).value = '';
-      const prod = productos.find(p => p.codigo === code);
-      if (prod) {
-        agregarProducto(prod);
-      } else {
-        setError(`Código no encontrado: ${code}`);
-        setTimeout(() => setError(''), 2500);
-      }
-    };
 
     const totalCosto = items.reduce((a, i) => a + i.cantidad * i.precio_costo, 0);
     const totalUnidades = items.reduce((a, i) => a + i.cantidad, 0);

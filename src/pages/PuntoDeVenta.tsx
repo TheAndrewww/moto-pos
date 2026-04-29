@@ -38,7 +38,6 @@ export default function PuntoDeVenta() {
   const [maxDescVendedor, setMaxDescVendedor] = useState(15);
   const [configNegocio, setConfigNegocio] = useState<ConfigNegocio | null>(null);
   const [ultimoTicket, setUltimoTicket] = useState<TicketData | null>(null);
-  const searchRef = useRef<HTMLInputElement>(null);
   const scanRef = useRef<HTMLInputElement>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [localSearch, setLocalSearch] = useState('');
@@ -502,7 +501,7 @@ export default function PuntoDeVenta() {
                             }} title="Se venderá en negativo">Sin stock</span>
                           )}
                         </div>
-                        <div style={{ fontSize: 11, color: 'var(--color-text-dim)', MathmarginTop: 2 }}>
+                        <div style={{ fontSize: 11, color: 'var(--color-text-dim)', marginTop: 2 }}>
                           <span className="mono">{p.codigo}</span>
                           <span style={{ color: p.stock_actual < 0 ? 'var(--color-danger)' : undefined, marginLeft: 6 }}>
                             · Stock: {p.stock_actual}
@@ -960,7 +959,7 @@ export default function PuntoDeVenta() {
             <div style={{ overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 8, paddingBottom: 16 }}>
               {tabs.map(t => {
                 const count = t.items.reduce((s,i)=>s+i.cantidad, 0);
-                const total = t.items.reduce((s,i)=>s+(i.precio_final * i.cantidad), 0);
+                const total = t.items.reduce((s,i)=>s+(i.precioFinal * i.cantidad), 0);
                 const isActiva = t.id === tabActivaId;
                 return (
                   <div key={t.id} style={{ display: 'flex', gap: 8 }}>
