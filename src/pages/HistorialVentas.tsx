@@ -1,17 +1,16 @@
 // pages/HistorialVentas.tsx — Historial de ventas + anulación + devoluciones parciales
 
-import { useState, useEffect } from 'react';
+import React, { useState, useEffect } from 'react';
 import { invoke } from '../lib/invokeCompat';
 import { useAuthStore } from '../store/authStore';
 import {
   useHistorialStore,
-  VentaResumen,
   VentaDetalleCompleto,
   VentaDetalleItem,
   DevolucionResumen,
 } from '../store/historialStore';
 import {
-  ScrollText, Search, RefreshCw, X, Ban, Undo2, FileText, CheckCircle2, Printer,
+  ScrollText, Search, RefreshCw, X, Ban, Undo2, CheckCircle2, Printer,
 } from 'lucide-react';
 import { imprimirTicket, type ConfigNegocio } from '../utils/ticket';
 
@@ -42,24 +41,31 @@ export default function HistorialVentas() {
   const [tab, setTab] = useState<Tab>('ventas');
 
   // Filtros
-  const [folio, setFolio] = useState('');
   const [fechaInicio, setFechaInicio] = useState(hoyISO());
   const [fechaFin, setFechaFin] = useState(hoyISO());
-  const [clienteTexto, setClienteTexto] = useState('');
+  const [articuloTexto, setArticuloTexto] = useState('');
+  const [articuloBuscado, setArticuloBuscado] = useState(''); // Texto activo usado para highlight
+  const [expandedRows, setExpandedRows] = useState<Set<number>>(new Set());
 
-  // Modal de detalle de venta
+  // Modal de detalle (para acciones, se usarán desde el detalle en línea)
   const [ventaSeleccionada, setVentaSeleccionada] = useState<VentaDetalleCompleto | null>(null);
   const [modalAnular, setModalAnular] = useState(false);
   const [modalDevolver, setModalDevolver] = useState(false);
 
   const cargar = async () => {
     try {
-      await buscarVentas({
-        folio,
+      setExpandedRows(new Set());
+      const termino = articuloTexto.trim();
+      setArticuloBuscado(termino);
+      const r = await buscarVentas({
         fecha_inicio: fechaInicio,
         fecha_fin: fechaFin,
-        cliente_texto: clienteTexto,
+        articulo_texto: termino,
       });
+      // Si se buscó por artículo y devolvió resultados, abrirlos todos automáticamente
+      if (termino !== '' && r && r.length > 0) {
+        setExpandedRows(new Set(r.map(v => v.id)));
+      }
     } catch (e) {
       alert('Error al buscar: ' + e);
     }
@@ -78,15 +84,11 @@ export default function HistorialVentas() {
     else cargarDevoluciones();
   }, [tab]);
 
-  const abrirDetalle = async (venta: VentaResumen) => {
-    try {
-      const detalle = await invoke<VentaDetalleCompleto>('obtener_detalle_venta', {
-        ventaId: venta.id,
-      });
-      setVentaSeleccionada(detalle);
-    } catch (e) {
-      alert('Error al abrir detalle: ' + e);
-    }
+  const toggleRow = (id: number) => {
+    const newEst = new Set(expandedRows);
+    if (newEst.has(id)) newEst.delete(id);
+    else newEst.add(id);
+    setExpandedRows(newEst);
   };
 
   return (
@@ -123,14 +125,15 @@ export default function HistorialVentas() {
             padding: '12px 20px', borderBottom: '1px solid var(--color-border)',
             background: 'var(--color-surface-2)', display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'end',
           }}>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-              <label style={{ fontSize: 11, color: 'var(--color-text-muted)', fontWeight: 600 }}>Folio</label>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 4, flex: 2, minWidth: 220 }}>
+              <label style={{ fontSize: 11, color: 'var(--color-text-muted)', fontWeight: 600 }}>🔍 Buscar artículo</label>
               <input
-                value={folio}
-                onChange={(e) => setFolio(e.target.value)}
-                placeholder="V-000123"
+                value={articuloTexto}
+                onChange={(e) => setArticuloTexto(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') cargar(); }}
+                placeholder="Código, nombre o descripción del producto"
                 className="input input-sm"
-                style={{ width: 130 }}
+                autoFocus
               />
             </div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
@@ -151,21 +154,12 @@ export default function HistorialVentas() {
                 className="input input-sm"
               />
             </div>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 4, flex: 1, minWidth: 180 }}>
-              <label style={{ fontSize: 11, color: 'var(--color-text-muted)', fontWeight: 600 }}>Cliente / teléfono</label>
-              <input
-                value={clienteTexto}
-                onChange={(e) => setClienteTexto(e.target.value)}
-                placeholder="Nombre o teléfono"
-                className="input input-sm"
-              />
-            </div>
             <button className="btn btn-sm" onClick={cargar} disabled={cargando}>
               <Search size={14} /> Buscar
             </button>
             <button
               className="btn btn-ghost btn-sm"
-              onClick={() => { setFolio(''); setFechaInicio(hoyISO()); setFechaFin(hoyISO()); setClienteTexto(''); }}
+              onClick={() => { setFechaInicio(hoyISO()); setFechaFin(hoyISO()); setArticuloTexto(''); setArticuloBuscado(''); cargar(); }}
             >
               <RefreshCw size={14} /> Limpiar
             </button>
@@ -196,41 +190,55 @@ export default function HistorialVentas() {
                   </tr>
                 )}
                 {ventas.map((v) => (
-                  <tr
-                    key={v.id}
-                    style={{
-                      borderBottom: '1px solid var(--color-border)',
-                      opacity: v.anulada ? 0.5 : 1,
-                      cursor: 'pointer',
-                    }}
-                    onClick={() => abrirDetalle(v)}
-                  >
-                    <td data-label="Folio" style={tdStyle}><code style={{ fontSize: 12 }}>{v.folio}</code></td>
-                    <td data-label="Fecha" style={tdStyle}>{formatFecha(v.fecha)}</td>
-                    <td data-label="Cajero" style={tdStyle}>{v.usuario_nombre}</td>
-                    <td data-label="Cliente" style={tdStyle}>{v.cliente_nombre || '—'}</td>
-                    <td data-label="Pago" style={tdStyle}>{v.metodo_pago}</td>
-                    <td data-label="Total" style={{ ...tdStyle, textAlign: 'right', fontWeight: 600 }}>{fmt(v.total)}</td>
-                    <td data-label="Items" style={{ ...tdStyle, textAlign: 'center' }}>{v.num_productos}</td>
-                    <td data-label="Estado" style={tdStyle}>
-                      {v.anulada ? (
-                        <span style={{
-                          fontSize: 11, padding: '2px 8px', borderRadius: 10,
-                          background: 'rgba(216,56,77,0.12)', color: 'var(--color-primary)', fontWeight: 600,
-                        }}>ANULADA</span>
-                      ) : (
-                        <span style={{
-                          fontSize: 11, padding: '2px 8px', borderRadius: 10,
-                          background: 'rgba(34,179,120,0.12)', color: '#22b378', fontWeight: 600,
-                        }}>OK</span>
-                      )}
-                    </td>
-                    <td style={tdStyle}>
-                      <button className="btn btn-ghost btn-sm" onClick={(e) => { e.stopPropagation(); abrirDetalle(v); }}>
-                        <FileText size={13} />
-                      </button>
-                    </td>
-                  </tr>
+                  <React.Fragment key={v.id}>
+                    <tr
+                      style={{
+                        borderBottom: '1px solid var(--color-border)',
+                        opacity: v.anulada ? 0.5 : 1,
+                        cursor: 'pointer',
+                        background: expandedRows.has(v.id) ? 'var(--color-surface-2)' : 'transparent',
+                      }}
+                      onClick={() => toggleRow(v.id)}
+                    >
+                      <td data-label="Folio" style={tdStyle}><code style={{ fontSize: 12 }}>{v.folio}</code></td>
+                      <td data-label="Fecha" style={tdStyle}>{formatFecha(v.fecha)}</td>
+                      <td data-label="Cajero" style={tdStyle}>{v.usuario_nombre}</td>
+                      <td data-label="Cliente" style={tdStyle}>{v.cliente_nombre || '—'}</td>
+                      <td data-label="Pago" style={tdStyle}>{v.metodo_pago}</td>
+                      <td data-label="Total" style={{ ...tdStyle, textAlign: 'right', fontWeight: 600 }}>{fmt(v.total)}</td>
+                      <td data-label="Items" style={{ ...tdStyle, textAlign: 'center' }}>{v.num_productos}</td>
+                      <td data-label="Estado" style={tdStyle}>
+                        {v.anulada ? (
+                          <span style={{
+                            fontSize: 11, padding: '2px 8px', borderRadius: 10,
+                            background: 'rgba(216,56,77,0.12)', color: 'var(--color-primary)', fontWeight: 600,
+                          }}>ANULADA</span>
+                        ) : (
+                          <span style={{
+                            fontSize: 11, padding: '2px 8px', borderRadius: 10,
+                            background: 'rgba(34,179,120,0.12)', color: '#22b378', fontWeight: 600,
+                          }}>OK</span>
+                        )}
+                      </td>
+                      <td style={tdStyle}>
+                        <button className="btn btn-ghost btn-sm" onClick={(e) => { e.stopPropagation(); toggleRow(v.id); }}>
+                          {expandedRows.has(v.id) ? 'Ocultar' : 'Detalles'}
+                        </button>
+                      </td>
+                    </tr>
+                    {expandedRows.has(v.id) && (
+                      <tr style={{ background: 'var(--color-surface-2)' }}>
+                        <td colSpan={9} style={{ padding: 0 }}>
+                          <DetalleVentaInline
+                            ventaId={v.id}
+                            highlightTerm={articuloBuscado}
+                            onAnular={(detalle) => { setVentaSeleccionada(detalle); setModalAnular(true); }}
+                            onDevolver={(detalle) => { setVentaSeleccionada(detalle); setModalDevolver(true); }}
+                          />
+                        </td>
+                      </tr>
+                    )}
+                  </React.Fragment>
                 ))}
               </tbody>
             </table>
@@ -280,16 +288,6 @@ export default function HistorialVentas() {
         </div>
       )}
 
-      {/* Modal detalle de venta */}
-      {ventaSeleccionada && !modalAnular && !modalDevolver && (
-        <ModalDetalleVenta
-          venta={ventaSeleccionada}
-          onClose={() => setVentaSeleccionada(null)}
-          onAnular={() => setModalAnular(true)}
-          onDevolver={() => setModalDevolver(true)}
-        />
-      )}
-
       {/* Modal anular */}
       {ventaSeleccionada && modalAnular && (
         <ModalAnularVenta
@@ -323,22 +321,42 @@ export default function HistorialVentas() {
   );
 }
 
-// ─── Modal: Detalle de venta ──────────────────────────────
+// ─── Componente In-line: Detalle de venta ───────────────────
 
-function ModalDetalleVenta({
-  venta, onClose, onAnular, onDevolver,
+function DetalleVentaInline({
+  ventaId, highlightTerm, onAnular, onDevolver,
 }: {
-  venta: VentaDetalleCompleto;
-  onClose: () => void;
-  onAnular: () => void;
-  onDevolver: () => void;
+  ventaId: number;
+  highlightTerm?: string;
+  onAnular: (v: VentaDetalleCompleto) => void;
+  onDevolver: (v: VentaDetalleCompleto) => void;
 }) {
+  const { obtenerDetalleCached } = useHistorialStore();
+  const [venta, setVenta] = useState<VentaDetalleCompleto | null>(null);
+
+  useEffect(() => {
+    let mounted = true;
+    obtenerDetalleCached(ventaId).then(v => {
+      if (mounted) setVenta(v);
+    }).catch(e => console.error(e));
+    return () => { mounted = false; };
+  }, [ventaId, obtenerDetalleCached]);
+
+  if (!venta) return <div style={{ padding: 20, textAlign: 'center', color: 'var(--color-text-muted)' }}>Cargando detalles...</div>;
+
   const hoy = new Date().toISOString().slice(0, 10);
   const fechaVenta = venta.fecha.slice(0, 10);
   const esHoy = fechaVenta === hoy;
   const totalDisponibleADevolver = venta.items.reduce((s, i) => s + i.cantidad_disponible, 0);
   const puedeDevolver = !venta.anulada && totalDisponibleADevolver > 0;
   const puedeAnular = !venta.anulada && esHoy && venta.total_devuelto === 0;
+
+  // Función para verificar si un item coincide con el término de búsqueda
+  const itemCoincide = (it: VentaDetalleItem): boolean => {
+    if (!highlightTerm) return false;
+    const term = highlightTerm.toLowerCase();
+    return it.codigo.toLowerCase().includes(term) || it.nombre.toLowerCase().includes(term);
+  };
 
   const handleReimprimir = async () => {
     try {
@@ -358,8 +376,6 @@ function ModalDetalleVenta({
         })),
         subtotal: venta.subtotal,
         descuento: venta.descuento,
-        // El redondeo no se guarda en BD; se infiere por diferencia.
-        // Si total > (subtotal - descuento) entonces hubo redondeo hacia arriba.
         redondeo: Math.max(0, +(venta.total - (venta.subtotal - venta.descuento)).toFixed(2)),
         total: venta.total,
         metodo_pago: venta.metodo_pago,
@@ -371,23 +387,10 @@ function ModalDetalleVenta({
   };
 
   return (
-    <ModalWrapper onClose={onClose} maxWidth={720}>
-      <div style={modalHeaderStyle}>
-        <div>
-          <h3 style={{ margin: 0, fontSize: 16, fontWeight: 700 }}>
-            Venta <code>{venta.folio}</code>
-          </h3>
-          <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginTop: 3 }}>
-            {formatFecha(venta.fecha)} · Cajero: {venta.usuario_nombre}
-            {venta.cliente_nombre && ` · Cliente: ${venta.cliente_nombre}`}
-          </div>
-        </div>
-        <button className="btn btn-ghost btn-sm" onClick={onClose}><X size={16} /></button>
-      </div>
-
+    <div style={{ padding: '16px 24px', borderTop: '1px dashed var(--color-border)' }}>
       {venta.anulada && (
         <div style={{
-          margin: '12px 20px', padding: 10, borderRadius: 6,
+          marginBottom: 12, padding: 10, borderRadius: 6,
           background: 'rgba(216,56,77,0.1)', border: '1px solid rgba(216,56,77,0.3)',
           fontSize: 12, color: 'var(--color-primary)',
         }}>
@@ -397,81 +400,84 @@ function ModalDetalleVenta({
         </div>
       )}
 
-      <div style={{ padding: '0 20px', maxHeight: 380, overflow: 'auto' }}>
-        <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
-          <thead>
-            <tr style={{ borderBottom: '1px solid var(--color-border)', textAlign: 'left' }}>
-              <th style={{ padding: '6px 4px' }}>Código</th>
-              <th style={{ padding: '6px 4px' }}>Producto</th>
-              <th style={{ padding: '6px 4px', textAlign: 'right' }}>Cant.</th>
-              <th style={{ padding: '6px 4px', textAlign: 'right' }}>Devuelto</th>
-              <th style={{ padding: '6px 4px', textAlign: 'right' }}>P. unit.</th>
-              <th style={{ padding: '6px 4px', textAlign: 'right' }}>Subtotal</th>
-            </tr>
-          </thead>
-          <tbody>
-            {venta.items.map(it => (
-              <tr key={it.id} style={{ borderBottom: '1px solid var(--color-border)' }}>
-                <td style={{ padding: '6px 4px', fontFamily: 'monospace' }}>{it.codigo}</td>
-                <td style={{ padding: '6px 4px' }}>{it.nombre}</td>
-                <td style={{ padding: '6px 4px', textAlign: 'right' }}>{it.cantidad}</td>
-                <td style={{ padding: '6px 4px', textAlign: 'right', color: it.cantidad_devuelta > 0 ? 'var(--color-primary)' : 'inherit' }}>
+      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13, background: 'var(--color-surface)', borderRadius: 6, overflow: 'hidden' }}>
+        <thead style={{ background: 'var(--color-surface-2)' }}>
+          <tr style={{ borderBottom: '1px solid var(--color-border)', textAlign: 'left' }}>
+            <th style={{ padding: '8px 12px' }}>Código</th>
+            <th style={{ padding: '8px 12px' }}>Producto</th>
+            <th style={{ padding: '8px 12px', textAlign: 'right' }}>Cant.</th>
+            <th style={{ padding: '8px 12px', textAlign: 'right' }}>Devuelto</th>
+            <th style={{ padding: '8px 12px', textAlign: 'right' }}>P. unit.</th>
+            <th style={{ padding: '8px 12px', textAlign: 'right' }}>Subtotal</th>
+          </tr>
+        </thead>
+        <tbody>
+          {venta.items.map(it => {
+            const match = itemCoincide(it);
+            return (
+              <tr key={it.id} style={{
+                borderBottom: '1px solid var(--color-border)',
+                background: match ? 'rgba(245,158,11,0.15)' : 'transparent',
+                borderLeft: match ? '3px solid var(--color-warning)' : '3px solid transparent',
+              }}>
+                <td style={{ padding: '8px 12px', fontFamily: 'monospace', color: match ? 'var(--color-warning)' : 'var(--color-text-muted)', fontWeight: match ? 700 : 400 }}>{it.codigo}</td>
+                <td style={{ padding: '8px 12px', fontWeight: match ? 700 : 500 }}>{it.nombre}</td>
+                <td style={{ padding: '8px 12px', textAlign: 'right' }}>{it.cantidad}</td>
+                <td style={{ padding: '8px 12px', textAlign: 'right', color: it.cantidad_devuelta > 0 ? 'var(--color-primary)' : 'inherit' }}>
                   {it.cantidad_devuelta > 0 ? it.cantidad_devuelta : '—'}
                 </td>
-                <td style={{ padding: '6px 4px', textAlign: 'right' }}>{fmt(it.precio_final)}</td>
-                <td style={{ padding: '6px 4px', textAlign: 'right', fontWeight: 600 }}>{fmt(it.subtotal)}</td>
+                <td style={{ padding: '8px 12px', textAlign: 'right' }}>{fmt(it.precio_final)}</td>
+                <td style={{ padding: '8px 12px', textAlign: 'right', fontWeight: 600 }}>{fmt(it.subtotal)}</td>
               </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+            );
+          })}
+        </tbody>
+      </table>
 
-      <div style={{
-        margin: '12px 20px', padding: 10, background: 'var(--color-surface-2)',
-        borderRadius: 6, fontSize: 13,
-      }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-          <span>Subtotal:</span>
-          <span>{fmt(venta.subtotal)}</span>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginTop: 16 }}>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <button className="btn btn-outline btn-sm" onClick={handleReimprimir} title="Reimprimir ticket">
+            <Printer size={14} /> Reimprimir
+          </button>
+          {puedeDevolver && (
+            <button className="btn btn-sm" style={{ background: 'var(--color-warning)', color: '#fff', border: 'none' }} onClick={() => onDevolver(venta)}>
+              <Undo2 size={14} /> Devolución parcial
+            </button>
+          )}
+          {puedeAnular && (
+            <button className="btn btn-danger btn-sm" onClick={() => onAnular(venta)}>
+              <Ban size={14} /> Anular venta
+            </button>
+          )}
         </div>
-        {venta.descuento > 0 && (
-          <div style={{ display: 'flex', justifyContent: 'space-between', color: 'var(--color-text-muted)' }}>
-            <span>Descuento:</span>
-            <span>-{fmt(venta.descuento)}</span>
-          </div>
-        )}
-        <div style={{ display: 'flex', justifyContent: 'space-between', fontWeight: 700, fontSize: 15, marginTop: 4 }}>
-          <span>Total:</span>
-          <span>{fmt(venta.total)}</span>
-        </div>
-        {venta.total_devuelto > 0 && (
-          <div style={{ display: 'flex', justifyContent: 'space-between', color: 'var(--color-primary)', fontWeight: 600, marginTop: 4 }}>
-            <span>Devuelto:</span>
-            <span>-{fmt(venta.total_devuelto)}</span>
-          </div>
-        )}
-      </div>
 
-      <div style={{
-        padding: '12px 20px', borderTop: '1px solid var(--color-border)',
-        display: 'flex', gap: 8, justifyContent: 'flex-end',
-      }}>
-        <button className="btn btn-ghost" onClick={onClose}>Cerrar</button>
-        <button className="btn btn-ghost" onClick={handleReimprimir} title="Reimprimir ticket">
-          <Printer size={14} /> Reimprimir
-        </button>
-        {puedeDevolver && (
-          <button className="btn" style={{ background: 'var(--color-warning)', color: '#fff' }} onClick={onDevolver}>
-            <Undo2 size={14} /> Devolución parcial
-          </button>
-        )}
-        {puedeAnular && (
-          <button className="btn btn-danger" onClick={onAnular}>
-            <Ban size={14} /> Anular venta
-          </button>
-        )}
+        <div style={{
+          padding: '12px 16px', background: 'var(--color-surface)', border: '1px solid var(--color-border)',
+          borderRadius: 6, fontSize: 13, minWidth: 200,
+        }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+            <span style={{ color: 'var(--color-text-muted)' }}>Subtotal:</span>
+            <span>{fmt(venta.subtotal)}</span>
+          </div>
+          {venta.descuento > 0 && (
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4, color: 'var(--color-text-muted)' }}>
+              <span>Descuento:</span>
+              <span>-{fmt(venta.descuento)}</span>
+            </div>
+          )}
+          <div style={{ display: 'flex', justifyContent: 'space-between', fontWeight: 800, fontSize: 16, marginTop: 8, paddingTop: 8, borderTop: '1px solid var(--color-border)' }}>
+            <span>Total:</span>
+            <span>{fmt(venta.total)}</span>
+          </div>
+          {venta.total_devuelto > 0 && (
+            <div style={{ display: 'flex', justifyContent: 'space-between', color: 'var(--color-primary)', fontWeight: 600, marginTop: 4 }}>
+              <span>Devuelto:</span>
+              <span>-{fmt(venta.total_devuelto)}</span>
+            </div>
+          )}
+        </div>
       </div>
-    </ModalWrapper>
+    </div>
   );
 }
 

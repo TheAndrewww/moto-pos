@@ -15,6 +15,7 @@ const MIGRATIONS: &[MigrationFn] = &[
     migracion_006_impresora_termica,
     migracion_007_uuid_auto_y_backfill,
     migracion_008_reparar_esquema_sync,
+    migracion_009_proveedores_activo,
 ];
 
 pub fn aplicar_migraciones(conn: &Connection) -> Result<()> {
@@ -584,6 +585,20 @@ fn migracion_007_uuid_auto_y_backfill(conn: &Connection) -> Result<()> {
 //   3. Pobla uuid en filas con uuid NULL.
 //   4. Re-crea los triggers de v5 y v7 con DROP+CREATE para asegurar que
 //      todos referencien el esquema reparado.
+// ─── Migración 009 ────────────────────────────────────────
+// Agrega columna `activo` a proveedores (soft-toggle, mismo patrón que clientes).
+// Sin esto la nueva página de Proveedores no puede ocultar/restaurar proveedores
+// sin perder los productos que los referencian.
+fn migracion_009_proveedores_activo(conn: &Connection) -> Result<()> {
+    if !columna_existe(conn, "proveedores", "activo") {
+        let _ = conn.execute(
+            "ALTER TABLE proveedores ADD COLUMN activo INTEGER NOT NULL DEFAULT 1",
+            [],
+        );
+    }
+    Ok(())
+}
+
 fn migracion_008_reparar_esquema_sync(conn: &Connection) -> Result<()> {
     let tablas: &[&str] = &[
         "productos", "proveedores", "clientes", "usuarios", "categorias",

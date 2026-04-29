@@ -8,6 +8,7 @@ import {
   type DatosCorte,
   type DenominacionInput,
   type CorteResumen,
+  type CorteDetalle,
 } from '../store/cortesStore';
 import {
   DollarSign, ArrowDownLeft, ArrowUpRight, Clock,
@@ -333,6 +334,11 @@ function TabHistorial({ cortes }: { cortes: CorteResumen[] }) {
 }
 
 function TarjetaCorte({ corte }: { corte: CorteResumen }) {
+  const { obtenerDetalleCorte } = useCortesStore();
+  const [expanded, setExpanded] = useState(false);
+  const [detalle, setDetalle] = useState<CorteDetalle | null>(null);
+  const [cargando, setCargando] = useState(false);
+
   const dif = corte.diferencia;
   const esDia = corte.tipo === 'DIA';
 
@@ -342,43 +348,239 @@ function TarjetaCorte({ corte }: { corte: CorteResumen }) {
 
   const labelDif = dif === 0 ? 'Cuadra' : dif > 0 ? `Sobrante +${fmt(dif)}` : `Faltante ${fmt(dif)}`;
 
+  const toggleExpand = async () => {
+    if (!expanded && !detalle) {
+      setCargando(true);
+      try {
+        const d = await obtenerDetalleCorte(corte.id);
+        setDetalle(d);
+      } catch (e) {
+        console.error(e);
+      }
+      setCargando(false);
+    }
+    setExpanded(!expanded);
+  };
+
   return (
-    <div className="card" style={{ padding: '14px 16px' }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-        <span style={{
-          fontSize: 10, fontWeight: 700, padding: '2px 8px', borderRadius: 6,
-          background: esDia ? 'rgba(99,102,241,0.12)' : 'rgba(158,122,126,0.12)',
-          color: esDia ? 'var(--color-primary)' : 'var(--color-text-muted)',
-          textTransform: 'uppercase',
-        }}>
-          {esDia ? 'Cierre del día' : 'Parcial'}
-        </span>
+    <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
+      {/* Header clickable */}
+      <div
+        onClick={toggleExpand}
+        style={{
+          padding: '14px 16px', cursor: 'pointer',
+          display: 'flex', flexDirection: 'column', gap: 10,
+          background: expanded ? 'var(--color-surface-2)' : 'transparent',
+          transition: 'background 0.15s',
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <span style={{
+            fontSize: 10, fontWeight: 700, padding: '2px 8px', borderRadius: 6,
+            background: esDia ? 'rgba(99,102,241,0.12)' : 'rgba(158,122,126,0.12)',
+            color: esDia ? 'var(--color-primary)' : 'var(--color-text-muted)',
+            textTransform: 'uppercase',
+          }}>
+            {esDia ? 'Cierre del día' : 'Corte de turno'}
+          </span>
 
-        <span style={{ fontSize: 13, color: 'var(--color-text-muted)', flex: 1 }}>
-          {fmtFecha(corte.created_at)} · {fmtHora(corte.created_at)} · {corte.usuario_nombre}
-        </span>
+          <span style={{ fontSize: 13, color: 'var(--color-text-muted)', flex: 1 }}>
+            {fmtFecha(corte.created_at)} · {fmtHora(corte.created_at)} · {corte.usuario_nombre}
+          </span>
 
-        <span style={{ fontSize: 13, fontWeight: 700, color: colorDif }}>
-          {labelDif}
-        </span>
-      </div>
+          <span style={{ fontSize: 13, fontWeight: 700, color: colorDif }}>
+            {labelDif}
+          </span>
 
-      <div style={{ display: 'flex', gap: 24, marginTop: 10 }}>
-        <div>
-          <p style={{ fontSize: 11, color: 'var(--color-text-dim)' }}>Esperado</p>
-          <p className="mono" style={{ fontSize: 15, fontWeight: 700 }}>{fmt(corte.efectivo_esperado)}</p>
+          {expanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
         </div>
-        <div>
-          <p style={{ fontSize: 11, color: 'var(--color-text-dim)' }}>Contado</p>
-          <p className="mono" style={{ fontSize: 15, fontWeight: 700 }}>{fmt(corte.efectivo_contado)}</p>
-        </div>
-        {esDia && (
-          <div>
-            <p style={{ fontSize: 11, color: 'var(--color-text-dim)' }}>Fondo siguiente</p>
-            <p className="mono" style={{ fontSize: 15, fontWeight: 700 }}>{fmt(corte.fondo_siguiente)}</p>
+
+        {/* Resumen de ventas por método */}
+        <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
+          <MiniStat label="Ventas Efectivo" value={fmt(corte.total_ventas_efectivo)} color="var(--color-success)" />
+          <MiniStat label="Tarjeta" value={fmt(corte.total_ventas_tarjeta)} color="#6366f1" />
+          <MiniStat label="Transferencia" value={fmt(corte.total_ventas_transferencia)} color="#06b6d4" />
+          <MiniStat label="Total Ventas" value={fmt(corte.total_ventas)} color="var(--color-text)" bold />
+          <div style={{ marginLeft: 'auto', display: 'flex', gap: 16 }}>
+            <MiniStat label="Esperado" value={fmt(corte.efectivo_esperado)} color="var(--color-primary)" />
+            <MiniStat label="Contado" value={fmt(corte.efectivo_contado)} color="var(--color-text)" />
+            <MiniStat label="Fondo sig." value={fmt(corte.fondo_siguiente)} color="var(--color-text-muted)" />
           </div>
-        )}
+        </div>
       </div>
+
+      {/* Nota de diferencia visible sin expandir */}
+      {corte.nota_diferencia && (
+        <div style={{
+          padding: '8px 16px', fontSize: 12,
+          background: dif < 0 ? 'rgba(239,68,68,0.06)' : 'rgba(245,158,11,0.06)',
+          borderTop: '1px solid var(--color-border)',
+          color: dif < 0 ? 'var(--color-danger)' : 'var(--color-warning)',
+          fontWeight: 600,
+        }}>
+          📝 {corte.nota_diferencia}
+        </div>
+      )}
+
+      {/* Detalle expandido */}
+      {expanded && (
+        <div style={{ borderTop: '1px solid var(--color-border)', padding: 16 }}>
+          {cargando ? (
+            <div style={{ textAlign: 'center', padding: 20, color: 'var(--color-text-dim)' }}>Cargando detalle...</div>
+          ) : detalle ? (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+
+              {/* Desglose de caja */}
+              <div>
+                <h4 style={{ fontSize: 12, fontWeight: 700, color: 'var(--color-text-muted)', marginBottom: 8, textTransform: 'uppercase', letterSpacing: 0.5 }}>
+                  Desglose de Caja
+                </h4>
+                <div className="card" style={{ padding: '10px 14px', fontSize: 13 }}>
+                  <DesgloseFila label="Fondo inicial" valor={corte.fondo_inicial} />
+                  <DesgloseFila label="+ Ventas en efectivo" valor={corte.total_ventas_efectivo} color="var(--color-success)" />
+                  {corte.total_entradas_efectivo > 0 && <DesgloseFila label="+ Entradas de caja" valor={corte.total_entradas_efectivo} color="var(--color-success)" />}
+                  {corte.total_retiros_efectivo > 0 && <DesgloseFila label="− Retiros de caja" valor={corte.total_retiros_efectivo} color="var(--color-danger)" negativo />}
+                  <div style={{ borderTop: '1px solid var(--color-border)', marginTop: 6, paddingTop: 6, display: 'flex', justifyContent: 'space-between', fontWeight: 800 }}>
+                    <span>= Efectivo esperado</span>
+                    <span className="mono">{fmt(corte.efectivo_esperado)}</span>
+                  </div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 4 }}>
+                    <span style={{ fontWeight: 600 }}>Efectivo contado</span>
+                    <span className="mono" style={{ fontWeight: 700 }}>{fmt(corte.efectivo_contado)}</span>
+                  </div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 4, color: colorDif, fontWeight: 800 }}>
+                    <span>Diferencia</span>
+                    <span className="mono">{dif >= 0 ? '+' : ''}{fmt(dif)}</span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Ventas por método */}
+              <div>
+                <h4 style={{ fontSize: 12, fontWeight: 700, color: 'var(--color-text-muted)', marginBottom: 8, textTransform: 'uppercase', letterSpacing: 0.5 }}>
+                  Ventas por Método ({corte.num_transacciones} transacciones)
+                </h4>
+                <div style={{ display: 'flex', gap: 10 }}>
+                  <MetodoPagoCard label="💵 Efectivo" valor={corte.total_ventas_efectivo} total={corte.total_ventas} color="var(--color-success)" />
+                  <MetodoPagoCard label="💳 Tarjeta" valor={corte.total_ventas_tarjeta} total={corte.total_ventas} color="#6366f1" />
+                  <MetodoPagoCard label="📱 Transferencia" valor={corte.total_ventas_transferencia} total={corte.total_ventas} color="#06b6d4" />
+                </div>
+              </div>
+
+              {/* Denominaciones */}
+              {detalle.denominaciones.length > 0 && (
+                <div>
+                  <h4 style={{ fontSize: 12, fontWeight: 700, color: 'var(--color-text-muted)', marginBottom: 8, textTransform: 'uppercase', letterSpacing: 0.5 }}>
+                    Denominaciones Contadas
+                  </h4>
+                  <div className="card" style={{ padding: '10px 14px' }}>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0 24px' }}>
+                      {['BILLETE', 'MONEDA'].map(tipo => {
+                        const items = detalle.denominaciones.filter(d => d.tipo === tipo);
+                        if (items.length === 0) return null;
+                        return (
+                          <div key={tipo}>
+                            <p style={{ fontSize: 11, fontWeight: 700, color: 'var(--color-text-dim)', marginBottom: 6 }}>
+                              {tipo === 'BILLETE' ? 'BILLETES' : 'MONEDAS'}
+                            </p>
+                            {items.map(d => (
+                              <div key={`${d.denominacion}_${d.tipo}`} style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, marginBottom: 3 }}>
+                                <span>${d.denominacion} × {d.cantidad}</span>
+                                <span className="mono" style={{ fontWeight: 600 }}>{fmt(d.subtotal)}</span>
+                              </div>
+                            ))}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Movimientos */}
+              {detalle.movimientos.length > 0 && (
+                <div>
+                  <h4 style={{ fontSize: 12, fontWeight: 700, color: 'var(--color-text-muted)', marginBottom: 8, textTransform: 'uppercase', letterSpacing: 0.5 }}>
+                    Movimientos de Caja
+                  </h4>
+                  <div className="card" style={{ padding: 0 }}>
+                    {detalle.movimientos.map(m => (
+                      <div key={m.id} style={{
+                        padding: '8px 14px', borderBottom: '1px solid var(--color-border)',
+                        display: 'flex', alignItems: 'center', gap: 10, fontSize: 12,
+                      }}>
+                        <span style={{
+                          fontSize: 10, fontWeight: 700, padding: '1px 6px', borderRadius: 4,
+                          background: m.tipo === 'ENTRADA' ? 'rgba(34,197,94,0.12)' : 'rgba(239,68,68,0.12)',
+                          color: m.tipo === 'ENTRADA' ? 'var(--color-success)' : 'var(--color-danger)',
+                        }}>
+                          {m.tipo === 'ENTRADA' ? '+' : '−'}
+                        </span>
+                        <span style={{ flex: 1 }}>{m.concepto}</span>
+                        <span style={{ color: 'var(--color-text-dim)' }}>{m.usuario_nombre} · {fmtHora(m.fecha)}</span>
+                        <span className="mono" style={{ fontWeight: 700 }}>{fmt(m.monto)}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Vendedores */}
+              {detalle.vendedores.length > 0 && (
+                <div>
+                  <h4 style={{ fontSize: 12, fontWeight: 700, color: 'var(--color-text-muted)', marginBottom: 8, textTransform: 'uppercase', letterSpacing: 0.5 }}>
+                    Resumen por Vendedor
+                  </h4>
+                  <div className="card" style={{ padding: 0 }}>
+                    {detalle.vendedores.map(v => (
+                      <div key={v.usuario_id} style={{
+                        padding: '8px 14px', borderBottom: '1px solid var(--color-border)',
+                        display: 'flex', alignItems: 'center', gap: 10, fontSize: 12,
+                      }}>
+                        <span style={{ fontWeight: 600, flex: 1 }}>{v.usuario_nombre}</span>
+                        <span style={{ color: 'var(--color-text-dim)' }}>{v.num_ventas} ventas</span>
+                        <span className="mono" style={{ fontWeight: 700 }}>{fmt(v.total_vendido)}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          ) : null}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Helpers para TarjetaCorte
+function MiniStat({ label, value, color, bold }: { label: string; value: string; color?: string; bold?: boolean }) {
+  return (
+    <div>
+      <p style={{ fontSize: 10, color: 'var(--color-text-dim)', lineHeight: 1 }}>{label}</p>
+      <p className="mono" style={{ fontSize: 13, fontWeight: bold ? 800 : 600, color: color || 'var(--color-text)' }}>{value}</p>
+    </div>
+  );
+}
+
+function DesgloseFila({ label, valor, color, negativo }: { label: string; valor: number; color?: string; negativo?: boolean }) {
+  return (
+    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 3 }}>
+      <span style={{ color: color || 'var(--color-text)' }}>{label}</span>
+      <span className="mono" style={{ fontWeight: 600, color: color || 'var(--color-text)' }}>
+        {negativo ? '-' : ''}{fmt(valor)}
+      </span>
+    </div>
+  );
+}
+
+function MetodoPagoCard({ label, valor, total, color }: { label: string; valor: number; total: number; color: string }) {
+  const pct = total > 0 ? ((valor / total) * 100).toFixed(0) : '0';
+  return (
+    <div className="card" style={{ flex: 1, padding: '10px 12px', textAlign: 'center' }}>
+      <p style={{ fontSize: 12, fontWeight: 600, marginBottom: 4 }}>{label}</p>
+      <p className="mono" style={{ fontSize: 18, fontWeight: 800, color }}>{fmt(valor)}</p>
+      <p style={{ fontSize: 10, color: 'var(--color-text-dim)' }}>{pct}% del total</p>
     </div>
   );
 }
@@ -663,17 +865,46 @@ function ModalCorteTurno({ onClose, onSuccess }: { onClose: () => void; onSucces
 
           {datos && (
             <>
-              {/* Efectivo Esperado */}
+              {/* Resumen de ventas del turno */}
+              <div style={{ display: 'flex', gap: 8 }}>
+                <div className="card" style={{ flex: 1, padding: '10px 12px', textAlign: 'center' }}>
+                  <p style={{ fontSize: 10, color: 'var(--color-text-dim)' }}>💵 Efectivo</p>
+                  <p className="mono" style={{ fontSize: 16, fontWeight: 800, color: 'var(--color-success)' }}>{fmt(datos.total_ventas_efectivo)}</p>
+                </div>
+                <div className="card" style={{ flex: 1, padding: '10px 12px', textAlign: 'center' }}>
+                  <p style={{ fontSize: 10, color: 'var(--color-text-dim)' }}>💳 Tarjeta</p>
+                  <p className="mono" style={{ fontSize: 16, fontWeight: 800, color: '#6366f1' }}>{fmt(datos.total_ventas_tarjeta)}</p>
+                </div>
+                <div className="card" style={{ flex: 1, padding: '10px 12px', textAlign: 'center' }}>
+                  <p style={{ fontSize: 10, color: 'var(--color-text-dim)' }}>📱 Transferencia</p>
+                  <p className="mono" style={{ fontSize: 16, fontWeight: 800, color: '#06b6d4' }}>{fmt(datos.total_ventas_transferencia)}</p>
+                </div>
+                <div className="card" style={{ flex: 1, padding: '10px 12px', textAlign: 'center', background: 'var(--color-surface-2)' }}>
+                  <p style={{ fontSize: 10, color: 'var(--color-text-dim)' }}>Total ({datos.num_transacciones})</p>
+                  <p className="mono" style={{ fontSize: 16, fontWeight: 800 }}>{fmt(datos.total_ventas)}</p>
+                </div>
+              </div>
+
+              {/* Desglose del efectivo esperado */}
               <div style={{
-                padding: '14px 16px', borderRadius: 10,
+                padding: '12px 16px', borderRadius: 10,
                 background: 'var(--color-surface-2)',
                 border: '1px solid var(--color-border)',
-                display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                fontSize: 13,
               }}>
-                <span style={{ fontSize: 13, fontWeight: 600 }}>Efectivo esperado en caja al momento</span>
-                <span className="mono" style={{ fontSize: 22, fontWeight: 800, color: 'var(--color-primary)' }}>
-                  {fmt(efectivoEsperado)}
-                </span>
+                <DesgloseFila label="Fondo inicial" valor={datos.fondo_inicial} />
+                <DesgloseFila label="+ Ventas en efectivo" valor={datos.total_ventas_efectivo} color="var(--color-success)" />
+                {datos.total_entradas_efectivo > 0 && <DesgloseFila label="+ Entradas de caja" valor={datos.total_entradas_efectivo} color="var(--color-success)" />}
+                {datos.total_retiros_efectivo > 0 && <DesgloseFila label="− Retiros de caja" valor={datos.total_retiros_efectivo} color="var(--color-danger)" negativo />}
+                <div style={{
+                  borderTop: '1px solid var(--color-border)', marginTop: 6, paddingTop: 6,
+                  display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                }}>
+                  <span style={{ fontWeight: 800 }}>= Efectivo esperado en caja</span>
+                  <span className="mono" style={{ fontSize: 22, fontWeight: 800, color: 'var(--color-primary)' }}>
+                    {fmt(efectivoEsperado)}
+                  </span>
+                </div>
               </div>
 
               {/* Conteo de caja */}
@@ -865,7 +1096,7 @@ function ModalCorteTurno({ onClose, onSuccess }: { onClose: () => void; onSucces
   );
 }
 
-// ─── Modal 3: Corte del Día ───────────────────────────────
+// ─── Modal 3: cierre de caja ───────────────────────────────
 
 function ModalCorteDelDia({ onClose, onSuccess, fechaObjetivo }: {
   onClose: () => void;
@@ -873,9 +1104,10 @@ function ModalCorteDelDia({ onClose, onSuccess, fechaObjetivo }: {
   fechaObjetivo?: string | null;
 }) {
   const { usuario } = useAuthStore();
-  const { calcularDatosCorte, crearCorte, cargando } = useCortesStore();
+  const { calcularDatosCorte, crearCorte, cargando, obtenerInicioProximoCierre } = useCortesStore();
 
   const [datos, setDatos] = useState<DatosCorte | null>(null);
+  const [rangoFechas, setRangoFechas] = useState<{ inicio: string; fin: string } | null>(null);
   const [cargandoDatos, setCargandoDatos] = useState(true);
   const [usarDenominaciones, setUsarDenominaciones] = useState(true);
   const [cantidades, setCantidades] = useState<Record<string, number>>({});
@@ -884,17 +1116,28 @@ function ModalCorteDelDia({ onClose, onSuccess, fechaObjetivo }: {
   const [fondoSiguiente, setFondoSiguiente] = useState('2000');
   const [error, setError] = useState('');
 
-  const [fechaInicio] = useState(() => fechaObjetivo ? `${fechaObjetivo} 00:00:00` : fechaHoyInicio());
-  const [fechaFin] = useState(() => fechaObjetivo ? `${fechaObjetivo} 23:59:59` : fechaHoyFin());
   const esExtemporaneo = !!fechaObjetivo;
 
   useEffect(() => {
-    calcularDatosCorte(fechaInicio, fechaFin)
-      .then(d => {
+    async function init() {
+      try {
+        setCargandoDatos(true);
+        // Siempre usamos el inicio de los tiempos pendientes para no dejar baches
+        const fInicio = await obtenerInicioProximoCierre();
+        // Si hay una fecha objetivo explícita (ej. "ayer"), el cierre llega hasta el final de ese día
+        const fFin = fechaObjetivo ? `${fechaObjetivo} 23:59:59` : fechaHoyFin();
+        
+        setRangoFechas({ inicio: fInicio, fin: fFin });
+        
+        const d = await calcularDatosCorte(fInicio, fFin);
         setDatos(d);
-      })
-      .catch(e => setError(String(e)))
-      .finally(() => setCargandoDatos(false));
+      } catch (e: any) {
+        setError(String(e));
+      } finally {
+        setCargandoDatos(false);
+      }
+    }
+    init();
   }, []);
 
   const totalDenominaciones = DENOMINACIONES.reduce((sum, d) => {
@@ -910,7 +1153,7 @@ function ModalCorteDelDia({ onClose, onSuccess, fechaObjetivo }: {
   const requiereNota = efectivoContado > 0 && diferencia !== 0;
 
   const handleConfirmar = async () => {
-    if (!datos) return;
+    if (!datos || !rangoFechas) return;
     if (efectivoContado < 0) { setError('El efectivo contado no puede ser negativo'); return; }
     if (requiereNota && !nota.trim()) { setError('La nota es obligatoria cuando hay diferencia'); return; }
 
@@ -931,8 +1174,8 @@ function ModalCorteDelDia({ onClose, onSuccess, fechaObjetivo }: {
       await crearCorte({
         tipo: 'DIA',
         usuario_id: usuario!.id,
-        fecha_inicio: fechaInicio,
-        fecha_fin: fechaFin,
+        fecha_inicio: rangoFechas.inicio,
+        fecha_fin: rangoFechas.fin,
         datos,
         efectivo_contado: efectivoContado,
         nota_diferencia: nota.trim() || null,
@@ -964,7 +1207,7 @@ function ModalCorteDelDia({ onClose, onSuccess, fechaObjetivo }: {
           <CheckCircle size={18} style={{ color: 'var(--color-success)' }} />
           <div style={{ flex: 1 }}>
             <h3 style={{ fontSize: 15, fontWeight: 700 }}>
-              {esExtemporaneo ? 'Corte del Día — Extemporáneo' : 'Corte del Día — Cierre'}
+              {esExtemporaneo ? 'cierre de caja — Extemporáneo' : 'cierre de caja — Cierre'}
             </h3>
             <p style={{ fontSize: 11, color: 'var(--color-text-dim)' }}>
               {esExtemporaneo
@@ -998,19 +1241,53 @@ function ModalCorteDelDia({ onClose, onSuccess, fechaObjetivo }: {
                 )}
               </SeccionResumen>
 
+              {/* Aviso de cortes parciales */}
+              {datos.cortes_parciales_hoy > 0 && (
+                <div style={{
+                  padding: '10px 14px', borderRadius: 8,
+                  background: 'rgba(99,102,241,0.08)', border: '1px solid rgba(99,102,241,0.2)',
+                  fontSize: 12, color: 'var(--color-primary)',
+                }}>
+                  <strong>ℹ️ Se realizaron {datos.cortes_parciales_hoy} corte{datos.cortes_parciales_hoy > 1 ? 's' : ''} de turno hoy.</strong>
+                  {datos.total_retirado_parciales > 0 && (
+                    <span> Se retiraron <strong>{fmt(datos.total_retirado_parciales)}</strong> en cambios de turno.</span>
+                  )}
+                  <span> El efectivo esperado ya refleja solo lo que debe estar en caja ahora.</span>
+                </div>
+              )}
+
               {/* CAJA */}
-              <SeccionResumen titulo="MOVIMIENTOS DE CAJA">
-                <FilaResumen label="Fondo inicial" valor={fmt(datos.fondo_inicial)} />
-                <FilaResumen label="(+) Ventas efectivo" valor={fmt(datos.total_ventas_efectivo)} color="var(--color-success)" />
+              <SeccionResumen titulo="CÁLCULO DE EFECTIVO EN CAJA">
+                <FilaResumen label="Fondo (desde último corte de turno o apertura)" valor={fmt(datos.fondo_inicial)} />
+                <FilaResumen label="(+) Ventas efectivo (desde último turno)" valor={fmt(datos.total_ventas_efectivo)} color="var(--color-success)" />
                 {datos.total_entradas_efectivo > 0 && (
                   <FilaResumen label="(+) Entradas" valor={fmt(datos.total_entradas_efectivo)} color="var(--color-success)" />
                 )}
                 {datos.total_retiros_efectivo > 0 && (
-                  <FilaResumen label="(-) Retiros" valor={`-${fmt(datos.total_retiros_efectivo)}`} color="var(--color-danger)" />
+                  <FilaResumen label="(-) Retiros pendientes" valor={`-${fmt(datos.total_retiros_efectivo)}`} color="var(--color-danger)" />
                 )}
                 <div style={{ margin: '6px 0', borderTop: '1px solid var(--color-border)' }} />
-                <FilaResumen label="Efectivo esperado" valor={fmt(datos.efectivo_esperado)} bold color="var(--color-primary)" />
               </SeccionResumen>
+
+              {/* EFECTIVO ESPERADO — MUY PROMINENTE */}
+              <div style={{
+                padding: '20px 24px', borderRadius: 12,
+                background: 'linear-gradient(135deg, rgba(99,102,241,0.12), rgba(99,102,241,0.04))',
+                border: '2px solid var(--color-primary)',
+                textAlign: 'center',
+              }}>
+                <p style={{ fontSize: 12, fontWeight: 700, color: 'var(--color-text-muted)', textTransform: 'uppercase', letterSpacing: 1, marginBottom: 4 }}>
+                  💰 Efectivo que debe haber en caja ahora
+                </p>
+                <p className="mono" style={{ fontSize: 42, fontWeight: 900, color: 'var(--color-primary)', lineHeight: 1 }}>
+                  {fmt(datos.efectivo_esperado)}
+                </p>
+                {datos.cortes_parciales_hoy > 0 && datos.total_retirado_parciales > 0 && (
+                  <p style={{ fontSize: 11, color: 'var(--color-text-dim)', marginTop: 6 }}>
+                    (Ya se retiraron {fmt(datos.total_retirado_parciales)} en cortes de turno)
+                  </p>
+                )}
+              </div>
 
               {/* DETALLE DE MOVIMIENTOS */}
               {datos.movimientos.length > 0 && (

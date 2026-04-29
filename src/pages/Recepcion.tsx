@@ -6,7 +6,7 @@ import { useProductStore, type Producto } from '../store/productStore';
 import { useAuthStore } from '../store/authStore';
 import {
   TruckIcon, Plus, Search, Eye, RefreshCw, Trash2, PackagePlus,
-  ArrowLeft, Minus, PlusIcon, Barcode, ClipboardList,
+  ArrowLeft, Minus, PlusIcon, Barcode, ClipboardList, X, QrCode
 } from 'lucide-react';
 
 interface RecepcionRow {
@@ -109,6 +109,7 @@ export default function Recepcion() {
     const [error, setError] = useState('');
     const [flash, setFlash] = useState<{ nombre: string; cantidad: number } | null>(null);
     const [buscarTexto, setBuscarTexto] = useState('');
+    const [showCartMobile, setShowCartMobile] = useState(false);
     const scanRef = useRef<HTMLInputElement>(null);
 
     // Cargar órdenes enviadas / parciales
@@ -257,23 +258,48 @@ export default function Recepcion() {
           )}
         </div>
 
-        <div className="recepcion-grid" style={{ flex: 1, display: 'grid', gridTemplateColumns: '1fr 380px', minHeight: 0 }}>
+        <div className="pos-pdv-grid" style={{ flex: 1, display: 'grid', gridTemplateColumns: '1fr 380px', minHeight: 0 }}>
           {/* Izquierda — escaneo + lista */}
           <div className="recepcion-col-left" style={{ display: 'flex', flexDirection: 'column', minHeight: 0, borderRight: '1px solid var(--color-border)' }}>
-            {/* Barra de escaneo */}
-            <div style={{ padding: '14px 16px', borderBottom: '1px solid var(--color-border)', background: 'var(--color-surface)' }}>
-              <label style={labelStyle}>
-                <Barcode size={12} style={{ display: 'inline', marginRight: 4, verticalAlign: 'middle' }} />
-                ESCANEAR CÓDIGO
-              </label>
-              <input
-                ref={scanRef}
-                className="input mono"
-                placeholder="Escanea el código del producto…"
-                onKeyDown={handleScan}
-                style={{ fontSize: 18, padding: '10px 14px', textAlign: 'center' }}
-                autoFocus
-              />
+            {/* Omni-Search */}
+            <div style={{ padding: '12px 16px', borderBottom: '1px solid var(--color-border)', background: 'var(--color-surface)', position: 'relative' }}>
+              <div style={{ display: 'flex', gap: 8 }}>
+                <div style={{ position: 'relative', flex: 1 }}>
+                  <Search size={16} style={{ position: 'absolute', left: 12, top: '50%', transform: 'translateY(-50%)', color: 'var(--color-text-dim)' }} />
+                  <input
+                    ref={scanRef}
+                    className="input mono"
+                    placeholder="Escanear o buscar..."
+                    value={buscarTexto}
+                    onChange={e => setBuscarTexto(e.target.value)}
+                    onKeyDown={e => {
+                      if (e.key === 'Enter') {
+                        const code = buscarTexto.trim();
+                        if (!code) return;
+                        const prod = productos.find(p => p.codigo === code);
+                        if (prod) {
+                          agregarProducto(prod);
+                          setBuscarTexto('');
+                        } else {
+                          setError(`Código no encontrado: ${code}`);
+                          setTimeout(() => setError(''), 2500);
+                        }
+                      }
+                    }}
+                    style={{ paddingLeft: 36, paddingRight: 12, fontSize: 16, width: '100%' }}
+                    autoFocus
+                  />
+                </div>
+                <button
+                  className="btn btn-secondary"
+                  title="Escanear QR / Código usando la cámara"
+                  style={{ width: 44, padding: 0, flexShrink: 0, justifyContent: 'center' }}
+                  onClick={() => alert('Función de cámara no implementada en este demo. Esta acción abriría la cámara del dispositivo móvil.')}
+                >
+                  <QrCode size={20} />
+                </button>
+              </div>
+
               {flash && (
                 <div style={{
                   marginTop: 8, padding: '6px 10px', borderRadius: 6,
@@ -293,37 +319,29 @@ export default function Recepcion() {
                   {error}
                 </div>
               )}
-            </div>
 
-            {/* Buscador manual (fallback) */}
-            <div style={{ padding: '10px 16px', borderBottom: '1px solid var(--color-border)', position: 'relative' }}>
-              <div style={{ position: 'relative' }}>
-                <Search size={14} style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: 'var(--color-text-dim)' }} />
-                <input className="input"
-                  placeholder="¿No escanea? Buscar por nombre…"
-                  value={buscarTexto}
-                  onChange={e => setBuscarTexto(e.target.value)}
-                  style={{ paddingLeft: 30, fontSize: 12 }} />
-              </div>
-              {buscarResultados.length > 0 && (
+              {/* Sugerencias de búsqueda manual */}
+              {buscarResultados.length > 0 && buscarTexto.length >= 2 && !productos.find(p => p.codigo === buscarTexto.trim()) && (
                 <div className="card" style={{
-                  position: 'absolute', top: '100%', left: 16, right: 16, zIndex: 10,
-                  maxHeight: 260, overflow: 'auto', padding: 0, marginTop: 2,
+                  position: 'absolute', top: '100%', left: 16, right: 16, zIndex: 30,
+                  maxHeight: 300, overflow: 'auto', padding: 0, marginTop: 4,
+                  boxShadow: '0 8px 32px rgba(0,0,0,0.15)'
                 }}>
                   {buscarResultados.map(p => (
                     <button key={p.id}
                       onClick={() => { agregarProducto(p); setBuscarTexto(''); scanRef.current?.focus(); }}
                       style={{
                         display: 'flex', justifyContent: 'space-between', width: '100%',
-                        padding: '8px 12px', border: 'none', background: 'transparent',
+                        padding: '10px 14px', border: 'none', background: 'transparent',
                         color: 'var(--color-text)', cursor: 'pointer',
                         borderBottom: '1px solid var(--color-border)',
-                        textAlign: 'left', fontSize: 12,
+                        textAlign: 'left', fontSize: 13,
                       }}
                       onMouseEnter={e => (e.currentTarget.style.background = 'var(--color-surface-2)')}
                       onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
                     >
-                      <span><span className="mono" style={{ fontSize: 10, color: 'var(--color-text-dim)' }}>{p.codigo}</span> {p.nombre}</span>
+                      <span style={{ fontWeight: 600 }}>{p.nombre}</span>
+                      <span className="mono" style={{ fontSize: 11, color: 'var(--color-text-dim)', textAlign: 'right' }}>{p.codigo}</span>
                     </button>
                   ))}
                 </div>
@@ -339,133 +357,112 @@ export default function Recepcion() {
                   <p style={{ fontSize: 12 }}>Los productos se sumarán al stock cuando confirmes</p>
                 </div>
               ) : (
-                <table className="recepcion-items-table" style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
-                  <thead style={{ position: 'sticky', top: 0, background: 'var(--color-surface-2)', zIndex: 1 }}>
-                    <tr style={{ fontSize: 10, fontWeight: 600, color: 'var(--color-text-dim)', textTransform: 'uppercase' }}>
-                      <th style={{ padding: '8px 12px', textAlign: 'left' }}>Producto</th>
-                      <th style={{ padding: '8px 6px', width: 120 }}>Cantidad</th>
-                      {ordenId && <th style={{ padding: '8px 6px', width: 70 }}>Pedido</th>}
-                      <th style={{ padding: '8px 8px', width: 200 }}>Costo</th>
-                      <th style={{ padding: '8px 8px', width: 92 }}>Venta</th>
-                      <th style={{ padding: '8px 12px', width: 80, textAlign: 'right' }}>Total</th>
-                      <th style={{ width: 28 }}></th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {items.map((item, idx) => {
-                      const excede = item.pedido_cantidad !== undefined && item.cantidad > item.pedido_cantidad;
-                      // El multiplicador se desactiva si no hay costo (regla del dueño:
-                      // no tocar productos legacy sin costo registrado).
-                      const sinCosto = item.precio_costo <= 0;
-                      const aplicarMultiplicador = (factor: number) => {
-                        const n = [...items];
-                        // Regla del dueño: precio de venta siempre entero hacia arriba
-                        // (sin centavos). Math.ceil(costo × factor).
-                        n[idx] = { ...n[idx], precio_venta: Math.ceil(n[idx].precio_costo * factor) };
-                        setItems(n);
-                      };
-                      return (
-                        <tr key={idx} style={{ borderBottom: '1px solid var(--color-border)' }}>
-                          <td style={{ padding: '8px 12px' }}>
-                            <div style={{ fontWeight: 600, fontSize: 13 }}>{item.producto.nombre}</div>
-                            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 2 }}>
-                              <span className="mono" style={{ fontSize: 11, color: 'var(--color-text-dim)' }}>{item.producto.codigo}</span>
-                              <span style={{
-                                fontSize: 10, fontWeight: 700,
-                                padding: '1px 6px', borderRadius: 8,
-                                background: item.producto.stock_actual <= item.producto.stock_minimo
-                                  ? 'rgba(239, 68, 68, 0.15)' : 'rgba(148, 163, 184, 0.15)',
-                                color: item.producto.stock_actual <= item.producto.stock_minimo
-                                  ? 'var(--color-danger)' : 'var(--color-text-muted)',
-                              }}>
-                                Stock: {item.producto.stock_actual}
-                              </span>
-                            </div>
-                          </td>
-                          <td style={{ padding: '4px 6px' }}>
-                            <div style={{ display: 'flex', alignItems: 'center', gap: 2, justifyContent: 'center' }}>
-                              <button className="btn btn-ghost btn-sm" style={{ padding: '2px 4px' }}
-                                onClick={() => {
-                                  const n = [...items]; const c = Math.max(1, n[idx].cantidad - 1);
-                                  n[idx] = { ...n[idx], cantidad: c }; setItems(n);
-                                }}>
-                                <Minus size={12} />
-                              </button>
-                              <input className="input mono" type="number" min={1} value={item.cantidad}
-                                style={{ width: 52, padding: '2px 4px', textAlign: 'center', fontSize: 13 }}
-                                onChange={e => { const n = [...items]; n[idx] = { ...n[idx], cantidad: Number(e.target.value) || 1 }; setItems(n); }} />
-                              <button className="btn btn-ghost btn-sm" style={{ padding: '2px 4px' }}
-                                onClick={() => { const n = [...items]; n[idx] = { ...n[idx], cantidad: n[idx].cantidad + 1 }; setItems(n); }}>
-                                <PlusIcon size={12} />
-                              </button>
-                            </div>
-                          </td>
-                          {ordenId && (
-                            <td className="mono" style={{ padding: '4px 6px', textAlign: 'center', fontSize: 12,
-                              color: excede ? 'var(--color-warning)' : 'var(--color-text-dim)' }}>
-                              {item.pedido_cantidad ?? '—'}
-                            </td>
-                          )}
-                          <td style={{ padding: '4px 8px' }}>
-                            <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-                              <input className="input mono" type="number" step="0.01" value={item.precio_costo}
-                                style={{ width: 78, padding: '2px 6px', textAlign: 'right', fontSize: 12 }}
-                                onChange={e => { const n = [...items]; n[idx] = { ...n[idx], precio_costo: Number(e.target.value) || 0 }; setItems(n); }} />
-                              {/* Multiplicadores 1.4 / 1.5 / 1.7 → calculan precio_venta */}
-                              {MULTIPLICADORES.map(m => (
-                                <button
-                                  key={m}
-                                  type="button"
-                                  className="btn btn-ghost btn-sm"
-                                  disabled={sinCosto}
-                                  title={sinCosto ? 'Captura primero el costo' : `Calcular precio de venta = costo × ${m}`}
-                                  onClick={() => aplicarMultiplicador(m)}
-                                  style={{
-                                    padding: '2px 6px', fontSize: 10, fontWeight: 700,
-                                    minWidth: 32,
-                                    opacity: sinCosto ? 0.4 : 1,
-                                    cursor: sinCosto ? 'not-allowed' : 'pointer',
-                                  }}>
-                                  ×{m}
-                                </button>
-                              ))}
-                            </div>
-                          </td>
-                          <td style={{ padding: '4px 8px' }}>
-                            <input className="input mono" type="number" step="1" min={0} value={item.precio_venta}
-                              style={{ width: 80, padding: '2px 6px', textAlign: 'right', fontSize: 12 }}
-                              onChange={e => {
-                                const v = parseFloat(e.target.value);
-                                const entero = isNaN(v) ? 0 : Math.ceil(v);
-                                const n = [...items];
-                                n[idx] = { ...n[idx], precio_venta: entero };
-                                setItems(n);
-                              }} />
-                            {/* Precio de venta anterior — referencia para el usuario */}
-                            <div style={{ fontSize: 10, color: 'var(--color-text-dim)', textAlign: 'right', marginTop: 2 }}>
-                              Anterior: ${item.producto.precio_venta.toFixed(2)}
-                            </div>
-                          </td>
-                          <td className="mono" style={{ padding: '8px 12px', textAlign: 'right', fontWeight: 700, color: 'var(--color-primary)' }}>
-                            {fmt(item.cantidad * item.precio_costo)}
-                          </td>
-                          <td style={{ padding: '4px' }}>
-                            <button className="btn btn-ghost btn-sm" style={{ padding: '2px 4px', color: 'var(--color-danger)' }}
-                              onClick={() => setItems(items.filter((_, i) => i !== idx))}>
-                              <Trash2 size={12} />
-                            </button>
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
+                <div style={{ display: 'flex', flexDirection: 'column' }}>
+                  {items.map((item, idx) => {
+                    const excede = item.pedido_cantidad !== undefined && item.cantidad > item.pedido_cantidad;
+                    const sinCosto = item.precio_costo <= 0;
+                    const aplicarMultiplicador = (factor: number) => {
+                      const n = [...items];
+                      n[idx] = { ...n[idx], precio_venta: Math.ceil(n[idx].precio_costo * factor) };
+                      setItems(n);
+                    };
+                    return (
+                      <div key={idx} className="recepcion-mobile-item" style={{
+                         padding: '12px 16px', borderBottom: '1px solid var(--color-border)', background: 'var(--color-surface)',
+                         display: 'flex', flexDirection: 'column', gap: 10
+                      }}>
+                        {/* Fila superior: Producto */}
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+                           <div>
+                             <div style={{ fontWeight: 700, fontSize: 13, lineHeight: '1.3' }}>{item.producto.nombre}</div>
+                             <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 4 }}>
+                               <span className="mono" style={{ fontSize: 11, color: 'var(--color-text-dim)' }}>{item.producto.codigo}</span>
+                               <span style={{ fontSize: 10, fontWeight: 700, padding: '1px 6px', borderRadius: 8, background: item.producto.stock_actual <= item.producto.stock_minimo ? 'rgba(239, 68, 68, 0.15)' : 'rgba(148, 163, 184, 0.15)', color: item.producto.stock_actual <= item.producto.stock_minimo ? 'var(--color-danger)' : 'var(--color-text-muted)' }}>Stock: {item.producto.stock_actual}</span>
+                               {ordenId && <span className="mono" style={{ fontSize: 10, padding: '1px 6px', borderRadius: 8, background: 'rgba(108,117,246,0.12)', color: '#6c75f6', fontWeight: 600 }}>Pedido: {item.pedido_cantidad ?? '—'}</span>}
+                             </div>
+                           </div>
+                           <button className="btn btn-ghost btn-sm" style={{ padding: '6px', color: 'var(--color-danger)', marginLeft: 8 }} onClick={() => setItems(items.filter((_, i) => i !== idx))}>
+                             <Trash2 size={16} />
+                           </button>
+                        </div>
+                        
+                        {/* Fila Inferior: Controles */}
+                        <div style={{ display: 'flex', gap: '8px 12px', flexWrap: 'wrap', alignItems: 'flex-end' }}>
+                           
+                           {/* Cantidad */}
+                           <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                             <span style={{ fontSize: 10, fontWeight: 600, color: 'var(--color-text-muted)', textTransform: 'uppercase' }}>Cant.</span>
+                             <div style={{ display: 'flex', alignItems: 'center', background: 'var(--color-surface-2)', borderRadius: 6, padding: 2, border: '1px solid var(--color-border)' }}>
+                                <button className="btn btn-ghost btn-sm" style={{ padding: '6px', height: 'auto', borderRadius: 4 }} onClick={() => { const n = [...items]; const c = Math.max(1, n[idx].cantidad - 1); n[idx] = { ...n[idx], cantidad: c }; setItems(n); }}><Minus size={14} /></button>
+                                <input className="input mono" type="number" min={1} value={item.cantidad} style={{ width: 44, padding: 0, textAlign: 'center', fontSize: 14, background: 'transparent', border: 'none', fontWeight: 700 }} onChange={e => { const n = [...items]; n[idx] = { ...n[idx], cantidad: Number(e.target.value) || 1 }; setItems(n); }} />
+                                <button className="btn btn-ghost btn-sm" style={{ padding: '6px', height: 'auto', borderRadius: 4 }} onClick={() => { const n = [...items]; n[idx] = { ...n[idx], cantidad: n[idx].cantidad + 1 }; setItems(n); }}><PlusIcon size={14} /></button>
+                             </div>
+                           </div>
+
+                           {/* Costo */}
+                           <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                             <span style={{ fontSize: 10, fontWeight: 600, color: 'var(--color-text-muted)', textTransform: 'uppercase' }}>Costo U.</span>
+                             <div style={{ padding: 2, background: 'var(--color-surface)', borderRadius: 6, border: '1px solid var(--color-border)' }}>
+                               <input className="input mono" type="number" step="0.01" value={item.precio_costo} style={{ width: 70, padding: '6px', textAlign: 'right', fontSize: 13, border: 'none', background: 'transparent' }} onChange={e => { const n = [...items]; n[idx] = { ...n[idx], precio_costo: Number(e.target.value) || 0 }; setItems(n); }} />
+                             </div>
+                           </div>
+
+                           {/* Venta con Multiplicador en Select */}
+                           <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                               <span style={{ fontSize: 10, fontWeight: 600, color: 'var(--color-text-muted)', textTransform: 'uppercase' }}>Venta</span>
+                               <span style={{ fontSize: 9, color: 'var(--color-text-dim)' }}>${item.producto.precio_venta.toFixed(2)}</span>
+                             </div>
+                             <div style={{ display: 'flex', background: 'var(--color-surface)', borderRadius: 6, border: '1px solid var(--color-border)', overflow: 'hidden' }}>
+                               <input className="input mono" type="number" step="1" min={0} value={item.precio_venta} style={{ width: 66, padding: '6px', textAlign: 'right', fontSize: 13, border: 'none', background: 'transparent', borderRadius: 0 }} onChange={e => { const v = parseFloat(e.target.value); const entero = isNaN(v) ? 0 : Math.ceil(v); const n = [...items]; n[idx] = { ...n[idx], precio_venta: entero }; setItems(n); }} />
+                               <select 
+                                 disabled={sinCosto}
+                                 className="mono" 
+                                 title="Aplicar multiplicador de costo"
+                                 style={{ padding: '0 4px', border: 'none', borderLeft: '1px solid var(--color-border)', background: 'var(--color-surface-2)', width: 44, fontSize: 11, fontWeight: 700, color: 'var(--color-text)', cursor: sinCosto ? 'not-allowed' : 'pointer' }}
+                                 onChange={(e) => { 
+                                   if(e.target.value) aplicarMultiplicador(Number(e.target.value)); 
+                                   e.target.value = ''; 
+                                 }}
+                               >
+                                  <option value="">×?</option>
+                                  {MULTIPLICADORES.map(m => <option key={m} value={m}>×{m}</option>)}
+                               </select>
+                             </div>
+                           </div>
+
+                           {/* Totales */}
+                           <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginLeft: 'auto', textAlign: 'right' }}>
+                             <span style={{ fontSize: 10, fontWeight: 600, textTransform: 'uppercase', color: excede ? 'var(--color-warning)' : 'var(--color-text-dim)' }}>{excede ? 'Excede Pedido' : 'Subtotal'}</span>
+                             <span className="mono" style={{ fontSize: 15, fontWeight: 800, color: 'var(--color-primary)', padding: '4px 0' }}>{fmt(item.cantidad * item.precio_costo)}</span>
+                           </div>
+
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
               )}
             </div>
           </div>
 
           {/* Derecha — resumen / metadatos */}
-          <div className="recepcion-col-right" style={{ display: 'flex', flexDirection: 'column', minHeight: 0, background: 'var(--color-surface)' }}>
+          <div className={`pos-pdv-cart${showCartMobile ? ' open' : ''}`} style={{ display: 'flex', flexDirection: 'column', background: 'var(--color-surface)', minHeight: 0, minWidth: 0 }}>
+            {/* Header móvil con botón cerrar (sólo se ve en mobile via CSS) */}
+            <button
+              onClick={() => setShowCartMobile(false)}
+              aria-label="Cerrar confirmación"
+              className="pos-cart-close"
+              style={{
+                display: 'none', alignItems: 'center', gap: 8, padding: '10px 14px',
+                background: 'var(--color-surface-2)', border: 'none', borderBottom: '1px solid var(--color-border)',
+                cursor: 'pointer', fontSize: 14, fontWeight: 700, color: 'var(--color-text)',
+                justifyContent: 'space-between', width: '100%',
+              }}
+            >
+              <span>Confirmar Recepción</span>
+              <X size={18} />
+            </button>
             <div style={{ padding: '14px 16px', display: 'flex', flexDirection: 'column', gap: 12, flex: 1, overflow: 'auto' }}>
               <div>
                 <label style={labelStyle}>RECIBIR CONTRA PEDIDO (OPCIONAL)</label>
@@ -538,6 +535,19 @@ export default function Recepcion() {
             </div>
           </div>
         </div>
+
+        {/* ─── FAB para Revisar y Confirmar en Móvil ─── */}
+        <button
+          className="pos-fab pos-show-mobile-flex"
+          style={{ position: 'fixed', bottom: 20, right: 20, zIndex: 80 }}
+          onClick={() => setShowCartMobile(true)}
+          title="Revisar y Confirmar"
+        >
+          <PackagePlus size={24} />
+          {items.length > 0 && (
+            <span className="pos-fab-badge">{items.length}</span>
+          )}
+        </button>
       </div>
     );
   };
@@ -576,7 +586,7 @@ export default function Recepcion() {
           </div>
 
           <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
-            <table className="recepcion-detalle-table" style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+            <table className="recepcion-detalle-table responsive-table" style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
               <thead>
                 <tr style={{ background: 'var(--color-surface-2)', fontSize: 11, fontWeight: 600, color: 'var(--color-text-dim)', textTransform: 'uppercase' }}>
                   <th style={{ padding: '8px 12px', textAlign: 'left' }}>Producto</th>
@@ -588,15 +598,15 @@ export default function Recepcion() {
               <tbody>
                 {items.map(i => (
                   <tr key={i.id} style={{ borderBottom: '1px solid var(--color-border)' }}>
-                    <td style={{ padding: '8px 12px' }}>
+                    <td data-label="Producto" style={{ padding: '8px 12px' }}>
                       <div style={{ fontWeight: 600 }}>{i.producto_nombre}</div>
                       <div className="mono" style={{ fontSize: 11, color: 'var(--color-text-dim)' }}>{i.producto_codigo}</div>
                     </td>
-                    <td className="mono" style={{ padding: '8px 12px', textAlign: 'center', fontWeight: 700, color: '#22b378' }}>
+                    <td data-label="Cantidad" className="mono" style={{ padding: '8px 12px', textAlign: 'center', fontWeight: 700, color: '#22b378' }}>
                       +{i.cantidad}
                     </td>
-                    <td className="mono" style={{ padding: '8px 12px', textAlign: 'center' }}>{fmt(i.precio_costo)}</td>
-                    <td className="mono" style={{ padding: '8px 12px', textAlign: 'right', fontWeight: 700 }}>
+                    <td data-label="Costo Unitario" className="mono" style={{ padding: '8px 12px', textAlign: 'center' }}>{fmt(i.precio_costo)}</td>
+                    <td data-label="Subtotal" className="mono" style={{ padding: '8px 12px', textAlign: 'right', fontWeight: 700 }}>
                       {fmt(i.cantidad * i.precio_costo)}
                     </td>
                   </tr>
@@ -623,21 +633,27 @@ export default function Recepcion() {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
-      <div style={{
+      <div className="pos-page-header" style={{
         padding: '12px 20px', borderBottom: '1px solid var(--color-border)',
-        background: 'var(--color-surface)', display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        background: 'var(--color-surface)', display: 'flex', flexDirection: 'column', gap: 10,
       }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-          <TruckIcon size={20} style={{ color: 'var(--color-primary)' }} />
-          <h2 style={{ fontSize: 17, fontWeight: 800, color: 'var(--color-text)' }}>Recepción de Mercancía</h2>
-          <span style={{ fontSize: 12, color: 'var(--color-text-dim)' }}>·</span>
-          <span style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>{recepciones.length} recepciones</span>
-        </div>
-        <div style={{ display: 'flex', gap: 8 }}>
-          <button className="btn btn-ghost" onClick={cargarDatos}><RefreshCw size={14} /></button>
-          <button className="btn btn-primary" onClick={() => setVista('crear')}>
-            <Plus size={16} /> Nueva Recepción
-          </button>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+            <TruckIcon size={20} style={{ color: 'var(--color-primary)' }} />
+            <h2 style={{ fontSize: 17, fontWeight: 800, color: 'var(--color-text)' }}>Recepción de Mercancía</h2>
+            <span className="pos-header-stats" style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
+              <span style={{ fontSize: 12, color: 'var(--color-text-dim)' }}>·</span>
+              <span style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>{recepciones.length} recepciones</span>
+            </span>
+          </div>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button className="btn btn-ghost" onClick={cargarDatos} title="Actualizar">
+              <RefreshCw size={16} />
+            </button>
+            <button className="btn btn-primary pos-hide-mobile" onClick={() => setVista('crear')}>
+              <Plus size={16} /> Nueva Recepción
+            </button>
+          </div>
         </div>
       </div>
 
@@ -690,6 +706,16 @@ export default function Recepcion() {
           </div>
         )}
       </div>
+
+      {/* ─── FAB para Nueva Recepción (Mobile) ─── */}
+      <button
+        className="pos-fab pos-show-mobile-flex"
+        style={{ position: 'fixed', bottom: 20, right: 20, zIndex: 90 }}
+        onClick={() => setVista('crear')}
+        title="Nueva Recepción"
+      >
+        <Plus size={24} />
+      </button>
     </div>
   );
 }

@@ -56,6 +56,7 @@ export interface FiltrosBusqueda {
   fecha_inicio?: string;
   fecha_fin?: string;
   cliente_texto?: string;
+  articulo_texto?: string;
   limite?: number;
 }
 
@@ -97,18 +98,21 @@ export interface DevolucionResumen {
 interface HistorialState {
   ventas: VentaResumen[];
   devoluciones: DevolucionResumen[];
+  ventasDetalladas: Record<number, VentaDetalleCompleto>;
   cargando: boolean;
 
   buscarVentas: (filtros: FiltrosBusqueda) => Promise<VentaResumen[]>;
   obtenerDetalleVenta: (ventaId: number) => Promise<VentaDetalleCompleto>;
+  obtenerDetalleCached: (ventaId: number) => Promise<VentaDetalleCompleto>;
   anularVenta: (ventaId: number, usuarioId: number, motivo: string) => Promise<boolean>;
   crearDevolucion: (datos: NuevaDevolucion) => Promise<DevolucionCreada>;
   listarDevoluciones: (limite?: number) => Promise<void>;
 }
 
-export const useHistorialStore = create<HistorialState>((set) => ({
+export const useHistorialStore = create<HistorialState>((set, get) => ({
   ventas: [],
   devoluciones: [],
+  ventasDetalladas: {},
   cargando: false,
 
   buscarVentas: async (filtros) => {
@@ -119,6 +123,7 @@ export const useHistorialStore = create<HistorialState>((set) => ({
         fechaInicio: filtros.fecha_inicio || null,
         fechaFin: filtros.fecha_fin || null,
         clienteTexto: filtros.cliente_texto || null,
+        articuloTexto: filtros.articulo_texto || null,
         limite: filtros.limite || 100,
       });
       set({ ventas: rows, cargando: false });
@@ -131,6 +136,14 @@ export const useHistorialStore = create<HistorialState>((set) => ({
 
   obtenerDetalleVenta: async (ventaId) => {
     return invoke<VentaDetalleCompleto>('obtener_detalle_venta', { ventaId });
+  },
+
+  obtenerDetalleCached: async (ventaId: number) => {
+    const cached = get().ventasDetalladas[ventaId];
+    if (cached) return cached;
+    const detalle = await invoke<VentaDetalleCompleto>('obtener_detalle_venta', { ventaId });
+    set((s) => ({ ventasDetalladas: { ...s.ventasDetalladas, [ventaId]: detalle } }));
+    return detalle;
   },
 
   anularVenta: async (ventaId, usuarioId, motivo) => {

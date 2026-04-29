@@ -74,7 +74,7 @@ export default function Bitacora() {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
       {/* Header */}
-      <div style={{
+      <div className="pos-page-header" style={{
         padding: '12px 20px',
         borderBottom: '1px solid var(--color-border)',
         background: 'var(--color-surface)',
@@ -92,7 +92,7 @@ export default function Bitacora() {
           </button>
         </div>
 
-        <div style={{ display: 'flex', gap: 8 }}>
+        <div className="pos-filter-row" style={{ display: 'flex', gap: 8 }}>
           <div style={{ position: 'relative', flex: 1 }}>
             <Search size={16} style={{
               position: 'absolute', left: 12, top: '50%', transform: 'translateY(-50%)',
@@ -146,6 +146,7 @@ export default function Bitacora() {
               const badge = getBadgeColor(e.accion);
               return (
                 <div
+                  className="pos-list-row"
                   key={e.id}
                   style={{
                     display: 'flex', alignItems: 'center', gap: 14,

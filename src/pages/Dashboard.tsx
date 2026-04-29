@@ -57,7 +57,7 @@ export default function Dashboard() {
 
   const esAdmin = usuario?.es_admin ?? false;
 
-  // Verificar corte del día pendiente al iniciar
+  // Verificar cierre de caja pendiente al iniciar
   useEffect(() => {
     invoke<string | null>('verificar_corte_dia_pendiente')
       .then(fecha => setCortePendiente(fecha))
@@ -159,11 +159,11 @@ export default function Dashboard() {
           </span>
         </div>
 
-        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexShrink: 0 }}>
           {/* Sync indicator */}
           <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
             <span className="sync-dot sync-ok" />
-            <span style={{ fontSize: 11, color: 'var(--color-text-muted)' }}>Local</span>
+            <span className="pos-hide-mobile" style={{ fontSize: 11, color: 'var(--color-text-muted)' }}>Local</span>
           </div>
 
           {/* Usuario */}
@@ -175,12 +175,12 @@ export default function Dashboard() {
             <div style={{
               width: 24, height: 24, borderRadius: '50%', background: 'var(--color-primary)',
               display: 'flex', alignItems: 'center', justifyContent: 'center',
-              fontSize: 11, fontWeight: 700, color: '#fff',
+              fontSize: 11, fontWeight: 700, color: '#fff', flexShrink: 0,
             }}>
               {usuario?.nombre_completo.charAt(0).toUpperCase()}
             </div>
-            <span style={{ fontSize: 13, fontWeight: 600 }}>{usuario?.nombre_completo}</span>
-            <span style={{
+            <span className="pos-hide-mobile" style={{ fontSize: 13, fontWeight: 600 }}>{usuario?.nombre_completo}</span>
+            <span className="pos-hide-mobile" style={{
               fontSize: 10, padding: '1px 6px', borderRadius: 10,
               background: esAdmin ? 'rgba(216,56,77,0.12)' : 'rgba(158,122,126,0.12)',
               color: esAdmin ? 'var(--color-primary)' : 'var(--color-text-muted)',
@@ -191,7 +191,7 @@ export default function Dashboard() {
           </div>
 
           <button className="btn btn-ghost btn-sm" onClick={logout}>
-            <LogOut size={14} /> F12
+            <LogOut size={14} /> <span className="pos-hide-mobile">F12</span>
           </button>
         </div>
       </div>
@@ -236,17 +236,17 @@ export default function Dashboard() {
       {/* ─── Contenido ─── */}
       <div style={{ overflow: 'hidden', display: 'flex', flexDirection: 'column', minHeight: 0, minWidth: 0 }}>
 
-        {/* Alerta de corte del día pendiente */}
+        {/* Alerta de cierre de caja pendiente */}
         {cortePendiente && (
           <div style={{
             padding: '10px 20px', background: 'rgba(245,158,11,0.12)',
             borderBottom: '1px solid rgba(245,158,11,0.4)',
             display: 'flex', alignItems: 'center', gap: 12,
-            flexShrink: 0,
+            flexShrink: 0, flexWrap: 'wrap',
           }}>
             <span style={{ fontSize: 15 }}>⚠️</span>
-            <span style={{ fontSize: 13, fontWeight: 600, flex: 1, color: 'var(--color-warning)' }}>
-              No se hizo el corte del día del {cortePendiente}. Realiza el cierre antes de continuar.
+            <span style={{ fontSize: 13, fontWeight: 600, flex: '1 1 200px', color: 'var(--color-warning)' }}>
+              No se hizo el cierre de caja del {cortePendiente}. Realiza el cierre antes de continuar.
             </span>
             <button
               className="btn btn-sm"
@@ -271,10 +271,10 @@ export default function Dashboard() {
             padding: '10px 20px', background: 'rgba(239,68,68,0.10)',
             borderBottom: '1px solid rgba(239,68,68,0.4)',
             display: 'flex', alignItems: 'center', gap: 12,
-            flexShrink: 0,
+            flexShrink: 0, flexWrap: 'wrap',
           }}>
             <span style={{ fontSize: 15 }}>📉</span>
-            <span style={{ fontSize: 13, fontWeight: 600, flex: 1, color: 'var(--color-danger)' }}>
+            <span style={{ fontSize: 13, fontWeight: 600, flex: '1 1 200px', color: 'var(--color-danger)' }}>
               {stockBajoCount} producto{stockBajoCount !== 1 ? 's' : ''} con stock bajo o agotado.
             </span>
             <button
@@ -294,21 +294,32 @@ export default function Dashboard() {
           </div>
         )}
 
-        {modulo === 'venta' && <PuntoDeVenta />}
-        {modulo === 'catalogo' && <Catalogo />}
+        {/* Módulos con persistencia de estado (keep-alive via CSS) */}
+        <div style={{ display: modulo === 'venta' ? 'flex' : 'none', flexDirection: 'column', flex: 1, overflow: 'hidden' }}>
+          <PuntoDeVenta />
+        </div>
+        <div style={{ display: modulo === 'recepcion' ? 'flex' : 'none', flexDirection: 'column', flex: 1, overflow: 'hidden' }}>
+          <RecepcionPage />
+        </div>
+        <div style={{ display: modulo === 'presupuestos' ? 'flex' : 'none', flexDirection: 'column', flex: 1, overflow: 'hidden' }}>
+          <Presupuestos onIrAVenta={() => setModulo('venta')} />
+        </div>
+        <div style={{ display: modulo === 'catalogo' ? 'flex' : 'none', flexDirection: 'column', flex: 1, overflow: 'hidden' }}>
+          <Catalogo />
+        </div>
+
+        {/* Módulos sin persistencia necesaria (renderizado condicional normal) */}
         {modulo === 'usuarios' && <UsuariosPage />}
         {modulo === 'clientes' && <ClientesPage />}
         {modulo === 'dashboard' && (
           <DashboardHome stats={stats} fmt={fmt} stockBajo={stockBajoCount} onVerInventario={() => setModulo('catalogo')} />
         )}
         {modulo === 'bitacora' && <Bitacora />}
-        {modulo === 'presupuestos' && <Presupuestos onIrAVenta={() => setModulo('venta')} />}
-        {modulo === 'recepcion' && <RecepcionPage />}
         {modulo === 'pedidos' && <PedidosPage />}
         {modulo === 'etiquetas' && <EtiquetasPage />}
         {modulo === 'historial' && <HistorialVentas />}
         {modulo === 'reportes' && <Reportes />}
-        {modulo === 'cortes' && (
+        <div style={{ display: modulo === 'cortes' ? 'flex' : 'none', flexDirection: 'column', flex: 1, overflow: 'hidden' }}>
           <CortesCaja
             triggerMovimiento={triggerMovimiento}
             triggerParcial={triggerParcial}
@@ -316,7 +327,7 @@ export default function Dashboard() {
             fechaObjetivoDia={cortePendiente}
             onCorteDiaHecho={() => setCortePendiente(null)}
           />
-        )}
+        </div>
         {modulo === 'ajustes' && <Ajustes />}
         {modulo === 'conexion' && <ConexionMovil />}
         {modulo === 'sincronizacion' && <Sincronizacion />}

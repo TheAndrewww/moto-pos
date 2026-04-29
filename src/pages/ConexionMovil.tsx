@@ -114,7 +114,7 @@ export default function ConexionMovil() {
 
   return (
     <div style={{ padding: 24, overflow: 'auto', height: '100%' }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 20 }}>
+      <div className="pos-page-header" style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 20 }}>
         <Smartphone size={22} />
         <h2 style={{ margin: 0 }}>Conexión móvil</h2>
         {info?.activo ? (
@@ -137,7 +137,7 @@ export default function ConexionMovil() {
         </div>
       )}
 
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 24 }}>
+      <div className="pos-2col-grid" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 24 }}>
 
         {/* === IZQ: QR + IP === */}
         <div className="card">

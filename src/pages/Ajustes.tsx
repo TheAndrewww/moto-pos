@@ -137,7 +137,7 @@ export default function Ajustes() {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
-      <div style={{
+      <div className="pos-page-header" style={{
         padding: '12px 20px', borderBottom: '1px solid var(--color-border)',
         background: 'var(--color-surface)', display: 'flex', alignItems: 'center', gap: 10,
       }}>
@@ -352,11 +352,11 @@ export default function Ajustes() {
 
       {/* ─── Modal confirmar restaurar ─── */}
       {confirmarRestaurar && (
-        <div style={{
+        <div className="pos-modal-overlay" style={{
           position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)',
           display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 200,
         }} onClick={() => setConfirmarRestaurar(null)}>
-          <div className="card animate-fade-in" style={{ width: 420, padding: 24 }} onClick={e => e.stopPropagation()}>
+          <div className="card pos-modal-content pos-modal-fluid animate-fade-in" style={{ width: 420, maxWidth: '100%', padding: 24 }} onClick={e => e.stopPropagation()}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10 }}>
               <AlertTriangle size={20} style={{ color: 'var(--color-warning)' }} />
               <h3 style={{ fontSize: 16, fontWeight: 700, margin: 0 }}>Restaurar respaldo</h3>

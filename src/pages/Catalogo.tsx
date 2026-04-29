@@ -4,7 +4,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { useProductStore, type Producto, type NuevoProducto } from '../store/productStore';
 import { useAuthStore } from '../store/authStore';
-import { Package, Plus, Search, Edit2, X, AlertTriangle, Tag, Hash, LayoutGrid, List, Upload, History, Trash2 } from 'lucide-react';
+import { Package, Plus, Search, Edit2, X, AlertTriangle, Tag, Hash, LayoutGrid, List, Upload, History, Trash2, SlidersHorizontal } from 'lucide-react';
 import { invoke } from '../lib/invokeCompat';
 import { useVirtualizer } from '@tanstack/react-virtual';
 
@@ -23,6 +23,7 @@ export default function Catalogo() {
   const [filtroCategoria, setFiltroCategoria] = useState<number | null>(null);
   const [filtroProveedor, setFiltroProveedor] = useState<number | null>(null);
   const [filtroStock, setFiltroStock] = useState<'todos' | 'bajo' | 'cero'>('todos');
+  const [showFiltrosMobile, setShowFiltrosMobile] = useState(false);
   const [vista, setVista] = useState<'grid' | 'lista'>('grid');
   const [localBusqueda, setLocalBusqueda] = useState(busqueda);
   const [confirmarEliminar, setConfirmarEliminar] = useState<Producto | null>(null);
@@ -84,7 +85,7 @@ export default function Catalogo() {
   const virtualizer = useVirtualizer({
     count: rowCount,
     getScrollElement: () => parentRef.current,
-    estimateSize: () => vista === 'lista' ? 56 : 210, // 56px for list, 210px for grid
+    estimateSize: () => vista === 'lista' ? 56 : 250, // 56px for list, 250px for grid to prevent text wrapping cutoff
     overscan: 3,
   });
 
@@ -465,7 +466,7 @@ export default function Catalogo() {
               </span>
             </span>
           </div>
-          <div style={{ display: 'flex', gap: 8 }}>
+          <div className="pos-hide-mobile" style={{ display: 'flex', gap: 8 }}>
             {esAdmin && (
               <button className="btn btn-secondary" onClick={() => setShowImportar(true)} title="Importar catálogo CSV">
                 <Upload size={16} /> Importar
@@ -481,26 +482,45 @@ export default function Catalogo() {
 
         {/* Search + filters + view toggle */}
         <div className="pos-filter-row" style={{ display: 'flex', gap: 8 }}>
-          <div style={{ position: 'relative', flex: 1 }}>
-            <Search size={16} style={{
-              position: 'absolute', left: 12, top: '50%', transform: 'translateY(-50%)',
-              color: 'var(--color-text-dim)',
-            }} />
-            <input
-              className="input"
-              placeholder="Buscar por nombre, código, descripción..."
-              value={localBusqueda}
-              onChange={e => {
-                const v = e.target.value;
-                setLocalBusqueda(v);
-                if (debounceRef.current) clearTimeout(debounceRef.current);
-                debounceRef.current = setTimeout(() => setBusqueda(v), 150);
+          <div style={{ display: 'flex', gap: 8, flex: 1 }}>
+            <div style={{ position: 'relative', flex: 1 }}>
+              <Search size={16} style={{
+                position: 'absolute', left: 12, top: '50%', transform: 'translateY(-50%)',
+                color: 'var(--color-text-dim)',
+              }} />
+              <input
+                className="input pos-input-icon"
+                placeholder="Buscar por nombre, código, descripción..."
+                value={localBusqueda}
+                onChange={e => {
+                  const v = e.target.value;
+                  setLocalBusqueda(v);
+                  if (debounceRef.current) clearTimeout(debounceRef.current);
+                  debounceRef.current = setTimeout(() => setBusqueda(v), 150);
+                }}
+                style={{ paddingLeft: 36, width: '100%' }}
+              />
+            </div>
+            
+            {/* Filter Toggle (Mobile only) */}
+            <button 
+              className="pos-show-mobile-flex btn btn-ghost" 
+              onClick={() => setShowFiltrosMobile(!showFiltrosMobile)}
+              style={{
+                background: showFiltrosMobile ? 'var(--color-primary-soft)' : 'var(--color-surface-2)',
+                color: showFiltrosMobile ? 'var(--color-primary)' : 'var(--color-text)',
+                padding: '0 12px',
+                border: '1px solid var(--color-border)',
+                borderRadius: 8,
               }}
-              style={{ paddingLeft: 36, width: '100%' }}
-            />
+              title="Filtros"
+            >
+              <SlidersHorizontal size={18} />
+            </button>
           </div>
+
           <select
-            className="input"
+            className={`input ${!showFiltrosMobile ? 'pos-hide-mobile' : ''}`}
             value={filtroCategoria || ''}
             onChange={e => setFiltroCategoria(e.target.value ? Number(e.target.value) : null)}
             style={{ width: 150 }}
@@ -509,7 +529,7 @@ export default function Catalogo() {
             {categorias.map(c => <option key={c.id} value={c.id}>{c.nombre}</option>)}
           </select>
           <select
-            className="input"
+            className={`input ${!showFiltrosMobile ? 'pos-hide-mobile' : ''}`}
             value={filtroProveedor || ''}
             onChange={e => setFiltroProveedor(e.target.value ? Number(e.target.value) : null)}
             style={{ width: 150 }}
@@ -518,7 +538,7 @@ export default function Catalogo() {
             {proveedores.map(p => <option key={p.id} value={p.id}>{p.nombre}</option>)}
           </select>
           <select
-            className="input"
+            className={`input ${!showFiltrosMobile ? 'pos-hide-mobile' : ''}`}
             value={filtroStock}
             onChange={e => setFiltroStock(e.target.value as any)}
             style={{ width: 140 }}
@@ -529,7 +549,7 @@ export default function Catalogo() {
           </select>
 
           {/* View Toggle */}
-          <div style={{ display: 'flex', background: 'var(--color-surface-2)', borderRadius: 8, padding: 2, border: '1px solid var(--color-border)' }}>
+          <div className={!showFiltrosMobile ? 'pos-hide-mobile' : ''} style={{ display: 'flex', background: 'var(--color-surface-2)', borderRadius: 8, padding: 2, border: '1px solid var(--color-border)' }}>
             <button
               onClick={() => setVista('grid')}
               style={{
@@ -585,6 +605,8 @@ export default function Catalogo() {
               return (
                 <div
                   key={virtualRow.index}
+                  ref={virtualizer.measureElement}
+                  data-index={virtualRow.index}
                   style={{
                     position: 'absolute',
                     top: 0,
@@ -900,6 +922,17 @@ export default function Catalogo() {
           </div>
         </div>
       )}
+
+      {/* ─── FAB para Nuevo Producto (Mobile) ─── */}
+      {puedeCrear && (
+        <button
+          className="pos-fab pos-show-mobile-flex"
+          style={{ position: 'fixed', bottom: 20, right: 20, zIndex: 90 }}
+          onClick={() => { setEditando(null); setShowForm(true); }}
+        >
+          <Plus size={24} />
+        </button>
+      )}
     </div>
   );
 }
@@ -1056,13 +1089,37 @@ interface ResultadoImportacion {
 }
 
 function ImportarModal({ onClose, onDone }: { onClose: () => void; onDone: () => void }) {
-  const [ruta, setRuta] = useState('/Users/andrewww/Downloads/catalogo.csv');
+  const [ruta, setRuta] = useState('');
+  const [nombreArchivo, setNombreArchivo] = useState('');
   const [reemplazar, setReemplazar] = useState(true);
   const [ejecutando, setEjecutando] = useState(false);
   const [resultado, setResultado] = useState<ResultadoImportacion | null>(null);
   const [error, setError] = useState('');
 
+  const seleccionarArchivo = async () => {
+    try {
+      const { open } = await import('@tauri-apps/plugin-dialog');
+      const selected = await open({
+        multiple: false,
+        filters: [{
+          name: 'Archivos CSV',
+          extensions: ['csv', 'txt'],
+        }],
+      });
+      if (selected) {
+        const path = typeof selected === 'string' ? selected : selected;
+        setRuta(path as string);
+        // Extraer nombre del archivo
+        const parts = (path as string).split('/');
+        setNombreArchivo(parts[parts.length - 1] || '');
+      }
+    } catch (e) {
+      setError('Error al abrir selector de archivos: ' + String(e));
+    }
+  };
+
   const ejecutar = async () => {
+    if (!ruta.trim()) { setError('Selecciona un archivo primero'); return; }
     setError('');
     setResultado(null);
     setEjecutando(true);
@@ -1092,9 +1149,43 @@ function ImportarModal({ onClose, onDone }: { onClose: () => void; onDone: () =>
           <code style={{ fontSize: 11 }}>codigo | nombre | precio_venta | stock | proveedor</code>
         </p>
 
-        <label style={{ fontSize: 12, fontWeight: 600, display: 'block', marginBottom: 4 }}>RUTA DEL ARCHIVO</label>
-        <input className="input" value={ruta} onChange={e => setRuta(e.target.value)}
-          placeholder="/Users/.../catalogo.csv" disabled={ejecutando} />
+        {/* Selector de archivo */}
+        <label style={{ fontSize: 12, fontWeight: 600, display: 'block', marginBottom: 6 }}>ARCHIVO CSV</label>
+        <div
+          onClick={!ejecutando ? seleccionarArchivo : undefined}
+          style={{
+            padding: '16px 20px', borderRadius: 10,
+            border: `2px dashed ${ruta ? 'var(--color-success)' : 'var(--color-border)'}`,
+            background: ruta ? 'rgba(34,197,94,0.04)' : 'var(--color-surface-2)',
+            cursor: ejecutando ? 'not-allowed' : 'pointer',
+            textAlign: 'center',
+            transition: 'all 0.15s',
+          }}
+        >
+          {ruta ? (
+            <div>
+              <p style={{ fontSize: 14, fontWeight: 700, color: 'var(--color-success)' }}>
+                ✅ {nombreArchivo}
+              </p>
+              <p style={{ fontSize: 11, color: 'var(--color-text-dim)', marginTop: 4 }}>
+                {ruta}
+              </p>
+              <p style={{ fontSize: 11, color: 'var(--color-text-muted)', marginTop: 4 }}>
+                Clic para cambiar archivo
+              </p>
+            </div>
+          ) : (
+            <div>
+              <Upload size={24} style={{ color: 'var(--color-text-dim)', marginBottom: 6 }} />
+              <p style={{ fontSize: 14, fontWeight: 600, color: 'var(--color-text-muted)' }}>
+                Clic para seleccionar archivo
+              </p>
+              <p style={{ fontSize: 11, color: 'var(--color-text-dim)', marginTop: 2 }}>
+                Archivos .csv o .txt
+              </p>
+            </div>
+          )}
+        </div>
 
         <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 12, cursor: 'pointer' }}>
           <input type="checkbox" checked={reemplazar} onChange={e => setReemplazar(e.target.checked)} disabled={ejecutando} />

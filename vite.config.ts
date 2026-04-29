@@ -25,5 +25,8 @@ export default defineConfig(async () => ({
     watch: {
       ignored: ["**/src-tauri/**"],
     },
+    proxy: {
+      '/rpc': 'http://localhost:3000'
+    }
   },
 }));

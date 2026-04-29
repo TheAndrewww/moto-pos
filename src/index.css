@@ -401,6 +401,10 @@
   border: 2px solid var(--color-bg);
 }
 
+/* Clases exclusivas para mobile (ocultas en escritorio) */
+.pos-show-mobile { display: none !important; }
+.pos-show-mobile-flex { display: none !important; }
+
 /* ============================================================
    MEDIA QUERY MOBILE (≤768px)
    ============================================================ */
@@ -448,14 +452,18 @@
   }
 
   /* Topbar más compacto y sin overflow */
-  .pos-topbar { padding: 0 8px; gap: 4px; }
+  .pos-topbar { padding: 0 8px; gap: 4px; overflow-x: auto; }
   .pos-topbar > div { gap: 6px !important; }
+  .pos-hide-mobile { display: none !important; }
+  .pos-show-mobile { display: block !important; }
+  .pos-show-mobile-flex { display: flex !important; }
 
   /* Botones del sidebar más altos para dedo */
   .pos-sidebar button { padding: 14px 14px !important; font-size: 14px !important; }
 
   /* Inputs más grandes (44px+ es lo que recomienda Apple para touch) */
   .input { padding: 12px 14px !important; font-size: 15px !important; }
+  .pos-input-icon { padding-left: 36px !important; }
   .btn { padding: 10px 14px !important; font-size: 14px !important; min-height: 40px; }
   .btn-sm { padding: 8px 12px !important; font-size: 13px !important; min-height: 36px; }
   .btn-lg { padding: 14px 20px !important; font-size: 16px !important; min-height: 48px; }
@@ -571,29 +579,57 @@
     display: flex !important;
   }
 
-  /* Items del carrito → layout más compacto, sin columna de subtotal grande */
+  /* Items del carrito → tarjeta ultra-compacta */
   .cart-item {
-    grid-template-columns: 1fr !important;
-    gap: 6px !important;
-    padding: 8px 10px !important;
+    display: grid !important;
+    grid-template-columns: auto 1fr auto !important;
+    grid-template-areas: 
+      "producto producto quitar"
+      "cantidad precio subtotal" !important;
+    gap: 12px 8px !important;
+    padding: 12px !important;
     border-bottom: 1px solid var(--color-border);
     border-radius: 0 !important;
   }
-  .cart-item > * { text-align: left !important; }
+  .cart-item > div:nth-child(1) { grid-area: producto; }
+  .cart-item > div:nth-child(2) { grid-area: cantidad; justify-content: flex-start !important; }
+  .cart-item > div:nth-child(3) { grid-area: precio; text-align: left !important; }
+  .cart-item > div:nth-child(3) > div { justify-content: flex-start !important; }
+  .cart-item > div:nth-child(4) { grid-area: subtotal; text-align: right !important; }
+  .cart-item > button:nth-child(5) { 
+    grid-area: quitar; 
+    margin: -4px -4px 0 0; 
+    padding: 8px !important; 
+    height: auto !important; 
+    align-self: start; 
+  }
 
   /* ─── HEADERS DE PÁGINA — wrap ────────────────────────── */
-  .pos-page-header,
-  .pos-filter-row {
+  .pos-page-header {
     flex-wrap: wrap !important;
     gap: 8px !important;
   }
-  .pos-filter-row > select.input,
-  .pos-filter-row > input.input {
-    width: 100% !important;
-    flex: 1 1 100% !important;
+  .pos-filter-row {
+    display: flex !important;
+    flex-wrap: wrap !important;
+    gap: 8px !important;
   }
-  .pos-filter-row > .pos-filter-search { flex: 1 1 100% !important; }
-  .pos-filter-row > div[role="filter-fixed"] { flex: 1 1 100% !important; }
+  /* El buscador en mobile ocupa el 100% */
+  .pos-filter-row > div:first-child { flex: 1 1 100% !important; }
+  
+  /* Los <select> se acomodan lado a lado equitativamente */
+  .pos-filter-row > select.input {
+    flex: 1 1 calc(33.33% - 6px) !important;
+    min-width: 0 !important;
+    padding: 10px 4px !important;
+    font-size: 12px !important;
+  }
+  
+  /* El toggle list/grid ocupa el final */
+  .pos-filter-row > div:last-child { 
+    flex: 1 1 100% !important; 
+    justify-content: flex-end !important;
+  }
 
   /* ─── TABLAS GENÉRICAS → CARDS ───────────────────────── */
   .responsive-table thead { display: none; }
@@ -625,8 +661,9 @@
 
   /* ─── ETIQUETAS — layout mobile ──────────────────────── */
   .etiquetas-content-grid {
-    grid-template-columns: 1fr !important;
-    grid-template-rows: auto auto !important;
+    display: flex !important;
+    flex-direction: column !important;
+    overflow-y: auto !important;
   }
 
   /* ─── DASHBOARD HOME — stats 2 columnas ──────────────── */

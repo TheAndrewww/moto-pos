@@ -40,6 +40,8 @@ export interface DatosCorte {
   total_entradas_efectivo: number;
   total_retiros_efectivo: number;
   efectivo_esperado: number;
+  cortes_parciales_hoy: number;
+  total_retirado_parciales: number;
   movimientos: MovimientoCaja[];
   vendedores: VendedorResumen[];
 }
@@ -86,10 +88,33 @@ export interface CorteResumen {
   tipo: string;
   usuario_nombre: string;
   created_at: string;
+  fondo_inicial: number;
+  total_ventas_efectivo: number;
+  total_ventas_tarjeta: number;
+  total_ventas_transferencia: number;
+  total_ventas: number;
+  num_transacciones: number;
+  total_entradas_efectivo: number;
+  total_retiros_efectivo: number;
   efectivo_esperado: number;
   efectivo_contado: number;
   diferencia: number;
+  nota_diferencia: string | null;
   fondo_siguiente: number;
+}
+
+export interface DenominacionDetalle {
+  denominacion: number;
+  tipo: string;
+  cantidad: number;
+  subtotal: number;
+}
+
+export interface CorteDetalle {
+  corte: CorteResumen;
+  denominaciones: DenominacionDetalle[];
+  movimientos: MovimientoCaja[];
+  vendedores: VendedorResumen[];
 }
 
 export interface NuevaApertura {
@@ -120,7 +145,9 @@ interface CortesState {
   calcularDatosCorte: (fechaInicio: string, fechaFin: string) => Promise<DatosCorte>;
   crearCorte: (datos: NuevoCorte) => Promise<CorteCreado>;
   cargarCortes: (limite?: number) => Promise<void>;
+  obtenerDetalleCorte: (id: number) => Promise<CorteDetalle>;
   verificarCorteDiaPendiente: () => Promise<string | null>;
+  obtenerInicioProximoCierre: () => Promise<string>;
   crearApertura: (datos: NuevaApertura) => Promise<AperturaCaja>;
   obtenerAperturaHoy: () => Promise<AperturaCaja | null>;
   obtenerFondoSugerido: () => Promise<number>;
@@ -171,8 +198,16 @@ export const useCortesStore = create<CortesState>((set) => ({
     set({ cortesPrevios: items });
   },
 
+  obtenerDetalleCorte: async (id) => {
+    return invoke<CorteDetalle>('obtener_detalle_corte', { id });
+  },
+
   verificarCorteDiaPendiente: async () => {
     return invoke<string | null>('verificar_corte_dia_pendiente');
+  },
+
+  obtenerInicioProximoCierre: async () => {
+    return invoke<string>('obtener_inicio_proximo_cierre');
   },
 
   crearApertura: async (datos) => {

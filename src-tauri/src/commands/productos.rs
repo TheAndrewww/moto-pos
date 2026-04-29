@@ -70,6 +70,17 @@ pub struct Proveedor {
     pub telefono: Option<String>,
     pub email: Option<String>,
     pub notas: Option<String>,
+    pub activo: bool,
+}
+
+#[derive(Deserialize)]
+pub struct ActualizarProveedor {
+    pub id: i64,
+    pub nombre: String,
+    pub contacto: Option<String>,
+    pub telefono: Option<String>,
+    pub email: Option<String>,
+    pub notas: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -95,7 +106,7 @@ pub struct ActualizarCliente {
 
 // ─── Helpers ──────────────────────────────────────────────
 
-fn normalizar_texto(texto: &str) -> String {
+pub fn normalizar_texto(texto: &str) -> String {
     texto
         .to_lowercase()
         .replace('á', "a")
@@ -602,7 +613,7 @@ pub fn listar_categorias(state: State<'_, AppState>) -> Vec<Categoria> {
 pub fn listar_proveedores(state: State<'_, AppState>) -> Vec<Proveedor> {
     let db = state.db.lock().unwrap();
     let mut stmt = db.prepare(
-        "SELECT id, nombre, contacto, telefono, email, notas FROM proveedores ORDER BY nombre"
+        "SELECT id, nombre, contacto, telefono, email, notas, activo FROM proveedores ORDER BY nombre"
     ).unwrap();
 
     stmt.query_map([], |row| {
@@ -613,6 +624,7 @@ pub fn listar_proveedores(state: State<'_, AppState>) -> Vec<Proveedor> {
             telefono: row.get(3)?,
             email: row.get(4)?,
             notas: row.get(5)?,
+            activo: row.get::<_, i64>(6)? != 0,
         })
     }).unwrap()
     .filter_map(|r| r.ok())

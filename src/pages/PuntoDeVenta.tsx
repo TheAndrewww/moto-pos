@@ -25,6 +25,7 @@ export default function PuntoDeVenta() {
   const { usuario } = useAuthStore();
 
   const [showCobro, setShowCobro] = useState(false);
+  const [showMobileTabs, setShowMobileTabs] = useState(false);
   const [showBusqueda, setShowBusqueda] = useState(false);
   const [showDescuento, setShowDescuento] = useState<number | null>(null); // index del item
   const [descPorcentaje, setDescPorcentaje] = useState('');
@@ -58,8 +59,10 @@ export default function PuntoDeVenta() {
   // Focus automático en el campo de escaneo
   useEffect(() => {
     if (!showCobro && !showBusqueda && !ventaExitosa && scanRef.current) {
-      // Limpiar el campo siempre que vuelve a tener el foco, para evitar que queden letras de una búsqueda previa
+      // Limpiar el campo y el estado de búsqueda para evitar que se reabra el dropdown
       scanRef.current.value = '';
+      setLocalSearch('');
+      setBusqueda('');
       scanRef.current.focus();
     }
   }, [showCobro, showBusqueda, ventaExitosa, items]);
@@ -247,7 +250,7 @@ export default function PuntoDeVenta() {
     return (
       <div className="animate-fade-in" style={{
         display: 'flex', alignItems: 'center', justifyContent: 'center',
-        height: '100%', flexDirection: 'column', gap: 20,
+        height: '100%', flexDirection: 'column', gap: 20, padding: 20
       }}>
         <div style={{ textAlign: 'center', display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
           <CheckCircle2 size={64} style={{ color: 'var(--color-success)', marginBottom: 12 }} />
@@ -256,7 +259,7 @@ export default function PuntoDeVenta() {
             Folio: {ventaExitosa.folio}
           </p>
         </div>
-        <div className="card" style={{ padding: 24, minWidth: 280, textAlign: 'center' }}>
+        <div className="card pos-modal-content pos-modal-fluid" style={{ padding: 24, width: '100%', maxWidth: 400, textAlign: 'center' }}>
           {ventaExitosa.cambio > 0 ? (
             <>
               <p style={{ fontSize: 18, color: 'var(--color-text-muted)', fontWeight: 600, textTransform: 'uppercase', letterSpacing: 1 }}>
@@ -272,7 +275,7 @@ export default function PuntoDeVenta() {
             </div>
           )}
         </div>
-        <div style={{ display: 'flex', gap: 10 }}>
+        <div className="pos-page-header" style={{ display: 'flex', gap: 10, justifyContent: 'center' }}>
           {ultimoTicket && (
             <button className="btn btn-ghost btn-lg" onClick={reimprimirUltimo} title="Imprimir ticket de venta">
               <Printer size={18} /> Imprimir Ticket
@@ -289,61 +292,85 @@ export default function PuntoDeVenta() {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
       {/* ─── Barra de pestañas ─── */}
-      <div style={{
+      <div className="pos-tabs-scroll" style={{
         display: 'flex', alignItems: 'center', gap: 2,
         padding: '6px 10px 0', background: 'var(--color-surface)',
         borderBottom: '1px solid var(--color-border)', overflowX: 'auto',
         flexShrink: 0,
       }}>
-        {tabs.map(t => {
-          const isActiva = t.id === tabActivaId;
-          const count = t.items.reduce((a, i) => a + i.cantidad, 0);
-          const isPresup = t.modo === 'presupuesto';
+        {/* Envolver pestañas clásicas para que no se vean en celular */}
+        <div className="pos-hide-mobile" style={{ display: 'flex', gap: 2, flexShrink: 0 }}>
+          {tabs.map(t => {
+            const isActiva = t.id === tabActivaId;
+            const count = t.items.reduce((a, i) => a + i.cantidad, 0);
+            const isPresup = t.modo === 'presupuesto';
+            return (
+              <div key={t.id}
+                onClick={() => activarTab(t.id)}
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 6,
+                  padding: '6px 10px', borderRadius: '6px 6px 0 0',
+                  background: isActiva ? 'var(--color-bg)' : 'transparent',
+                  border: '1px solid ' + (isActiva ? 'var(--color-border)' : 'transparent'),
+                  borderBottom: isActiva ? '1px solid var(--color-bg)' : '1px solid transparent',
+                  marginBottom: -1, cursor: 'pointer', fontSize: 13,
+                  fontWeight: isActiva ? 700 : 500,
+                  color: isActiva ? 'var(--color-text)' : 'var(--color-text-muted)',
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                {isPresup && <FileText size={12} style={{ color: '#e6a817' }} />}
+                <span>{t.nombre}</span>
+                {count > 0 && (
+                  <span style={{
+                    fontSize: 10, fontWeight: 700,
+                    background: 'var(--color-primary)', color: '#fff',
+                    padding: '1px 6px', borderRadius: 10, minWidth: 18, textAlign: 'center',
+                  }}>{count}</span>
+                )}
+                <button
+                  onClick={(e) => { e.stopPropagation(); handleCerrarTab(t.id); }}
+                  style={{
+                    border: 'none', background: 'transparent', cursor: 'pointer',
+                    color: 'var(--color-text-dim)', padding: 0, display: 'flex',
+                  }}
+                  title="Cerrar pestaña (Ctrl+W)"
+                >
+                  <X size={12} />
+                </button>
+              </div>
+            );
+          })}
+          <button
+            className="btn btn-ghost btn-sm"
+            onClick={() => nuevaTab()}
+            title="Nueva venta (Ctrl+T)"
+            style={{ padding: '4px 8px', marginLeft: 4, marginBottom: 2 }}
+          >
+            <PlusIcon size={14} />
+          </button>
+        </div>
+
+        {/* SELECTOR MÓVIL (oculto en desktop) */}
+        {(() => {
+          const tActiva = tabs.find(t => t.id === tabActivaId);
+          const c = tActiva ? tActiva.items.reduce((s,i)=>s+i.cantidad, 0) : 0;
           return (
-            <div key={t.id}
-              onClick={() => activarTab(t.id)}
+            <button
+              className="pos-show-mobile-flex btn btn-ghost btn-sm"
+              onClick={() => setShowMobileTabs(true)}
               style={{
-                display: 'flex', alignItems: 'center', gap: 6,
-                padding: '6px 10px', borderRadius: '6px 6px 0 0',
-                background: isActiva ? 'var(--color-bg)' : 'transparent',
-                border: '1px solid ' + (isActiva ? 'var(--color-border)' : 'transparent'),
-                borderBottom: isActiva ? '1px solid var(--color-bg)' : '1px solid transparent',
-                marginBottom: -1, cursor: 'pointer', fontSize: 13,
-                fontWeight: isActiva ? 700 : 500,
-                color: isActiva ? 'var(--color-text)' : 'var(--color-text-muted)',
-                whiteSpace: 'nowrap',
+                padding: '6px 12px', fontWeight: 700, borderRadius: 6, gap: 8,
+                background: 'var(--color-surface)', border: '1px solid var(--color-border)',
+                marginBottom: 4, whiteSpace: 'nowrap'
               }}
             >
-              {isPresup && <FileText size={12} style={{ color: '#e6a817' }} />}
-              <span>{t.nombre}</span>
-              {count > 0 && (
-                <span style={{
-                  fontSize: 10, fontWeight: 700,
-                  background: 'var(--color-primary)', color: '#fff',
-                  padding: '1px 6px', borderRadius: 10, minWidth: 18, textAlign: 'center',
-                }}>{count}</span>
-              )}
-              <button
-                onClick={(e) => { e.stopPropagation(); handleCerrarTab(t.id); }}
-                style={{
-                  border: 'none', background: 'transparent', cursor: 'pointer',
-                  color: 'var(--color-text-dim)', padding: 0, display: 'flex',
-                }}
-                title="Cerrar pestaña (Ctrl+W)"
-              >
-                <X size={12} />
-              </button>
-            </div>
+              <ShoppingCart size={14} style={{ color: 'var(--color-primary)' }} />
+              {tActiva?.nombre || 'Venta'} {c > 0 && `(${c})`}
+              <span style={{ fontSize: 10, opacity: 0.5, marginLeft: 2 }}>▼</span>
+            </button>
           );
-        })}
-        <button
-          className="btn btn-ghost btn-sm"
-          onClick={() => nuevaTab()}
-          title="Nueva venta (Ctrl+T)"
-          style={{ padding: '4px 8px', marginLeft: 4, marginBottom: 2 }}
-        >
-          <PlusIcon size={14} />
-        </button>
+        })()}
 
         {/* Toggle Venta/Presupuesto para la pestaña activa */}
         <div style={{ marginLeft: 'auto', marginRight: 6, marginBottom: 4, display: 'flex', gap: 4, alignItems: 'center' }}>
@@ -396,7 +423,7 @@ export default function PuntoDeVenta() {
       {/* ─── Panel Izquierdo: Productos ─── */}
       <div style={{ display: 'flex', flexDirection: 'column', borderRight: '1px solid var(--color-border)', minHeight: 0, minWidth: 0 }}>
         {/* Barra de escaneo */}
-        <div style={{ padding: '10px 16px', borderBottom: '1px solid var(--color-border)', display: 'flex', gap: 8 }}>
+        <div style={{ padding: '10px 16px', borderBottom: '1px solid var(--color-border)', display: 'flex', gap: 8, position: 'relative', zIndex: 10 }}>
           <div style={{ flex: 1, position: 'relative' }}>
             <Search size={16} style={{
               position: 'absolute', left: 12, top: '50%', transform: 'translateY(-50%)',
@@ -404,30 +431,98 @@ export default function PuntoDeVenta() {
             }} />
             <input
               ref={scanRef}
-              className="input"
-              placeholder="Escanear código o buscar producto... (Ctrl+B)"
+              className="input pos-input-icon"
+              placeholder="Buscar producto o escanear..."
               style={{ paddingLeft: 36, width: '100%' }}
+              value={localSearch || ''}
               onKeyDown={handleScan}
               onChange={(e) => {
                 const v = e.target.value;
+                setLocalSearch(v);
+                if (debounceRef.current) clearTimeout(debounceRef.current);
                 if (v.length >= 2) {
-                  setLocalSearch(v);
-                  if (debounceRef.current) clearTimeout(debounceRef.current);
                   debounceRef.current = setTimeout(() => {
                     setBusqueda(v);
                     setShowBusqueda(true);
                   }, 150);
+                } else {
+                  setShowBusqueda(false);
                 }
               }}
+              onFocus={() => {
+                if (localSearch && localSearch.length >= 2) setShowBusqueda(true);
+              }}
+              onBlur={() => {
+                // Pequeño delay para permitir clic en resultados
+                setTimeout(() => setShowBusqueda(false), 200);
+              }}
             />
+            {/* Buscador flocado (Dropdown) */}
+            {showBusqueda && busqueda && (
+              <div className="card animate-fade-in" style={{
+                position: 'absolute', top: '100%', left: 0, right: 0, marginTop: 4,
+                maxHeight: '60vh', overflowY: 'auto', padding: 0, zIndex: 50,
+                boxShadow: '0 10px 25px rgba(0,0,0,0.15)',
+                display: 'flex', flexDirection: 'column'
+              }}>
+                {productosFiltrados().slice(0, 50).map((p) => {
+                  const sinStock = p.stock_actual <= 0;
+                  return (
+                    <button
+                      key={p.id}
+                      style={{
+                        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                        width: '100%', padding: '10px 16px', border: 'none',
+                        background: 'transparent', color: 'var(--color-text)',
+                        cursor: 'pointer', textAlign: 'left',
+                        borderBottom: '1px solid var(--color-border)',
+                      }}
+                      onMouseEnter={(e) => { e.currentTarget.style.background = 'var(--color-surface-2)'; }}
+                      onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
+                      onMouseDown={(e) => {
+                        // Prevenir blur del input al hacer mousedown
+                        e.preventDefault();
+                      }}
+                      onClick={() => {
+                        agregarProducto(p);
+                        setShowBusqueda(false);
+                        setLocalSearch('');
+                        setBusqueda('');
+                        setTimeout(() => scanRef.current?.focus(), 50);
+                      }}
+                    >
+                      <div>
+                        <div style={{ fontWeight: 600, fontSize: 13, display: 'flex', alignItems: 'center', gap: 8 }}>
+                          {p.nombre}
+                          {sinStock && (
+                            <span style={{
+                              fontSize: 10, padding: '1px 8px', borderRadius: 10,
+                              background: 'rgba(245,158,11,0.15)', color: 'var(--color-warning)',
+                              fontWeight: 700,
+                            }} title="Se venderá en negativo">Sin stock</span>
+                          )}
+                        </div>
+                        <div style={{ fontSize: 11, color: 'var(--color-text-dim)', MathmarginTop: 2 }}>
+                          <span className="mono">{p.codigo}</span>
+                          <span style={{ color: p.stock_actual < 0 ? 'var(--color-danger)' : undefined, marginLeft: 6 }}>
+                            · Stock: {p.stock_actual}
+                          </span>
+                        </div>
+                      </div>
+                      <div className="mono" style={{ fontWeight: 700, color: 'var(--color-primary)', fontSize: 13, textAlign: 'right' }}>
+                        {fmt(p.precio_venta)}
+                      </div>
+                    </button>
+                  );
+                })}
+                {productosFiltrados().length === 0 && busqueda && (
+                  <div style={{ padding: 20, textAlign: 'center', color: 'var(--color-text-dim)', fontSize: 13 }}>
+                    No se encontraron productos para "{busqueda}"
+                  </div>
+                )}
+              </div>
+            )}
           </div>
-          <button
-            className="btn btn-ghost"
-            onClick={() => { setShowBusqueda(!showBusqueda); }}
-            title="Buscar producto"
-          >
-            <Search size={16} />
-          </button>
         </div>
 
         {/* Lista del carrito */}
@@ -445,7 +540,7 @@ export default function PuntoDeVenta() {
           ) : (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
               {/* Header */}
-              <div style={{
+              <div className="pos-hide-mobile" style={{
                 display: 'grid', gridTemplateColumns: '1fr 80px 110px 100px 40px',
                 alignItems: 'center', gap: 8, padding: '4px 12px',
                 fontSize: 11, fontWeight: 600, color: 'var(--color-text-dim)',
@@ -692,101 +787,15 @@ export default function PuntoDeVenta() {
         </div>
       </div>
 
-      {/* ─── Modal de Búsqueda ─── */}
-      {showBusqueda && (
-        <div className="pos-modal-overlay" style={{
-          position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)',
-          display: 'flex', alignItems: 'flex-start', justifyContent: 'center',
-          paddingTop: 60, zIndex: 100,
-        }} onClick={() => setShowBusqueda(false)}>
-          <div className="card pos-modal-content animate-fade-in" style={{ width: 600, maxHeight: '70vh', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}
-            onClick={(e) => e.stopPropagation()}>
-            <div style={{ padding: '12px 16px', borderBottom: '1px solid var(--color-border)', display: 'flex', gap: 8, alignItems: 'center' }}>
-              <Search size={18} style={{ color: 'var(--color-text-dim)' }} />
-              <input
-                ref={searchRef}
-                className="input"
-                placeholder="Buscar por nombre, código..."
-                value={localSearch}
-                onChange={(e) => {
-                  const v = e.target.value;
-                  setLocalSearch(v);
-                  if (debounceRef.current) clearTimeout(debounceRef.current);
-                  debounceRef.current = setTimeout(() => setBusqueda(v), 120);
-                }}
-                autoFocus
-                style={{ flex: 1, border: 'none', background: 'transparent', padding: 0 }}
-              />
-              <button className="btn btn-ghost btn-sm" onClick={() => setShowBusqueda(false)}>
-                <X size={16} />
-              </button>
-            </div>
-            <div style={{ overflow: 'auto', maxHeight: '55vh' }}>
-              {productosFiltrados().slice(0, 50).map((p) => {
-                const sinStock = p.stock_actual <= 0;
-                return (
-                <button
-                  key={p.id}
-                  style={{
-                    display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-                    width: '100%', padding: '10px 16px', border: 'none',
-                    background: 'transparent', color: 'var(--color-text)',
-                    cursor: 'pointer', textAlign: 'left',
-                    borderBottom: '1px solid var(--color-border)',
-                  }}
-                  onMouseEnter={(e) => { e.currentTarget.style.background = 'var(--color-surface-2)'; }}
-                  onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
-                  onClick={() => {
-                    agregarProducto(p);
-                    setShowBusqueda(false);
-                    setLocalSearch('');
-                    setBusqueda('');
-                  }}
-                >
-                  <div>
-                    <div style={{ fontWeight: 600, fontSize: 14, display: 'flex', alignItems: 'center', gap: 8 }}>
-                      {p.nombre}
-                      {sinStock && (
-                        <span style={{
-                          fontSize: 10, padding: '1px 8px', borderRadius: 10,
-                          background: 'rgba(245,158,11,0.15)', color: 'var(--color-warning)',
-                          fontWeight: 700,
-                        }} title="Se venderá en negativo">Sin stock</span>
-                      )}
-                    </div>
-                    <div style={{ fontSize: 12, color: 'var(--color-text-dim)', display: 'flex', gap: 8 }}>
-                      <span className="mono">{p.codigo}</span>
-                      {p.categoria_nombre && <span>· {p.categoria_nombre}</span>}
-                      <span style={{ color: p.stock_actual < 0 ? 'var(--color-danger)' : undefined }}>
-                        · Stock: {p.stock_actual}
-                      </span>
-                    </div>
-                  </div>
-                  <div style={{ textAlign: 'right' }}>
-                    <div className="mono" style={{ fontWeight: 700, color: 'var(--color-primary)' }}>
-                      {fmt(p.precio_venta)}
-                    </div>
-                  </div>
-                </button>
-                );
-              })}
-              {productosFiltrados().length === 0 && busqueda && (
-                <div style={{ padding: 32, textAlign: 'center', color: 'var(--color-text-dim)' }}>
-                  No se encontraron productos para "{busqueda}"
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
-      )}
+
 
       {/* ─── Modal de Descuento ─── */}
       {showDescuento !== null && (
-        <div style={{
+        <div className="pos-modal-overlay" style={{
           position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)',
           display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 100,
         }} onClick={() => { setShowDescuento(null); setShowPinAuth(false); }}>
-          <div className="card animate-fade-in" style={{ width: 340, padding: 24 }}
+          <div className="card pos-modal-content pos-modal-fluid animate-fade-in" style={{ width: 340, maxWidth: '100%', padding: 24 }}
             onClick={e => e.stopPropagation()}>
             {!showPinAuth ? (
               <>
@@ -798,7 +807,7 @@ export default function PuntoDeVenta() {
                   {items[showDescuento]?.producto.nombre}
                   {!esAdmin && <span> · Máx sin autorización: {maxDescVendedor}%</span>}
                 </p>
-                <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                <div className="pos-filter-row" style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
                   <input
                     className="input mono"
                     type="number"
@@ -862,14 +871,14 @@ export default function PuntoDeVenta() {
                   }}
                   autoFocus
                   placeholder="••••"
-                  style={{ textAlign: 'center', fontSize: 28, letterSpacing: 8 }}
+                  style={{ textAlign: 'center', fontSize: 28, letterSpacing: 8, width: '100%' }}
                 />
                 {pinError && (
                   <p style={{ color: 'var(--color-danger)', fontSize: 12, textAlign: 'center', marginTop: 6 }}>
                     PIN incorrecto
                   </p>
                 )}
-                <button className="btn btn-ghost btn-sm" style={{ marginTop: 12 }}
+                <button className="btn btn-ghost btn-sm" style={{ marginTop: 12, width: '100%' }}
                   onClick={() => { setShowPinAuth(false); setPinAuth(''); }}>
                   Cancelar
                 </button>
@@ -881,13 +890,13 @@ export default function PuntoDeVenta() {
 
       {/* ─── Toast Presupuesto Guardado ─── */}
       {presupGuardado && (
-        <div style={{
+        <div className="pos-modal-overlay" style={{
           position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)',
           display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 200,
         }} onClick={() => setPresupGuardado(null)}>
-          <div className="card animate-fade-in" style={{ width: 360, padding: 28, textAlign: 'center' }}
+          <div className="card pos-modal-content pos-modal-fluid animate-fade-in" style={{ width: 360, maxWidth: '100%', padding: 28, textAlign: 'center' }}
             onClick={e => e.stopPropagation()}>
-            <CheckCircle2 size={48} style={{ color: '#e6a817', marginBottom: 10 }} />
+            <CheckCircle2 size={48} style={{ color: '#e6a817', marginBottom: 10, alignSelf: 'center' }} />
             <h3 style={{ fontSize: 18, fontWeight: 700, marginBottom: 4 }}>Presupuesto Guardado</h3>
             <p className="mono" style={{ fontSize: 15, color: 'var(--color-text-muted)', marginBottom: 16 }}>
               {presupGuardado.folio}
@@ -931,6 +940,66 @@ export default function PuntoDeVenta() {
           </div>
         );
       })()}
+      {/* ─── MODAL: Selector de Pestañas (Mobile) ─── */}
+      {showMobileTabs && (
+        <div style={{
+          position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', backdropFilter: 'blur(4px)',
+          zIndex: 300, display: 'flex', flexDirection: 'column', justifyContent: 'flex-end',
+        }} onClick={() => setShowMobileTabs(false)}>
+          <div className="animate-fade-in" style={{
+            background: 'var(--color-surface-2)', width: '100%', maxHeight: '80vh',
+            padding: 16, borderTopLeftRadius: 16, borderTopRightRadius: 16, display: 'flex', flexDirection: 'column'
+          }} onClick={e => e.stopPropagation()}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+              <h3 style={{ fontSize: 16, fontWeight: 800 }}>Ventas Abiertas ({tabs.length})</h3>
+              <button className="btn btn-ghost btn-sm" onClick={() => setShowMobileTabs(false)} style={{ padding: 6, borderRadius: '50%' }}>
+                <X size={20} />
+              </button>
+            </div>
+            
+            <div style={{ overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 8, paddingBottom: 16 }}>
+              {tabs.map(t => {
+                const count = t.items.reduce((s,i)=>s+i.cantidad, 0);
+                const total = t.items.reduce((s,i)=>s+(i.precio_final * i.cantidad), 0);
+                const isActiva = t.id === tabActivaId;
+                return (
+                  <div key={t.id} style={{ display: 'flex', gap: 8 }}>
+                    <button
+                      className="btn"
+                      onClick={() => { activarTab(t.id); setShowMobileTabs(false); }}
+                      style={{
+                        flex: 1, justifyContent: 'flex-start', padding: '12px 16px', fontSize: 15,
+                        background: isActiva ? 'var(--color-primary)' : 'var(--color-surface)',
+                        color: isActiva ? '#fff' : 'var(--color-text)',
+                        border: isActiva ? 'none' : '1px solid var(--color-border)',
+                      }}
+                    >
+                      <ShoppingCart size={16} />
+                      <div style={{ flex: 1, textAlign: 'left', marginLeft: 8 }}>
+                        <div style={{ fontWeight: 700 }}>{t.nombre}</div>
+                        {count > 0 && <div style={{ fontSize: 11, opacity: 0.8 }}>{count} artículos — ${total.toFixed(2)}</div>}
+                      </div>
+                    </button>
+                    {tabs.length > 1 && (
+                      <button
+                        className="btn btn-ghost"
+                        onClick={(e) => { e.stopPropagation(); setShowMobileTabs(false); handleCerrarTab(t.id); }}
+                        style={{ padding: '0 16px', background: 'var(--color-surface)' }}
+                      >
+                         <X size={16} color="var(--color-danger)" />
+                      </button>
+                    )}
+                  </div>
+                );
+              })}
+              
+              <button className="btn btn-success" style={{ padding: 16, fontSize: 16, marginTop: 8 }} onClick={() => { nuevaTab(); setShowMobileTabs(false); }}>
+                 <PlusIcon size={18} /> Nueva Venta
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ─── FAB para abrir el carrito en móvil ─── */}
       <button

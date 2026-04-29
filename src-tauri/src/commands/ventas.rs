@@ -196,18 +196,9 @@ pub fn crear_venta(
         ],
     );
 
-    // Registrar movimiento de caja ENTRADA para ventas en efectivo
-    if venta.metodo_pago == "efectivo" {
-        let _ = db.execute(
-            r#"INSERT INTO movimientos_caja (tipo, usuario_id, monto, concepto, fecha)
-               VALUES ('ENTRADA', ?, ?, ?, ?)"#,
-            rusqlite::params![
-                venta.usuario_id, venta.total,
-                format!("Venta {} — {} productos", folio, venta.items.len()),
-                now
-            ],
-        );
-    }
+    // NOTA: No creamos movimiento_caja para ventas en efectivo porque
+    // calcular_datos_corte ya consulta la tabla 'ventas' directamente.
+    // Crear un movimiento aquí causaría doble conteo.
 
     // Si la venta viene de un presupuesto, marcarlo como convertido
     if let Some(presup_id) = venta.presupuesto_origen_id {
@@ -232,6 +223,7 @@ pub fn crear_venta(
 #[tauri::command]
 pub fn listar_ventas_dia(state: State<'_, AppState>) -> Vec<VentaResumen> {
     let db = state.db.lock().unwrap();
+    let hoy = chrono::Local::now().format("%Y-%m-%d").to_string();
     let mut stmt = db.prepare(
         r#"
         SELECT v.id, v.folio, u.nombre_completo, cl.nombre,
@@ -240,12 +232,12 @@ pub fn listar_ventas_dia(state: State<'_, AppState>) -> Vec<VentaResumen> {
         FROM ventas v
         JOIN usuarios u ON u.id = v.usuario_id
         LEFT JOIN clientes cl ON cl.id = v.cliente_id
-        WHERE date(v.fecha) = date('now')
+        WHERE date(v.fecha) = ?
         ORDER BY v.fecha DESC
         "#,
     ).unwrap();
 
-    stmt.query_map([], |row| {
+    stmt.query_map(rusqlite::params![hoy], |row| {
         Ok(VentaResumen {
             id: row.get(0)?,
             folio: row.get(1)?,
@@ -267,25 +259,27 @@ pub fn listar_ventas_dia(state: State<'_, AppState>) -> Vec<VentaResumen> {
 pub fn obtener_estadisticas_dia(state: State<'_, AppState>) -> EstadisticasDia {
     let db = state.db.lock().unwrap();
 
+    let hoy = chrono::Local::now().format("%Y-%m-%d").to_string();
+
     let (total, num) = db.query_row(
-        "SELECT COALESCE(SUM(total), 0), COUNT(*) FROM ventas WHERE date(fecha) = date('now') AND anulada = 0",
-        [],
+        "SELECT COALESCE(SUM(total), 0), COUNT(*) FROM ventas WHERE date(fecha) = ? AND anulada = 0",
+        rusqlite::params![hoy],
         |row| Ok((row.get::<_, f64>(0)?, row.get::<_, i64>(1)?)),
     ).unwrap_or((0.0, 0));
 
     let efectivo: f64 = db.query_row(
-        "SELECT COALESCE(SUM(total), 0) FROM ventas WHERE date(fecha) = date('now') AND anulada = 0 AND metodo_pago = 'efectivo'",
-        [], |row| row.get(0),
+        "SELECT COALESCE(SUM(total), 0) FROM ventas WHERE date(fecha) = ? AND anulada = 0 AND metodo_pago = 'efectivo'",
+        rusqlite::params![hoy], |row| row.get(0),
     ).unwrap_or(0.0);
 
     let tarjeta: f64 = db.query_row(
-        "SELECT COALESCE(SUM(total), 0) FROM ventas WHERE date(fecha) = date('now') AND anulada = 0 AND metodo_pago = 'tarjeta'",
-        [], |row| row.get(0),
+        "SELECT COALESCE(SUM(total), 0) FROM ventas WHERE date(fecha) = ? AND anulada = 0 AND metodo_pago = 'tarjeta'",
+        rusqlite::params![hoy], |row| row.get(0),
     ).unwrap_or(0.0);
 
     let transferencia: f64 = db.query_row(
-        "SELECT COALESCE(SUM(total), 0) FROM ventas WHERE date(fecha) = date('now') AND anulada = 0 AND metodo_pago = 'transferencia'",
-        [], |row| row.get(0),
+        "SELECT COALESCE(SUM(total), 0) FROM ventas WHERE date(fecha) = ? AND anulada = 0 AND metodo_pago = 'transferencia'",
+        rusqlite::params![hoy], |row| row.get(0),
     ).unwrap_or(0.0);
 
     // Producto más vendido
@@ -295,12 +289,12 @@ pub fn obtener_estadisticas_dia(state: State<'_, AppState>) -> EstadisticasDia {
         FROM venta_detalle vd
         JOIN ventas v ON v.id = vd.venta_id
         JOIN productos p ON p.id = vd.producto_id
-        WHERE date(v.fecha) = date('now') AND v.anulada = 0
+        WHERE date(v.fecha) = ? AND v.anulada = 0
         GROUP BY vd.producto_id
         ORDER BY qty DESC
         LIMIT 1
         "#,
-        [],
+        rusqlite::params![hoy],
         |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?)),
     );
 
@@ -380,15 +374,9 @@ pub fn anular_venta(
         rusqlite::params![usuario_id, motivo, venta_id],
     ).map_err(|e| { let _ = db.execute("ROLLBACK", []); e.to_string() })?;
 
-    // Compensar caja: si fue venta en efectivo, registrar RETIRO por el monto devuelto al cliente
-    if metodo_pago == "efectivo" && total_venta > 0.0 {
-        let concepto = format!("Anulación venta {} — {}", folio, motivo);
-        let _ = db.execute(
-            r#"INSERT INTO movimientos_caja (tipo, usuario_id, monto, concepto, fecha)
-               VALUES ('RETIRO', ?, ?, ?, ?)"#,
-            rusqlite::params![usuario_id, total_venta, concepto, now],
-        );
-    }
+    // NOTA: No creamos movimiento_caja para anulaciones porque
+    // calcular_datos_corte ya filtra ventas con anulada = 0.
+    // Crear un retiro aquí causaría doble conteo.
 
     // Bitácora
     let _ = db.execute(
@@ -412,6 +400,7 @@ pub fn buscar_ventas(
     fecha_inicio: Option<String>,
     fecha_fin: Option<String>,
     cliente_texto: Option<String>,
+    articulo_texto: Option<String>,
     limite: Option<i64>,
     state: State<'_, AppState>,
 ) -> Result<Vec<VentaResumen>, String> {
@@ -444,6 +433,17 @@ pub fn buscar_ventas(
         sql.push_str(" AND (cl.nombre LIKE ? OR cl.telefono LIKE ?)");
         let like = format!("%{}%", c.trim());
         params.push(Box::new(like.clone()));
+        params.push(Box::new(like));
+    }
+    if let Some(a) = articulo_texto.as_ref().filter(|s| !s.trim().is_empty()) {
+        sql.push_str(r#" AND EXISTS (
+            SELECT 1 FROM venta_detalle vd
+            JOIN productos p ON p.id = vd.producto_id
+            WHERE vd.venta_id = v.id AND (p.codigo LIKE ? OR p.search_text LIKE ?)
+        )"#);
+        let like = format!("%{}%", super::productos::normalizar_texto(a.trim()));
+        let like_codigo = format!("%{}%", a.trim());
+        params.push(Box::new(like_codigo));
         params.push(Box::new(like));
     }
     sql.push_str(" ORDER BY v.fecha DESC LIMIT ?");

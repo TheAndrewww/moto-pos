@@ -42,7 +42,7 @@ use commands::cortes::{
     crear_movimiento_caja, listar_movimientos_sin_corte,
     calcular_datos_corte, crear_corte,
     listar_cortes, obtener_detalle_corte,
-    verificar_corte_dia_pendiente,
+    verificar_corte_dia_pendiente, obtener_inicio_proximo_cierre,
     crear_apertura_caja, obtener_apertura_hoy, obtener_fondo_sugerido,
 };
 use commands::respaldos::{
@@ -81,6 +81,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
@@ -227,6 +228,7 @@ pub fn run() {
             listar_cortes,
             obtener_detalle_corte,
             verificar_corte_dia_pendiente,
+            obtener_inicio_proximo_cierre,
             // Apertura de caja
             crear_apertura_caja,
             obtener_apertura_hoy,

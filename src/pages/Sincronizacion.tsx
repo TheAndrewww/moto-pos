@@ -134,7 +134,7 @@ export default function Sincronizacion() {
 
   return (
     <div style={{ padding: 20, maxWidth: 720, margin: '0 auto', overflow: 'auto' }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 18 }}>
+      <div className="pos-page-header" style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 18 }}>
         <Cloud size={22} />
         <h2 style={{ margin: 0, fontSize: 20 }}>Sincronización con servidor</h2>
       </div>

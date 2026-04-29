@@ -66,6 +66,7 @@ CREATE TABLE IF NOT EXISTS proveedores (
     telefono TEXT,
     email    TEXT,
     notas    TEXT,
+    activo   INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     synced_at  TEXT

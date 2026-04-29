@@ -275,33 +275,40 @@ export default function Presupuestos({ onIrAVenta }: PresupuestosProps = {}) {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
       {/* Header */}
-      <div style={{
+      <div className="pos-page-header" style={{
         padding: '12px 20px',
         borderBottom: '1px solid var(--color-border)',
         background: 'var(--color-surface)',
         display: 'flex', flexDirection: 'column', gap: 10,
       }}>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
             <ClipboardList size={20} style={{ color: 'var(--color-primary)' }} />
             <h2 style={{ fontSize: 17, fontWeight: 800, color: 'var(--color-text)' }}>Presupuestos</h2>
-            <span style={{ fontSize: 12, color: 'var(--color-text-dim)' }}>·</span>
-            <span style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>{presupuestos.length} cotizaciones</span>
+            <span className="pos-header-stats" style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
+              <span style={{ fontSize: 12, color: 'var(--color-text-dim)' }}>·</span>
+              <span style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>{presupuestos.length} cotizaciones</span>
+            </span>
           </div>
-          <div style={{ display: 'flex', gap: 8 }}>
-            <button className="btn btn-ghost" onClick={cargarDatos}><RefreshCw size={14} /></button>
+          <div className="pos-hide-mobile" style={{ display: 'flex', gap: 8 }}>
+            <button className="btn btn-ghost" onClick={cargarDatos} title="Actualizar">
+              <RefreshCw size={16} />
+            </button>
             <button className="btn btn-primary" onClick={handleNuevoPresupuesto}>
               <Plus size={16} /> Nuevo Presupuesto
             </button>
           </div>
         </div>
 
-        <div style={{ display: 'flex', gap: 8 }}>
+        <div className="pos-filter-row" style={{ display: 'flex', gap: 8 }}>
           <select className="input" value={filtroEstado} onChange={e => setFiltroEstado(e.target.value)}
-            style={{ width: 180 }}>
+            style={{ flex: 1, maxWidth: 300 }}>
             <option value="">Todos los estados</option>
             {Object.entries(ESTADOS).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
           </select>
+          <button className="pos-show-mobile-flex btn btn-ghost" onClick={cargarDatos} style={{ padding: '0 12px', border: '1px solid var(--color-border)' }}>
+            <RefreshCw size={16} />
+          </button>
         </div>
       </div>
 
@@ -361,6 +368,16 @@ export default function Presupuestos({ onIrAVenta }: PresupuestosProps = {}) {
       </div>
 
       {detalle && <ModalDetalle />}
+
+      {/* ─── FAB para Nuevo Presupuesto (Mobile) ─── */}
+      <button
+        className="pos-fab pos-show-mobile-flex"
+        style={{ position: 'fixed', bottom: 20, right: 20, zIndex: 90 }}
+        onClick={handleNuevoPresupuesto}
+        title="Nuevo Presupuesto"
+      >
+        <Plus size={24} />
+      </button>
     </div>
   );
 }

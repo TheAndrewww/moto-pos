@@ -58,6 +58,8 @@ pub struct DatosCorte {
     pub total_entradas_efectivo: f64,
     pub total_retiros_efectivo: f64,
     pub efectivo_esperado: f64,
+    pub cortes_parciales_hoy: i64,
+    pub total_retirado_parciales: f64,
     pub movimientos: Vec<MovimientoCajaRs>,
     pub vendedores: Vec<VendedorResumenRs>,
 }
@@ -99,9 +101,18 @@ pub struct CorteResumen {
     pub tipo: String,
     pub usuario_nombre: String,
     pub created_at: String,
+    pub fondo_inicial: f64,
+    pub total_ventas_efectivo: f64,
+    pub total_ventas_tarjeta: f64,
+    pub total_ventas_transferencia: f64,
+    pub total_ventas: f64,
+    pub num_transacciones: i64,
+    pub total_entradas_efectivo: f64,
+    pub total_retiros_efectivo: f64,
     pub efectivo_esperado: f64,
     pub efectivo_contado: f64,
     pub diferencia: f64,
+    pub nota_diferencia: Option<String>,
     pub fondo_siguiente: f64,
 }
 
@@ -266,38 +277,72 @@ pub fn calcular_datos_corte(
 ) -> Result<DatosCorte, String> {
     let db = state.db.lock().unwrap();
 
-    // Totales de ventas en el rango (no anuladas)
+    // ── 1. Determinar el periodo real ──
+    // Si hay cortes parciales hoy, el periodo empieza DESPUÉS del último.
+    // Si no, empieza desde fecha_inicio (inicio del día / apertura).
+    // NOTA: Usamos fecha_fin para el día, porque fecha_inicio puede ser de una
+    // fecha muy antigua (ej. "2000-01-01") cuando no hay cierres previos.
+    let dia = &fecha_fin[..10]; // YYYY-MM-DD
+
+    let fecha_inicio_real: String = db.query_row(
+        "SELECT fecha_fin FROM cortes WHERE tipo = 'PARCIAL' AND date(created_at) = ? ORDER BY created_at DESC LIMIT 1",
+        rusqlite::params![dia],
+        |row| row.get::<_, String>(0),
+    ).unwrap_or_else(|_| fecha_inicio.clone());
+
+    // ── 2. Fondo inicial ──
+    // Prioridad: fondo_siguiente del último corte parcial del día.
+    // Luego: apertura del día. Fallback: último corte. Default: 0.
+    let fondo_inicial: f64 = db.query_row(
+        "SELECT fondo_siguiente FROM cortes WHERE tipo = 'PARCIAL' AND date(created_at) = ? ORDER BY created_at DESC LIMIT 1",
+        rusqlite::params![dia],
+        |row| row.get::<_, f64>(0),
+    ).or_else(|_| {
+        db.query_row(
+            "SELECT fondo_declarado FROM aperturas_caja WHERE date(fecha) = ? LIMIT 1",
+            rusqlite::params![dia],
+            |row| row.get::<_, f64>(0),
+        )
+    }).or_else(|_| {
+        db.query_row(
+            "SELECT fondo_siguiente FROM cortes ORDER BY created_at DESC LIMIT 1",
+            [],
+            |row| row.get::<_, f64>(0),
+        )
+    }).unwrap_or(0.0);
+
+    // ── 3. Ventas SOLO del periodo actual (después del último corte parcial) ──
     let efectivo: f64 = db.query_row(
-        "SELECT COALESCE(SUM(total), 0) FROM ventas WHERE fecha BETWEEN ? AND ? AND anulada = 0 AND metodo_pago = 'efectivo'",
-        rusqlite::params![fecha_inicio, fecha_fin],
+        "SELECT COALESCE(SUM(total), 0) FROM ventas WHERE fecha > ? AND fecha <= ? AND anulada = 0 AND metodo_pago = 'efectivo'",
+        rusqlite::params![fecha_inicio_real, fecha_fin],
         |row| row.get(0),
     ).unwrap_or(0.0);
 
     let tarjeta: f64 = db.query_row(
-        "SELECT COALESCE(SUM(total), 0) FROM ventas WHERE fecha BETWEEN ? AND ? AND anulada = 0 AND metodo_pago = 'tarjeta'",
-        rusqlite::params![fecha_inicio, fecha_fin],
+        "SELECT COALESCE(SUM(total), 0) FROM ventas WHERE fecha > ? AND fecha <= ? AND anulada = 0 AND metodo_pago = 'tarjeta'",
+        rusqlite::params![fecha_inicio_real, fecha_fin],
         |row| row.get(0),
     ).unwrap_or(0.0);
 
     let transferencia: f64 = db.query_row(
-        "SELECT COALESCE(SUM(total), 0) FROM ventas WHERE fecha BETWEEN ? AND ? AND anulada = 0 AND metodo_pago = 'transferencia'",
-        rusqlite::params![fecha_inicio, fecha_fin],
+        "SELECT COALESCE(SUM(total), 0) FROM ventas WHERE fecha > ? AND fecha <= ? AND anulada = 0 AND metodo_pago = 'transferencia'",
+        rusqlite::params![fecha_inicio_real, fecha_fin],
         |row| row.get(0),
     ).unwrap_or(0.0);
 
     let (num_transacciones, total_ventas, total_descuentos): (i64, f64, f64) = db.query_row(
-        "SELECT COUNT(*), COALESCE(SUM(total), 0), COALESCE(SUM(descuento), 0) FROM ventas WHERE fecha BETWEEN ? AND ? AND anulada = 0",
-        rusqlite::params![fecha_inicio, fecha_fin],
+        "SELECT COUNT(*), COALESCE(SUM(total), 0), COALESCE(SUM(descuento), 0) FROM ventas WHERE fecha > ? AND fecha <= ? AND anulada = 0",
+        rusqlite::params![fecha_inicio_real, fecha_fin],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     ).unwrap_or((0, 0.0, 0.0));
 
     let total_anulaciones: f64 = db.query_row(
-        "SELECT COALESCE(SUM(total), 0) FROM ventas WHERE fecha BETWEEN ? AND ? AND anulada = 1",
-        rusqlite::params![fecha_inicio, fecha_fin],
+        "SELECT COALESCE(SUM(total), 0) FROM ventas WHERE fecha > ? AND fecha <= ? AND anulada = 1",
+        rusqlite::params![fecha_inicio_real, fecha_fin],
         |row| row.get(0),
     ).unwrap_or(0.0);
 
-    // Movimientos de caja sin corte asignado
+    // ── 4. Movimientos de caja sin corte asignado ──
     let mut stmt = db.prepare(
         r#"SELECT m.id, m.tipo, m.usuario_id, u.nombre_completo, m.monto,
                   m.concepto, m.autorizado_por, m.corte_id, m.fecha
@@ -332,25 +377,26 @@ pub fn calcular_datos_corte(
         .map(|m| m.monto)
         .sum();
 
-    // Fondo inicial: prioridad a la apertura del día (si existe).
-    // Fallback: fondo_siguiente del corte más reciente. Default: 0.
-    let dia = &fecha_inicio[..10]; // YYYY-MM-DD
-    let fondo_inicial: f64 = db.query_row(
-        "SELECT fondo_declarado FROM aperturas_caja WHERE date(fecha) = ? LIMIT 1",
+    // ── 5. Efectivo esperado ──
+    let efectivo_esperado = fondo_inicial + efectivo + total_entradas - total_retiros;
+
+    // ── 6. Info de cortes parciales del día ──
+    let cortes_parciales_hoy: i64 = db.query_row(
+        "SELECT COUNT(*) FROM cortes WHERE tipo = 'PARCIAL' AND date(created_at) = ?",
         rusqlite::params![dia],
         |row| row.get(0),
-    ).or_else(|_| {
-        db.query_row(
-            "SELECT fondo_siguiente FROM cortes ORDER BY created_at DESC LIMIT 1",
-            [],
-            |row| row.get::<_, f64>(0),
-        )
-    }).unwrap_or(0.0);
+    ).unwrap_or(0);
 
-    // fondo + entradas (incluye ventas efectivo) - retiros (incluye devoluciones)
-    let efectivo_esperado = fondo_inicial + total_entradas - total_retiros;
+    let total_retirado_parciales: f64 = db.query_row(
+        r#"SELECT COALESCE(SUM(m.monto), 0)
+           FROM movimientos_caja m
+           JOIN cortes c ON c.id = m.corte_id
+           WHERE m.tipo = 'RETIRO' AND c.tipo = 'PARCIAL' AND date(c.created_at) = ?"#,
+        rusqlite::params![dia],
+        |row| row.get(0),
+    ).unwrap_or(0.0);
 
-    // Resumen por vendedor en el rango
+    // ── 7. Resumen por vendedor (del periodo actual) ──
     let mut vstmt = db.prepare(
         r#"SELECT v.usuario_id, u.nombre_completo,
                   COUNT(*) as num_ventas,
@@ -359,13 +405,13 @@ pub fn calcular_datos_corte(
                   MAX(v.fecha) as hora_fin
            FROM ventas v
            JOIN usuarios u ON u.id = v.usuario_id
-           WHERE v.fecha BETWEEN ? AND ? AND v.anulada = 0
+           WHERE v.fecha > ? AND v.fecha <= ? AND v.anulada = 0
            GROUP BY v.usuario_id
            ORDER BY total DESC"#,
     ).map_err(|e| e.to_string())?;
 
     let vendedores: Vec<VendedorResumenRs> = vstmt.query_map(
-        rusqlite::params![fecha_inicio, fecha_fin],
+        rusqlite::params![fecha_inicio_real, fecha_fin],
         |row| {
             Ok(VendedorResumenRs {
                 usuario_id: row.get(0)?,
@@ -394,6 +440,8 @@ pub fn calcular_datos_corte(
         total_entradas_efectivo: total_entradas,
         total_retiros_efectivo: total_retiros,
         efectivo_esperado,
+        cortes_parciales_hoy,
+        total_retirado_parciales,
         movimientos,
         vendedores,
     })
@@ -532,7 +580,11 @@ pub fn listar_cortes(
     let db = state.db.lock().unwrap();
     let mut stmt = db.prepare(
         r#"SELECT c.id, c.tipo, u.nombre_completo, c.created_at,
-                  c.efectivo_esperado, c.efectivo_contado, c.diferencia, c.fondo_siguiente
+                  c.fondo_inicial, c.total_ventas_efectivo, c.total_ventas_tarjeta,
+                  c.total_ventas_transferencia, c.total_ventas, c.num_transacciones,
+                  c.total_entradas_efectivo, c.total_retiros_efectivo,
+                  c.efectivo_esperado, c.efectivo_contado, c.diferencia,
+                  c.nota_diferencia, c.fondo_siguiente
            FROM cortes c
            JOIN usuarios u ON u.id = c.usuario_id
            ORDER BY c.created_at DESC
@@ -545,10 +597,19 @@ pub fn listar_cortes(
             tipo: row.get(1)?,
             usuario_nombre: row.get(2)?,
             created_at: row.get(3)?,
-            efectivo_esperado: row.get(4)?,
-            efectivo_contado: row.get(5)?,
-            diferencia: row.get(6)?,
-            fondo_siguiente: row.get(7)?,
+            fondo_inicial: row.get(4)?,
+            total_ventas_efectivo: row.get(5)?,
+            total_ventas_tarjeta: row.get(6)?,
+            total_ventas_transferencia: row.get(7)?,
+            total_ventas: row.get(8)?,
+            num_transacciones: row.get(9)?,
+            total_entradas_efectivo: row.get(10)?,
+            total_retiros_efectivo: row.get(11)?,
+            efectivo_esperado: row.get(12)?,
+            efectivo_contado: row.get(13)?,
+            diferencia: row.get(14)?,
+            nota_diferencia: row.get(15)?,
+            fondo_siguiente: row.get(16)?,
         })
     }).map_err(|e| e.to_string())?
     .filter_map(|r| r.ok())
@@ -567,7 +628,11 @@ pub fn obtener_detalle_corte(
 
     let corte = db.query_row(
         r#"SELECT c.id, c.tipo, u.nombre_completo, c.created_at,
-                  c.efectivo_esperado, c.efectivo_contado, c.diferencia, c.fondo_siguiente
+                  c.fondo_inicial, c.total_ventas_efectivo, c.total_ventas_tarjeta,
+                  c.total_ventas_transferencia, c.total_ventas, c.num_transacciones,
+                  c.total_entradas_efectivo, c.total_retiros_efectivo,
+                  c.efectivo_esperado, c.efectivo_contado, c.diferencia,
+                  c.nota_diferencia, c.fondo_siguiente
            FROM cortes c
            JOIN usuarios u ON u.id = c.usuario_id
            WHERE c.id = ?"#,
@@ -577,10 +642,19 @@ pub fn obtener_detalle_corte(
             tipo: row.get(1)?,
             usuario_nombre: row.get(2)?,
             created_at: row.get(3)?,
-            efectivo_esperado: row.get(4)?,
-            efectivo_contado: row.get(5)?,
-            diferencia: row.get(6)?,
-            fondo_siguiente: row.get(7)?,
+            fondo_inicial: row.get(4)?,
+            total_ventas_efectivo: row.get(5)?,
+            total_ventas_tarjeta: row.get(6)?,
+            total_ventas_transferencia: row.get(7)?,
+            total_ventas: row.get(8)?,
+            num_transacciones: row.get(9)?,
+            total_entradas_efectivo: row.get(10)?,
+            total_retiros_efectivo: row.get(11)?,
+            efectivo_esperado: row.get(12)?,
+            efectivo_contado: row.get(13)?,
+            diferencia: row.get(14)?,
+            nota_diferencia: row.get(15)?,
+            fondo_siguiente: row.get(16)?,
         }),
     ).map_err(|_| "Corte no encontrado".to_string())?;
 
@@ -767,29 +841,66 @@ pub fn obtener_fondo_sugerido(
     Ok(fondo)
 }
 
-/// Verificar si hay un corte del día pendiente de ayer
+/// Verificar si hay un corte del día (Cierre de Caja) pendiente de ayer u otros días anteriores
 #[tauri::command]
 pub fn verificar_corte_dia_pendiente(
     state: State<'_, AppState>,
 ) -> Result<Option<String>, String> {
     let db = state.db.lock().unwrap();
 
-    // Obtener la fecha del día más reciente con ventas que no tenga corte DIA
-    let resultado: Option<String> = db.query_row(
-        r#"SELECT date(v.fecha) as dia
-           FROM ventas v
-           WHERE date(v.fecha) < date('now', 'localtime')
-           AND NOT EXISTS (
-               SELECT 1 FROM cortes c
-               WHERE c.tipo = 'DIA'
-               AND date(c.fecha_fin) = date(v.fecha)
-           )
-           GROUP BY dia
-           ORDER BY dia DESC
-           LIMIT 1"#,
+    // 1. Obtener la fecha del último corte (o un valor muy antiguo si no hay)
+    let ultima_fecha_fin: String = db.query_row(
+        "SELECT COALESCE(MAX(fecha_fin), '1970-01-01 00:00:00') FROM cortes WHERE tipo = 'DIA'",
         [],
         |row| row.get(0),
-    ).ok();
+    ).unwrap_or("1970-01-01 00:00:00".to_string());
 
-    Ok(resultado)
+    // 2. Verificar si hay alguna venta anterior a hoy que ocurrió DESPUÉS de ese último corte
+    let existe_venta_sin_corte: i64 = db.query_row(
+        r#"SELECT COUNT(*)
+           FROM ventas v
+           WHERE date(v.fecha) < date('now', 'localtime')
+           AND v.fecha > ?"#,
+        rusqlite::params![ultima_fecha_fin],
+        |row| row.get(0),
+    ).unwrap_or(0);
+
+    if existe_venta_sin_corte > 0 {
+        // En lugar de devolver un día específico, devolvemos la fecha de "ayer" 
+        // para que el Cierre de Caja se haga con fecha objetivo de ayer, lo que 
+        // lógicamente cubrirá todo lo pendiente si modificamos el frontend.
+        let ayer: String = db.query_row(
+            "SELECT date('now', 'localtime', '-1 day')",
+            [],
+            |row| row.get(0),
+        ).unwrap_or_default();
+        
+        Ok(Some(ayer))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Obtiene la fecha exacta donde debería iniciar el próximo Cierre (último corte + 1 seg o inicio de los tiempos)
+#[tauri::command]
+pub fn obtener_inicio_proximo_cierre(
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let db = state.db.lock().unwrap();
+    let ultima: String = db.query_row(
+        "SELECT COALESCE(MAX(fecha_fin), '2000-01-01 00:00:00') FROM cortes WHERE tipo = 'DIA'",
+        [],
+        |row| row.get(0),
+    ).unwrap_or("2000-01-01 00:00:00".to_string());
+    
+    // Si la fecha existe y es válida, deberíamos sumar algo? 
+    // En las proyecciones SQLite BETWEEN incluye orillas, así que lo habitual
+    // es usar datetime(..., '+1 second') para evitar empalmes.
+    let próxima: String = db.query_row(
+        "SELECT datetime(?, '+1 second')",
+        rusqlite::params![ultima],
+        |row| row.get(0),
+    ).unwrap_or(ultima);
+    
+    Ok(próxima)
 }
