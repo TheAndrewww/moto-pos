@@ -60,6 +60,7 @@ use commands::sync_remoto::{
     obtener_estado_sync, configurar_sync, desactivar_sync, probar_conexion_sync,
     backfill_outbox,
 };
+use commands::exportar::escribir_archivo;
 use db::connection::init_database;
 use std::sync::{Arc, Mutex};
 use tauri::Manager;
@@ -245,6 +246,8 @@ pub fn run() {
             listar_impresoras,
             // Importación
             importar_catalogo_csv,
+            // Exportación
+            escribir_archivo,
             // Conexión móvil (Fase 3.1)
             obtener_info_servidor,
             generar_qr_emparejamiento,

@@ -4,7 +4,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { useProductStore, type Producto, type NuevoProducto } from '../store/productStore';
 import { useAuthStore } from '../store/authStore';
-import { Package, Plus, Search, Edit2, X, AlertTriangle, Tag, Hash, LayoutGrid, List, Upload, History, Trash2, SlidersHorizontal } from 'lucide-react';
+import { Package, Plus, Search, Edit2, X, AlertTriangle, Tag, Hash, LayoutGrid, List, Download, History, Trash2, SlidersHorizontal } from 'lucide-react';
 import { invoke } from '../lib/invokeCompat';
 import { useVirtualizer } from '@tanstack/react-virtual';
 
@@ -18,7 +18,7 @@ export default function Catalogo() {
   const { usuario, tienePermiso } = useAuthStore();
 
   const [showForm, setShowForm] = useState(false);
-  const [showImportar, setShowImportar] = useState(false);
+  const [showExportar, setShowExportar] = useState(false);
   const [editando, setEditando] = useState<Producto | null>(null);
   const [filtroCategoria, setFiltroCategoria] = useState<number | null>(null);
   const [filtroProveedor, setFiltroProveedor] = useState<number | null>(null);
@@ -468,8 +468,8 @@ export default function Catalogo() {
           </div>
           <div className="pos-hide-mobile" style={{ display: 'flex', gap: 8 }}>
             {esAdmin && (
-              <button className="btn btn-secondary" onClick={() => setShowImportar(true)} title="Importar catálogo CSV">
-                <Upload size={16} /> Importar
+              <button className="btn btn-secondary" onClick={() => setShowExportar(true)} title="Exportar inventario a CSV">
+                <Download size={16} /> Exportar
               </button>
             )}
             {puedeCrear && (
@@ -612,7 +612,6 @@ export default function Catalogo() {
                     top: 0,
                     left: 0,
                     width: '100%',
-                    height: `${virtualRow.size}px`,
                     transform: `translateY(${virtualRow.start}px)`,
                     display: 'grid',
                     gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))`,
@@ -870,7 +869,14 @@ export default function Catalogo() {
 
       {/* Modal de form */}
       {showForm && <FormProducto />}
-      {showImportar && <ImportarModal onClose={() => setShowImportar(false)} onDone={() => { setShowImportar(false); cargarTodo(); }} />}
+      {showExportar && (
+        <ExportarModal
+          productos={productosFiltrados()}
+          categorias={categorias}
+          proveedores={proveedores}
+          onClose={() => setShowExportar(false)}
+        />
+      )}
       {stockModal && (
         <AjustarStockModal
           producto={stockModal}
@@ -1078,161 +1084,302 @@ function AjustarStockModal({
   );
 }
 
-// ─── Modal de importación de catálogo CSV ───────────────────────
-interface ResultadoImportacion {
-  total_lineas: number;
-  insertados: number;
-  actualizados: number;
-  omitidos: number;
-  proveedores_creados: number;
-  errores: string[];
-}
 
-function ImportarModal({ onClose, onDone }: { onClose: () => void; onDone: () => void }) {
-  const [ruta, setRuta] = useState('');
-  const [nombreArchivo, setNombreArchivo] = useState('');
-  const [reemplazar, setReemplazar] = useState(true);
-  const [ejecutando, setEjecutando] = useState(false);
-  const [resultado, setResultado] = useState<ResultadoImportacion | null>(null);
-  const [error, setError] = useState('');
+// ─── Modal de exportación de inventario ─────────────────────────
+function ExportarModal({
+  productos, categorias, proveedores, onClose,
+}: {
+  productos: Producto[];
+  categorias: { id: number; nombre: string }[];
+  proveedores: { id: number; nombre: string }[];
+  onClose: () => void;
+}) {
+  const [proveedorId, setProveedorId] = useState<number | null>(null);
+  const [categoriaId, setCategoriaId] = useState<number | null>(null);
+  const [stockFiltro, setStockFiltro] = useState<'todos' | 'bajo' | 'cero' | 'conStock'>('todos');
+  const [exportando, setExportando] = useState(false);
+  const [incluirCosto, setIncluirCosto] = useState(false);
 
-  const seleccionarArchivo = async () => {
+  // Filtros combinables — se aplican todos al mismo tiempo
+  const productosFiltradosExport = () => {
+    let lista = [...productos];
+    if (proveedorId) {
+      lista = lista.filter(p => p.proveedor_id === proveedorId);
+    }
+    if (categoriaId) {
+      lista = lista.filter(p => p.categoria_id === categoriaId);
+    }
+    if (stockFiltro === 'bajo') {
+      lista = lista.filter(p => p.stock_actual <= p.stock_minimo && p.stock_actual > 0);
+    } else if (stockFiltro === 'cero') {
+      lista = lista.filter(p => p.stock_actual <= 0);
+    } else if (stockFiltro === 'conStock') {
+      lista = lista.filter(p => p.stock_actual > 0);
+    }
+    return lista;
+  };
+
+  const conteo = productosFiltradosExport().length;
+  const hayFiltros = !!proveedorId || !!categoriaId || stockFiltro !== 'todos';
+
+  const getNombreArchivo = () => {
+    const fecha = new Date().toISOString().split('T')[0];
+    const partes = ['inventario'];
+    if (proveedorId) {
+      const prov = proveedores.find(p => p.id === proveedorId);
+      partes.push((prov?.nombre || 'proveedor').replace(/\s+/g, '_'));
+    }
+    if (categoriaId) {
+      const cat = categorias.find(c => c.id === categoriaId);
+      partes.push((cat?.nombre || 'categoria').replace(/\s+/g, '_'));
+    }
+    if (stockFiltro !== 'todos') {
+      partes.push('stock_' + stockFiltro);
+    }
+    if (!hayFiltros) partes.push('completo');
+    partes.push(fecha);
+    return partes.join('_') + '.csv';
+  };
+
+  const limpiarFiltros = () => {
+    setProveedorId(null);
+    setCategoriaId(null);
+    setStockFiltro('todos');
+  };
+
+  const handleExportar = async () => {
+    const lista = productosFiltradosExport();
+    if (lista.length === 0) return;
+    setExportando(true);
     try {
-      const { open } = await import('@tauri-apps/plugin-dialog');
-      const selected = await open({
-        multiple: false,
-        filters: [{
-          name: 'Archivos CSV',
-          extensions: ['csv', 'txt'],
-        }],
-      });
-      if (selected) {
-        const path = typeof selected === 'string' ? selected : selected;
-        setRuta(path as string);
-        // Extraer nombre del archivo
-        const parts = (path as string).split('/');
-        setNombreArchivo(parts[parts.length - 1] || '');
+      const cabeceras = ['Codigo', 'Nombre', 'Descripcion', 'Precio Venta'];
+      if (incluirCosto) cabeceras.push('Precio Costo');
+      cabeceras.push('Stock', 'Categoria', 'Proveedor');
+
+      const lineas = [cabeceras.join(',')];
+      for (const p of lista) {
+        const row: (string | number)[] = [
+          `"${p.codigo || ''}"`,
+          `"${(p.nombre || '').replace(/"/g, '""')}"`,
+          `"${(p.descripcion || '').replace(/"/g, '""')}"`,
+          p.precio_venta,
+        ];
+        if (incluirCosto) row.push(p.precio_costo);
+        row.push(
+          p.stock_actual,
+          `"${(p.categoria_nombre || '').replace(/"/g, '""')}"`,
+          `"${(p.proveedor_nombre || '').replace(/"/g, '""')}"`
+        );
+        lineas.push(row.join(','));
       }
-    } catch (e) {
-      setError('Error al abrir selector de archivos: ' + String(e));
+      const csvContent = "\uFEFF" + lineas.join('\n');
+
+      const { save } = await import('@tauri-apps/plugin-dialog');
+      const ruta = await save({
+        defaultPath: getNombreArchivo(),
+        filters: [{ name: 'CSV', extensions: ['csv'] }],
+      });
+      if (ruta) {
+        await invoke('escribir_archivo', { ruta, contenido: csvContent });
+        alert(`✅ Exportado exitosamente:\n${lista.length} productos guardados.`);
+        onClose();
+      }
+    } catch (err: any) {
+      alert('Error al exportar: ' + err);
+    } finally {
+      setExportando(false);
     }
   };
 
-  const ejecutar = async () => {
-    if (!ruta.trim()) { setError('Selecciona un archivo primero'); return; }
-    setError('');
-    setResultado(null);
-    setEjecutando(true);
-    try {
-      const res = await invoke<ResultadoImportacion>('importar_catalogo_csv', { ruta, reemplazar });
-      setResultado(res);
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setEjecutando(false);
-    }
+  const seccionStyle: React.CSSProperties = {
+    marginBottom: 14, padding: 14,
+    background: 'var(--color-surface-2)', borderRadius: 10,
+  };
+  const seccionLabelStyle: React.CSSProperties = {
+    fontSize: 11, fontWeight: 600, color: 'var(--color-text-muted)',
+    display: 'block', marginBottom: 0, textTransform: 'uppercase', letterSpacing: '0.3px',
   };
 
   return (
     <div className="pos-modal-overlay" style={{
-      position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', zIndex: 1000,
-      display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20,
-    }}>
-      <div className="pos-modal-content pos-modal-fluid" style={{ background: 'var(--color-surface)', borderRadius: 12, padding: 24, width: 560, maxWidth: 560, maxHeight: '90vh', overflowY: 'auto' }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
-          <h3 style={{ fontSize: 18, fontWeight: 800 }}>📥 Importar catálogo CSV</h3>
-          <button className="btn-icon" onClick={onClose}><X size={18} /></button>
+      position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)',
+      display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 100,
+    }} onClick={onClose}>
+      <div
+        className="card animate-fade-in pos-modal-content"
+        style={{ width: 520, maxHeight: '85vh', overflow: 'auto', padding: 24 }}
+        onClick={e => e.stopPropagation()}
+      >
+        {/* Header */}
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <Download size={20} style={{ color: 'var(--color-primary)' }} />
+            <h2 style={{ fontSize: 18, fontWeight: 800 }}>Exportar Inventario</h2>
+          </div>
+          <button className="btn btn-ghost btn-sm" onClick={onClose}><X size={18} /></button>
         </div>
 
-        <p style={{ fontSize: 13, color: 'var(--color-text-muted)', marginBottom: 12 }}>
-          Formato esperado (pipe-separado, sin cabecera): <br />
-          <code style={{ fontSize: 11 }}>codigo | nombre | precio_venta | stock | proveedor</code>
+        <p style={{ fontSize: 13, color: 'var(--color-text-dim)', marginBottom: 16 }}>
+          Configura los filtros que necesites. Puedes combinarlos libremente.
         </p>
 
-        {/* Selector de archivo */}
-        <label style={{ fontSize: 12, fontWeight: 600, display: 'block', marginBottom: 6 }}>ARCHIVO CSV</label>
-        <div
-          onClick={!ejecutando ? seleccionarArchivo : undefined}
-          style={{
-            padding: '16px 20px', borderRadius: 10,
-            border: `2px dashed ${ruta ? 'var(--color-success)' : 'var(--color-border)'}`,
-            background: ruta ? 'rgba(34,197,94,0.04)' : 'var(--color-surface-2)',
-            cursor: ejecutando ? 'not-allowed' : 'pointer',
-            textAlign: 'center',
-            transition: 'all 0.15s',
-          }}
-        >
-          {ruta ? (
-            <div>
-              <p style={{ fontSize: 14, fontWeight: 700, color: 'var(--color-success)' }}>
-                ✅ {nombreArchivo}
-              </p>
-              <p style={{ fontSize: 11, color: 'var(--color-text-dim)', marginTop: 4 }}>
-                {ruta}
-              </p>
-              <p style={{ fontSize: 11, color: 'var(--color-text-muted)', marginTop: 4 }}>
-                Clic para cambiar archivo
-              </p>
-            </div>
-          ) : (
-            <div>
-              <Upload size={24} style={{ color: 'var(--color-text-dim)', marginBottom: 6 }} />
-              <p style={{ fontSize: 14, fontWeight: 600, color: 'var(--color-text-muted)' }}>
-                Clic para seleccionar archivo
-              </p>
-              <p style={{ fontSize: 11, color: 'var(--color-text-dim)', marginTop: 2 }}>
-                Archivos .csv o .txt
-              </p>
-            </div>
-          )}
-        </div>
-
-        <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 12, cursor: 'pointer' }}>
-          <input type="checkbox" checked={reemplazar} onChange={e => setReemplazar(e.target.checked)} disabled={ejecutando} />
-          <span style={{ fontSize: 13 }}>
-            <strong>Reemplazar todo</strong> — borra productos, proveedores y ventas de prueba antes de importar
-          </span>
-        </label>
-        {reemplazar && (
-          <div style={{ marginTop: 8, padding: 10, background: 'rgba(255,180,0,0.1)', borderRadius: 8, fontSize: 12, color: 'var(--color-warning, orange)' }}>
-            ⚠️ Esta operación es irreversible. Asegúrate de tener un respaldo.
-          </div>
-        )}
-
-        {error && (
-          <div style={{ marginTop: 12, padding: 10, background: 'var(--color-danger-bg, #fee)', color: 'var(--color-danger)', borderRadius: 8, fontSize: 13 }}>
-            {error}
-          </div>
-        )}
-
-        {resultado && (
-          <div style={{ marginTop: 14, padding: 12, background: 'var(--color-surface-2)', borderRadius: 8 }}>
-            <p style={{ fontWeight: 700, marginBottom: 6 }}>Resultado</p>
-            <p style={{ fontSize: 13 }}>• Líneas procesadas: <strong>{resultado.total_lineas}</strong></p>
-            <p style={{ fontSize: 13, color: 'var(--color-success, green)' }}>• Insertados: <strong>{resultado.insertados}</strong></p>
-            <p style={{ fontSize: 13, color: 'var(--color-primary)' }}>• Actualizados: <strong>{resultado.actualizados}</strong></p>
-            <p style={{ fontSize: 13, color: 'var(--color-warning, orange)' }}>• Omitidos: <strong>{resultado.omitidos}</strong></p>
-            <p style={{ fontSize: 13 }}>• Proveedores creados: <strong>{resultado.proveedores_creados}</strong></p>
-            {resultado.errores.length > 0 && (
-              <details style={{ marginTop: 8 }}>
-                <summary style={{ cursor: 'pointer', fontSize: 12 }}>Ver {resultado.errores.length} errores</summary>
-                <pre style={{ fontSize: 11, maxHeight: 180, overflow: 'auto', marginTop: 6 }}>{resultado.errores.join('\n')}</pre>
-              </details>
+        {/* Filtro: Proveedor */}
+        <div style={seccionStyle}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+            <label style={seccionLabelStyle}>🏭 Proveedor</label>
+            {proveedorId && (
+              <button
+                onClick={() => setProveedorId(null)}
+                style={{ fontSize: 11, color: 'var(--color-danger)', background: 'none', border: 'none', cursor: 'pointer', fontWeight: 600 }}
+              >✕ Quitar</button>
             )}
           </div>
+          <select
+            className="input"
+            value={proveedorId || ''}
+            onChange={e => setProveedorId(e.target.value ? Number(e.target.value) : null)}
+            style={{ width: '100%' }}
+          >
+            <option value="">Todos los proveedores</option>
+            {proveedores.map(p => <option key={p.id} value={p.id}>{p.nombre}</option>)}
+          </select>
+        </div>
+
+        {/* Filtro: Categoría */}
+        <div style={seccionStyle}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+            <label style={seccionLabelStyle}>🏷️ Categoría</label>
+            {categoriaId && (
+              <button
+                onClick={() => setCategoriaId(null)}
+                style={{ fontSize: 11, color: 'var(--color-danger)', background: 'none', border: 'none', cursor: 'pointer', fontWeight: 600 }}
+              >✕ Quitar</button>
+            )}
+          </div>
+          <select
+            className="input"
+            value={categoriaId || ''}
+            onChange={e => setCategoriaId(e.target.value ? Number(e.target.value) : null)}
+            style={{ width: '100%' }}
+          >
+            <option value="">Todas las categorías</option>
+            {categorias.map(c => <option key={c.id} value={c.id}>{c.nombre}</option>)}
+          </select>
+        </div>
+
+        {/* Filtro: Stock */}
+        <div style={seccionStyle}>
+          <label style={{ ...seccionLabelStyle, marginBottom: 8 }}>📊 Nivel de stock</label>
+          <div style={{ display: 'flex', gap: 6 }}>
+            {([
+              { key: 'todos' as const, label: 'Todos', color: 'var(--color-primary)' },
+              { key: 'conStock' as const, label: '✅ Con stock', color: 'var(--color-success, #22c55e)' },
+              { key: 'bajo' as const, label: '⚠️ Bajo', color: 'var(--color-warning)' },
+              { key: 'cero' as const, label: '🔴 Sin stock', color: 'var(--color-danger)' },
+            ]).map(opt => (
+              <button
+                key={opt.key}
+                onClick={() => setStockFiltro(opt.key)}
+                style={{
+                  flex: 1, padding: '8px 6px', borderRadius: 8, border: 'none', cursor: 'pointer',
+                  background: stockFiltro === opt.key ? 'var(--color-bg)' : 'transparent',
+                  outline: stockFiltro === opt.key ? `2px solid ${opt.color}` : '2px solid transparent',
+                  fontSize: 11, fontWeight: 600,
+                  color: stockFiltro === opt.key ? opt.color : 'var(--color-text-muted)',
+                  transition: 'all 0.15s',
+                }}
+              >
+                {opt.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Opción: incluir costo */}
+        <label style={{
+          display: 'flex', alignItems: 'center', gap: 8, marginBottom: 14,
+          cursor: 'pointer', fontSize: 13,
+        }}>
+          <input type="checkbox" checked={incluirCosto} onChange={e => setIncluirCosto(e.target.checked)} />
+          <span>Incluir <strong>precio de costo</strong> en la exportación</span>
+        </label>
+
+        {/* Filtros activos + limpiar */}
+        {hayFiltros && (
+          <div style={{
+            display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 14, alignItems: 'center',
+          }}>
+            <span style={{ fontSize: 11, color: 'var(--color-text-dim)', fontWeight: 600 }}>Filtros activos:</span>
+            {proveedorId && (
+              <span style={{
+                fontSize: 11, padding: '3px 10px', borderRadius: 12,
+                background: 'var(--color-primary-soft)', color: 'var(--color-primary)', fontWeight: 600,
+              }}>
+                🏭 {proveedores.find(p => p.id === proveedorId)?.nombre}
+              </span>
+            )}
+            {categoriaId && (
+              <span style={{
+                fontSize: 11, padding: '3px 10px', borderRadius: 12,
+                background: 'var(--color-primary-soft)', color: 'var(--color-primary)', fontWeight: 600,
+              }}>
+                🏷️ {categorias.find(c => c.id === categoriaId)?.nombre}
+              </span>
+            )}
+            {stockFiltro !== 'todos' && (
+              <span style={{
+                fontSize: 11, padding: '3px 10px', borderRadius: 12,
+                background: stockFiltro === 'bajo' ? 'rgba(255,180,0,0.12)' :
+                           stockFiltro === 'cero' ? 'rgba(220,53,69,0.1)' : 'rgba(34,197,94,0.1)',
+                color: stockFiltro === 'bajo' ? 'var(--color-warning)' :
+                       stockFiltro === 'cero' ? 'var(--color-danger)' : 'var(--color-success, #22c55e)',
+                fontWeight: 600,
+              }}>
+                {stockFiltro === 'bajo' ? '⚠️ Stock bajo' : stockFiltro === 'cero' ? '🔴 Sin stock' : '✅ Con stock'}
+              </span>
+            )}
+            <button
+              onClick={limpiarFiltros}
+              style={{
+                fontSize: 11, color: 'var(--color-text-muted)', background: 'none',
+                border: '1px solid var(--color-border)', borderRadius: 12,
+                padding: '3px 10px', cursor: 'pointer', fontWeight: 600,
+              }}
+            >Limpiar todos</button>
+          </div>
         )}
 
-        <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 16 }}>
-          {resultado ? (
-            <button className="btn btn-primary" onClick={onDone}>Cerrar</button>
-          ) : (
-            <>
-              <button className="btn btn-secondary" onClick={onClose} disabled={ejecutando}>Cancelar</button>
-              <button className="btn btn-primary" onClick={ejecutar} disabled={ejecutando || !ruta.trim()}>
-                {ejecutando ? 'Importando…' : 'Importar'}
-              </button>
-            </>
-          )}
+        {/* Preview de conteo */}
+        <div style={{
+          padding: '12px 16px', borderRadius: 10,
+          background: conteo > 0 ? 'rgba(34,197,94,0.06)' : 'rgba(220,53,69,0.06)',
+          border: `1px solid ${conteo > 0 ? 'rgba(34,197,94,0.2)' : 'rgba(220,53,69,0.2)'}`,
+          marginBottom: 16,
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        }}>
+          <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--color-text)' }}>
+            Productos a exportar:
+          </span>
+          <span className="mono" style={{
+            fontSize: 18, fontWeight: 800,
+            color: conteo > 0 ? 'var(--color-success, #22c55e)' : 'var(--color-danger)',
+          }}>
+            {conteo}
+          </span>
+        </div>
+
+        {/* Botones */}
+        <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+          <button className="btn btn-ghost" onClick={onClose}>Cancelar</button>
+          <button
+            className="btn btn-primary"
+            disabled={exportando || conteo === 0}
+            onClick={handleExportar}
+            style={{ display: 'flex', alignItems: 'center', gap: 6 }}
+          >
+            <Download size={16} />
+            {exportando ? 'Exportando...' : `Exportar ${conteo} productos`}
+          </button>
         </div>
       </div>
     </div>
