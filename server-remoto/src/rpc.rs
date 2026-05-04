@@ -67,6 +67,9 @@ pub async fn dispatch(
         "listar_categorias"             => listar_categorias(&state).await?,
         "listar_proveedores"            => listar_proveedores(&state).await?,
         "listar_clientes"               => listar_clientes(&state).await?,
+        "crear_cliente"                 => crear_cliente(&state, args).await?,
+        "actualizar_cliente"            => actualizar_cliente(&state, args).await?,
+        "toggle_cliente_activo"         => toggle_cliente_activo(&state, &args).await?,
         "listar_usuarios"               => listar_usuarios(&state).await?,
         "listar_roles"                  => listar_roles(),
 
@@ -128,12 +131,14 @@ pub async fn dispatch(
         "buscar_ventas"                 => buscar_ventas(&state, &args).await?,
         "obtener_detalle_venta"         => obtener_detalle_venta(&state, &args).await?,
         "crear_venta"                   => crear_venta(&state, args).await?,
+        "listar_ventas_dia"             => listar_ventas_dia(&state).await?,
+        "anular_venta"                  => anular_venta(&state, &args).await?,
 
         // ─── Estadísticas ────────────────────────────────────
         "obtener_estadisticas_dia"      => obtener_estadisticas_dia(&state, &args).await?,
 
         // ─── Bitácora (read) ─────────────────────────────────
-        "listar_bitacora"               => json!([]),
+        "listar_bitacora"               => listar_bitacora(&state, &args).await?,
 
         // ─── Presupuestos (stub) ─────────────────────────────
         "listar_presupuestos"           => json!([]),
@@ -3201,4 +3206,441 @@ async fn buscar_dueno_por_pin(state: &AppState, pin: &str) -> Result<Option<i64>
         }
     }
     Ok(None)
+}
+
+// =============================================================================
+// CLIENTES — CRUD (paridad con desktop `commands/productos.rs:647-690`)
+// =============================================================================
+//
+// Forma del frontend (`pages/Clientes.tsx`):
+//   - crear_cliente:           { nombre, telefono, email, descuentoPorcentaje, notas }
+//   - actualizar_cliente:      { datos: { id, nombre, telefono, email,
+//                                         descuento_porcentaje, notas } }
+//   - toggle_cliente_activo:   { id }
+//
+// El frontend espera de vuelta la shape `ClienteInfo` que ya devuelve
+// `listar_clientes` (mismo payload por consistencia, aunque la página solo
+// recarga toda la lista después de un mutate).
+
+async fn crear_cliente(state: &AppState, args: Value) -> Result<Value, ApiError> {
+    use rust_decimal::prelude::ToPrimitive;
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct A {
+        nombre: String,
+        #[serde(default)] telefono: Option<String>,
+        #[serde(default)] email: Option<String>,
+        #[serde(default)] descuento_porcentaje: f64,
+        #[serde(default)] notas: Option<String>,
+        // Si el frontend lo pasa, lo usamos para auditar; si no, queda null.
+        #[serde(default)] usuario_id: Option<i64>,
+    }
+
+    let a: A = serde_json::from_value(args)
+        .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
+    if a.nombre.trim().is_empty() {
+        return Err(ApiError::BadRequest("El nombre es obligatorio".into()));
+    }
+
+    let uuid = uuid::Uuid::now_v7().to_string();
+    let mut tx = state.pool.begin().await?;
+
+    let ins_sql = format!(
+        r#"INSERT INTO clientes (uuid, nombre, telefono, email,
+               descuento_porcentaje, notas, activo, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, 1, {NOW_TEXT}, {NOW_TEXT})
+           RETURNING id, nombre, telefono, email, descuento_porcentaje,
+                     notas, activo"#
+    );
+    let row = sqlx::query(&ins_sql)
+        .bind(&uuid)
+        .bind(&a.nombre)
+        .bind(a.telefono.as_deref())
+        .bind(a.email.as_deref())
+        .bind(a.descuento_porcentaje)
+        .bind(a.notas.as_deref())
+        .fetch_one(&mut *tx)
+        .await?;
+    let id: i64 = row.get("id");
+
+    sqlx::query(
+        "INSERT INTO sync_cursor (tabla, uuid, sucursal_id, origen_device) \
+         VALUES ('clientes', $1, 1, $2)",
+    )
+    .bind(&uuid)
+    .bind(WEB_ORIGIN)
+    .execute(&mut *tx)
+    .await?;
+
+    let audit_sql = format!(
+        r#"INSERT INTO audit_log
+           (usuario_id, accion, tabla_afectada, registro_id,
+            descripcion_legible, origen, fecha)
+           VALUES ($1, 'CLIENTE_CREADO', 'clientes', $2, $3, 'WEB', {NOW_TEXT})"#
+    );
+    let _ = sqlx::query(&audit_sql)
+        .bind(a.usuario_id)
+        .bind(id)
+        .bind(format!("Cliente creado: {}", a.nombre))
+        .execute(&mut *tx)
+        .await;
+
+    tx.commit().await?;
+
+    Ok(json!({
+        "id":       id,
+        "nombre":   row.get::<String, _>("nombre"),
+        "telefono": row.try_get::<Option<String>, _>("telefono").ok().flatten(),
+        "email":    row.try_get::<Option<String>, _>("email").ok().flatten(),
+        "descuento_porcentaje": row.try_get::<rust_decimal::Decimal, _>("descuento_porcentaje")
+            .ok().and_then(|d| d.to_f64()).unwrap_or(0.0),
+        "notas":    row.try_get::<Option<String>, _>("notas").ok().flatten(),
+        "activo":   row.get::<i32, _>("activo") != 0,
+    }))
+}
+
+async fn actualizar_cliente(state: &AppState, args: Value) -> Result<Value, ApiError> {
+    #[derive(Deserialize)]
+    struct A { datos: ClienteUpd, #[serde(default)] usuario_id: Option<i64> }
+    #[derive(Deserialize)]
+    struct ClienteUpd {
+        id: i64,
+        nombre: String,
+        #[serde(default)] telefono: Option<String>,
+        #[serde(default)] email: Option<String>,
+        #[serde(default)] descuento_porcentaje: f64,
+        #[serde(default)] notas: Option<String>,
+    }
+
+    let a: A = serde_json::from_value(args)
+        .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
+    let c = a.datos;
+
+    let mut tx = state.pool.begin().await?;
+
+    let uuid: String = sqlx::query_scalar(
+        "SELECT uuid FROM clientes WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(c.id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(ApiError::NotFound)?;
+
+    let upd_sql = format!(
+        r#"UPDATE clientes SET
+               nombre = $1, telefono = $2, email = $3,
+               descuento_porcentaje = $4, notas = $5, updated_at = {NOW_TEXT}
+           WHERE id = $6 AND deleted_at IS NULL"#
+    );
+    sqlx::query(&upd_sql)
+        .bind(&c.nombre)
+        .bind(c.telefono.as_deref())
+        .bind(c.email.as_deref())
+        .bind(c.descuento_porcentaje)
+        .bind(c.notas.as_deref())
+        .bind(c.id)
+        .execute(&mut *tx)
+        .await?;
+
+    sqlx::query(
+        "INSERT INTO sync_cursor (tabla, uuid, sucursal_id, origen_device) \
+         VALUES ('clientes', $1, 1, $2)",
+    )
+    .bind(&uuid)
+    .bind(WEB_ORIGIN)
+    .execute(&mut *tx)
+    .await?;
+
+    let audit_sql = format!(
+        r#"INSERT INTO audit_log
+           (usuario_id, accion, tabla_afectada, registro_id,
+            descripcion_legible, origen, fecha)
+           VALUES ($1, 'CLIENTE_EDITADO', 'clientes', $2, $3, 'WEB', {NOW_TEXT})"#
+    );
+    let _ = sqlx::query(&audit_sql)
+        .bind(a.usuario_id)
+        .bind(c.id)
+        .bind(format!("Cliente editado: {}", c.nombre))
+        .execute(&mut *tx)
+        .await;
+
+    tx.commit().await?;
+    Ok(json!(true))
+}
+
+async fn toggle_cliente_activo(state: &AppState, args: &Value) -> Result<Value, ApiError> {
+    #[derive(Deserialize)]
+    struct A { id: i64, #[serde(default)] usuario_id: Option<i64> }
+    let a: A = serde_json::from_value(args.clone())
+        .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
+
+    let mut tx = state.pool.begin().await?;
+
+    // Capturar uuid + nombre + estado actual antes del flip (para auditar y sync)
+    let row = sqlx::query(
+        "SELECT uuid, nombre, activo FROM clientes WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(a.id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(ApiError::NotFound)?;
+    let uuid: String = row.get("uuid");
+    let nombre: String = row.get("nombre");
+    let nuevo_estado: i32 = if row.get::<i32, _>("activo") == 0 { 1 } else { 0 };
+
+    let upd_sql = format!(
+        "UPDATE clientes SET activo = $1, updated_at = {NOW_TEXT} WHERE id = $2"
+    );
+    sqlx::query(&upd_sql)
+        .bind(nuevo_estado)
+        .bind(a.id)
+        .execute(&mut *tx)
+        .await?;
+
+    sqlx::query(
+        "INSERT INTO sync_cursor (tabla, uuid, sucursal_id, origen_device) \
+         VALUES ('clientes', $1, 1, $2)",
+    )
+    .bind(&uuid)
+    .bind(WEB_ORIGIN)
+    .execute(&mut *tx)
+    .await?;
+
+    let accion = if nuevo_estado == 1 { "CLIENTE_REACTIVADO" } else { "CLIENTE_DESACTIVADO" };
+    let descr = if nuevo_estado == 1 {
+        format!("Cliente reactivado: {}", nombre)
+    } else {
+        format!("Cliente desactivado: {}", nombre)
+    };
+    let audit_sql = format!(
+        r#"INSERT INTO audit_log
+           (usuario_id, accion, tabla_afectada, registro_id,
+            descripcion_legible, origen, fecha)
+           VALUES ($1, $2, 'clientes', $3, $4, 'WEB', {NOW_TEXT})"#
+    );
+    let _ = sqlx::query(&audit_sql)
+        .bind(a.usuario_id)
+        .bind(accion)
+        .bind(a.id)
+        .bind(descr)
+        .execute(&mut *tx)
+        .await;
+
+    tx.commit().await?;
+    Ok(json!(true))
+}
+
+// =============================================================================
+// VENTAS — listar del día y anular (paridad con `commands/ventas.rs:224, 319`)
+// =============================================================================
+
+/// Ventas del día actual en zona horaria de México.
+/// El web NO filtra por `origen` (no existe esa columna en `ventas`); muestra
+/// todas las ventas del día — simétrico a desktop.
+async fn listar_ventas_dia(state: &AppState) -> Result<Value, ApiError> {
+    use rust_decimal::prelude::ToPrimitive;
+
+    // `date(v.fecha)` sobre la columna TEXT funciona porque el formato
+    // canónico es `YYYY-MM-DD HH:MM:SS` (mismo que SQLite).
+    // Comparamos contra "hoy" en zona MX para no traer otros días.
+    let rows = sqlx::query(
+        r#"
+        SELECT v.id, v.folio, v.total, v.metodo_pago, v.anulada, v.fecha,
+               u.nombre_completo AS usuario_nombre,
+               c.nombre AS cliente_nombre,
+               COALESCE((SELECT COUNT(*) FROM venta_detalle vd
+                         WHERE vd.venta_id = v.id AND vd.deleted_at IS NULL), 0)
+                 AS num_productos
+        FROM ventas v
+        LEFT JOIN usuarios u ON u.id = v.usuario_id
+        LEFT JOIN clientes c ON c.id = v.cliente_id
+        WHERE v.deleted_at IS NULL
+          AND substr(v.fecha, 1, 10) = to_char(now() AT TIME ZONE 'America/Mexico_City', 'YYYY-MM-DD')
+        ORDER BY v.fecha DESC
+        "#,
+    )
+    .fetch_all(&state.pool)
+    .await?;
+
+    Ok(json!(rows.iter().map(|r| json!({
+        "id":              r.get::<i64, _>("id"),
+        "folio":           r.get::<String, _>("folio"),
+        "usuario_nombre":  r.try_get::<Option<String>, _>("usuario_nombre").ok().flatten().unwrap_or_default(),
+        "cliente_nombre":  r.try_get::<Option<String>, _>("cliente_nombre").ok().flatten(),
+        "total":           r.try_get::<rust_decimal::Decimal, _>("total").ok()
+                              .and_then(|d| d.to_f64()).unwrap_or(0.0),
+        "metodo_pago":     r.get::<String, _>("metodo_pago"),
+        "anulada":         r.get::<i32, _>("anulada") != 0,
+        "fecha":           r.get::<String, _>("fecha"),
+        "num_productos":   r.get::<i64, _>("num_productos"),
+    })).collect::<Vec<_>>()))
+}
+
+/// Anular una venta. Reglas (mismas que desktop):
+///   1. Solo el día en curso — para días anteriores se usa devolución.
+///   2. No debe tener devoluciones parciales registradas.
+///   3. Restaura stock de cada partida.
+///   4. NO crea movimiento de caja: `calcular_datos_corte` ya excluye
+///      ventas con `anulada = 1`, así que generar un retiro contaría doble.
+async fn anular_venta(state: &AppState, args: &Value) -> Result<Value, ApiError> {
+    use rust_decimal::prelude::ToPrimitive;
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct A {
+        venta_id: i64,
+        usuario_id: i64,
+        motivo: String,
+    }
+
+    let a: A = serde_json::from_value(args.clone())
+        .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
+    if a.motivo.trim().is_empty() {
+        return Err(ApiError::BadRequest("El motivo es obligatorio".into()));
+    }
+
+    let mut tx = state.pool.begin().await?;
+
+    // Verificar que existe, no está anulada, y es del día en curso.
+    let v = sqlx::query(
+        "SELECT folio, fecha FROM ventas \
+         WHERE id = $1 AND anulada = 0 AND deleted_at IS NULL",
+    )
+    .bind(a.venta_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| ApiError::BadRequest("Venta no encontrada o ya anulada".into()))?;
+
+    let folio: String = v.get("folio");
+    let fecha_venta: String = v.get("fecha");
+
+    let hoy: String = sqlx::query_scalar(
+        "SELECT to_char(now() AT TIME ZONE 'America/Mexico_City', 'YYYY-MM-DD')",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    if !fecha_venta.starts_with(&hoy) {
+        return Err(ApiError::BadRequest(
+            "Solo se puede anular una venta del día en curso. Para ventas anteriores, usa el flujo de devolución.".into(),
+        ));
+    }
+
+    // ¿Tiene devoluciones parciales?
+    let num_dev: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM devoluciones \
+         WHERE venta_id = $1 AND deleted_at IS NULL",
+    )
+    .bind(a.venta_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if num_dev > 0 {
+        return Err(ApiError::BadRequest(
+            "La venta tiene devoluciones parciales registradas. No se puede anular completa.".into(),
+        ));
+    }
+
+    // Restaurar stock de cada partida.
+    let items = sqlx::query(
+        "SELECT producto_id, cantidad FROM venta_detalle \
+         WHERE venta_id = $1 AND deleted_at IS NULL",
+    )
+    .bind(a.venta_id)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    let upd_stock_sql = format!(
+        "UPDATE productos SET stock_actual = stock_actual + $1, updated_at = {NOW_TEXT} \
+         WHERE id = $2"
+    );
+    for it in &items {
+        let prod_id: i64 = it.get("producto_id");
+        let cantidad: f64 = it.try_get::<rust_decimal::Decimal, _>("cantidad")
+            .ok().and_then(|d| d.to_f64()).unwrap_or(0.0);
+        sqlx::query(&upd_stock_sql)
+            .bind(cantidad)
+            .bind(prod_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+
+    // Marcar como anulada.
+    sqlx::query(
+        "UPDATE ventas SET anulada = 1, anulada_por = $1, motivo_anulacion = $2 \
+         WHERE id = $3",
+    )
+    .bind(a.usuario_id)
+    .bind(&a.motivo)
+    .bind(a.venta_id)
+    .execute(&mut *tx)
+    .await?;
+
+    // Bitácora.
+    let audit_sql = format!(
+        r#"INSERT INTO audit_log
+           (usuario_id, accion, tabla_afectada, registro_id,
+            descripcion_legible, origen, fecha)
+           VALUES ($1, 'ANULACION', 'ventas', $2, $3, 'WEB', {NOW_TEXT})"#
+    );
+    let _ = sqlx::query(&audit_sql)
+        .bind(a.usuario_id)
+        .bind(a.venta_id)
+        .bind(format!("Venta {} anulada — Motivo: {}", folio, a.motivo))
+        .execute(&mut *tx)
+        .await;
+
+    tx.commit().await?;
+    Ok(json!(true))
+}
+
+// =============================================================================
+// BITÁCORA — visor de audit_log (paridad con `commands/bitacora.rs:20`)
+// =============================================================================
+//
+// El frontend (`pages/Bitacora.tsx`) manda `{ limite, accionFiltro }`. Si la
+// columna `accion` contiene el filtro como substring, se devuelve. La tabla
+// `audit_log` postgres se creó en migration 002 y solo tiene entradas con
+// `origen='WEB'` (las del desktop viven en su SQLite local; bitácoras
+// divergentes hasta que se unifiquen — ver auditoría).
+
+async fn listar_bitacora(state: &AppState, args: &Value) -> Result<Value, ApiError> {
+    #[derive(Deserialize, Default)]
+    #[serde(rename_all = "camelCase")]
+    struct A {
+        #[serde(default)] limite: Option<i64>,
+        #[serde(default)] accion_filtro: Option<String>,
+    }
+    let a: A = serde_json::from_value(args.clone()).unwrap_or_default();
+    let lim = a.limite.unwrap_or(200).clamp(1, 1000);
+    let filtro_like = a.accion_filtro
+        .as_ref()
+        .map(|s| format!("%{}%", s));
+
+    let rows = sqlx::query(
+        r#"
+        SELECT a.id, u.nombre_completo AS usuario_nombre,
+               a.accion, a.tabla_afectada, a.registro_id,
+               a.descripcion_legible, a.origen, a.fecha
+        FROM audit_log a
+        LEFT JOIN usuarios u ON u.id = a.usuario_id
+        WHERE ($1::text IS NULL OR a.accion LIKE $1)
+        ORDER BY a.fecha DESC
+        LIMIT $2
+        "#,
+    )
+    .bind(&filtro_like)
+    .bind(lim)
+    .fetch_all(&state.pool)
+    .await?;
+
+    Ok(json!(rows.iter().map(|r| json!({
+        "id":                  r.get::<i64, _>("id"),
+        "usuario_nombre":      r.try_get::<Option<String>, _>("usuario_nombre").ok().flatten(),
+        "accion":              r.get::<String, _>("accion"),
+        "tabla_afectada":      r.try_get::<Option<String>, _>("tabla_afectada").ok().flatten(),
+        "registro_id":         r.try_get::<Option<i64>, _>("registro_id").ok().flatten(),
+        "descripcion_legible": r.try_get::<Option<String>, _>("descripcion_legible").ok().flatten().unwrap_or_default(),
+        "origen":              r.get::<String, _>("origen"),
+        "fecha":               r.get::<String, _>("fecha"),
+    })).collect::<Vec<_>>()))
 }

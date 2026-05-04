@@ -74,6 +74,14 @@ async function rpcWeb<T>(cmd: string, args?: InvokeArgs): Promise<T> {
     body: JSON.stringify(args ?? {}),
   });
   if (!res.ok) {
+    // Token expirado o inválido → limpiar sesión y forzar login
+    if (res.status === 401 && cmd !== 'login_pin' && cmd !== 'login_password') {
+      setAuthToken(null);
+      localStorage.removeItem('moto_usuario');
+      window.location.reload();
+      // Never resolves — the page reloads
+      return new Promise(() => {}) as T;
+    }
     const text = await res.text().catch(() => '');
     throw new Error(`RPC ${cmd} failed: ${res.status} ${text || res.statusText}`);
   }
