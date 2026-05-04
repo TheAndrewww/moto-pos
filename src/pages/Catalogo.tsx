@@ -318,12 +318,12 @@ export default function Catalogo() {
               </div>
             </div>
 
-            {/* Descripción */}
+            {/* Código de barras */}
             <div>
-              <label style={labelStyle}>DESCRIPCIÓN</label>
+              <label style={labelStyle}>CÓDIGO DE BARRAS</label>
               <input className="input" value={form.descripcion}
                 onChange={e => setForm(f => ({ ...f, descripcion: e.target.value }))}
-                placeholder="Descripción opcional" />
+                placeholder="Escanear o escribir código de barras" />
             </div>
 
             {/* Precios */}
@@ -773,15 +773,12 @@ export default function Catalogo() {
 
                           {p.descripcion && (
                             <p style={{
-                              fontSize: 12, color: 'var(--color-text-dim)',
+                              fontSize: 11, color: 'var(--color-text-dim)',
                               marginBottom: 8,
                               lineHeight: 1.3,
-                              display: '-webkit-box',
-                              WebkitLineClamp: 1,
-                              WebkitBoxOrient: 'vertical',
-                              overflow: 'hidden',
+                              fontFamily: 'monospace',
                             }}>
-                              {p.descripcion}
+                              🔖 {p.descripcion}
                             </p>
                           )}
 
@@ -1152,7 +1149,7 @@ function ExportarModal({
     if (lista.length === 0) return;
     setExportando(true);
     try {
-      const cabeceras = ['Codigo', 'Nombre', 'Descripcion', 'Precio Venta'];
+      const cabeceras = ['Codigo', 'Nombre', 'Codigo Barras', 'Precio Venta'];
       if (incluirCosto) cabeceras.push('Precio Costo');
       cabeceras.push('Stock', 'Categoria', 'Proveedor');
 
