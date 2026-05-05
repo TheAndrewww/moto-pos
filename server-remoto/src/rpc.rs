@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 use sqlx::Row;
 
 use crate::api::row_to_json;
-use crate::auth::{autenticar, emitir_token};
+use crate::auth::{autenticar, emitir_token_con_device, Claims};
 use crate::error::{ApiError, ApiResult};
 use crate::AppState;
 
@@ -57,7 +57,7 @@ pub async fn dispatch(
     }
 
     // Toda RPC restante requiere Bearer token válido.
-    let _claims = autenticar(&headers, &state.jwt_secret)?;
+    let claims = autenticar(&headers, &state.jwt_secret)?;
 
     let result = match cmd.as_str() {
         // ─── Catálogos (read) ────────────────────────────────
@@ -115,22 +115,30 @@ pub async fn dispatch(
         "listar_respaldos"              => json!([]),
         "crear_respaldo"                => Value::Null,
 
+        // ─── Modo de caja ────────────────────────────────────
+        // Estos dos viven aparte porque son los únicos que escriben a
+        // pos_devices (los demás solo leen el modo desde claims+BD).
+        "obtener_modo_caja"             => obtener_modo_caja(&state, &claims).await?,
+        "configurar_modo_caja"          => configurar_modo_caja(&state, &claims, &args).await?,
+
         // ─── Cortes / caja ───────────────────────────────────
-        "obtener_apertura_hoy"          => obtener_apertura_hoy(&state).await?,
-        "crear_apertura_caja"           => crear_apertura_caja(&state, &args).await?,
-        "verificar_corte_dia_pendiente" => verificar_corte_dia_pendiente(&state).await?,
-        "listar_movimientos_sin_corte"  => listar_movimientos_sin_corte(&state).await?,
-        "listar_cortes"                 => listar_cortes(&state, &args).await?,
+        // Reciben &claims para resolver el modo (espejo vs individual) y
+        // aplicar/omitir el filtro origen='web' acorde.
+        "obtener_apertura_hoy"          => obtener_apertura_hoy(&state, &claims).await?,
+        "crear_apertura_caja"           => crear_apertura_caja(&state, &claims, &args).await?,
+        "verificar_corte_dia_pendiente" => verificar_corte_dia_pendiente(&state, &claims).await?,
+        "listar_movimientos_sin_corte"  => listar_movimientos_sin_corte(&state, &claims).await?,
+        "listar_cortes"                 => listar_cortes(&state, &claims, &args).await?,
         "obtener_detalle_corte"         => obtener_detalle_corte(&state, &args).await?,
-        "obtener_fondo_sugerido"        => obtener_fondo_sugerido(&state).await?,
+        "obtener_fondo_sugerido"        => obtener_fondo_sugerido(&state, &claims).await?,
         "crear_movimiento_caja"         => crear_movimiento_caja(&state, args).await?,
-        "calcular_datos_corte"          => calcular_datos_corte(&state, &args).await?,
-        "crear_corte"                   => crear_corte(&state, args).await?,
+        "calcular_datos_corte"          => calcular_datos_corte(&state, &claims, &args).await?,
+        "crear_corte"                   => crear_corte(&state, &claims, args).await?,
 
         // ─── Ventas ──────────────────────────────────────────
         "buscar_ventas"                 => buscar_ventas(&state, &args).await?,
         "obtener_detalle_venta"         => obtener_detalle_venta(&state, &args).await?,
-        "crear_venta"                   => crear_venta(&state, args).await?,
+        "crear_venta"                   => crear_venta(&state, &claims, args).await?,
         "listar_ventas_dia"             => listar_ventas_dia(&state).await?,
         "anular_venta"                  => anular_venta(&state, &args).await?,
 
@@ -1088,7 +1096,11 @@ struct ItemVentaWeb {
     #[serde(default)] autorizado_por: Option<i64>,
 }
 
-async fn crear_venta(state: &AppState, args: Value) -> Result<Value, ApiError> {
+async fn crear_venta(
+    state: &AppState,
+    _claims: &Claims,
+    args: Value,
+) -> Result<Value, ApiError> {
     let a: CrearVentaArgs = serde_json::from_value(args)
         .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
     let d = a.venta;
@@ -1145,14 +1157,16 @@ async fn crear_venta(state: &AppState, args: Value) -> Result<Value, ApiError> {
 
     let venta_uuid = uuid::Uuid::now_v7().to_string();
 
-    // Insertar venta
+    // Insertar venta. `origen='web'` deja claro que la creó el POS web; el
+    // corte la cuenta o la ignora según el modo de caja del dispositivo
+    // (espejo cuenta todas, individual filtra origen='web').
     let insert_sql = format!(
         r#"
         INSERT INTO ventas
           (uuid, sucursal_id, folio, usuario_id, cliente_id,
            subtotal, descuento, total, metodo_pago,
-           monto_recibido, cambio, anulada, fecha, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 0, {NOW_TEXT}, {NOW_TEXT})
+           monto_recibido, cambio, anulada, origen, fecha, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 0, 'web', {NOW_TEXT}, {NOW_TEXT})
         RETURNING id, fecha
         "#
     );
@@ -1354,7 +1368,11 @@ async fn verificar_pin_dueno(state: &AppState, args: &Value) -> Result<Value, Ap
 
 async fn login_pin(state: &AppState, args: &Value) -> Result<Value, ApiError> {
     #[derive(Deserialize)]
-    struct A { pin: String }
+    #[serde(rename_all = "camelCase")]
+    struct A {
+        pin: String,
+        #[serde(default)] device_uuid: Option<String>,
+    }
     let a: A = serde_json::from_value(args.clone())
         .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
 
@@ -1372,7 +1390,7 @@ async fn login_pin(state: &AppState, args: &Value) -> Result<Value, ApiError> {
     for r in &candidatos {
         let hash: String = r.get("pin");
         if bcrypt::verify(&a.pin, &hash).unwrap_or(false) {
-            return usuario_sesion_response(&state, r).await;
+            return usuario_sesion_response(&state, r, a.device_uuid.as_deref()).await;
         }
     }
     Ok(json!({ "ok": false, "error": "PIN incorrecto" }))
@@ -1383,6 +1401,7 @@ async fn login_password(state: &AppState, args: &Value) -> Result<Value, ApiErro
     struct A {
         #[serde(rename = "nombreUsuario")] nombre_usuario: String,
         password: String,
+        #[serde(default, rename = "deviceUuid")] device_uuid: Option<String>,
     }
     let a: A = serde_json::from_value(args.clone())
         .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
@@ -1407,13 +1426,52 @@ async fn login_password(state: &AppState, args: &Value) -> Result<Value, ApiErro
     if !ok {
         return Ok(json!({ "ok": false, "error": "Credenciales incorrectas" }));
     }
-    usuario_sesion_response(&state, &r).await
+    usuario_sesion_response(&state, &r, a.device_uuid.as_deref()).await
+}
+
+/// Asegura que exista una fila en `pos_devices` para este `device_uuid`.
+/// Devuelve `(modo_caja, configurado)` donde `configurado=true` significa
+/// que el device ya había sido visto antes (no es la primera vez que entra).
+///
+/// La primera vez se inserta con `modo_caja='individual'` por default y
+/// `configurado=false`, lo que dispara el modal de bienvenida en el frontend.
+async fn upsert_pos_device(
+    state: &AppState,
+    device_uuid: &str,
+) -> Result<(String, bool), ApiError> {
+    let existente = sqlx::query(
+        "SELECT modo_caja FROM pos_devices WHERE device_uuid = $1",
+    )
+    .bind(device_uuid)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    if let Some(row) = existente {
+        let modo: String = row.get("modo_caja");
+        return Ok((modo, true));
+    }
+
+    sqlx::query(
+        "INSERT INTO pos_devices (device_uuid, sucursal_id, nombre, modo_caja) \
+         VALUES ($1, 1, $2, 'individual') \
+         ON CONFLICT (device_uuid) DO NOTHING",
+    )
+    .bind(device_uuid)
+    .bind(format!("Web {}", &device_uuid[..8.min(device_uuid.len())]))
+    .execute(&state.pool)
+    .await?;
+
+    Ok(("individual".to_string(), false))
 }
 
 /// Construye la respuesta `{ ok: true, usuario, token }` a partir de un row de usuarios.
+/// Si `device_uuid` viene del frontend, lo registra en `pos_devices` y lo
+/// embebe en los claims del JWT para que los handlers siguientes sepan
+/// qué modo de caja respetar.
 async fn usuario_sesion_response(
     state: &AppState,
     r: &sqlx::postgres::PgRow,
+    device_uuid: Option<&str>,
 ) -> Result<Value, ApiError> {
     let id: i64               = r.get("id");
     let nombre_completo: String = r.get("nombre_completo");
@@ -1421,13 +1479,20 @@ async fn usuario_sesion_response(
     let rol_id: i64           = r.get("rol_id");
     let es_admin              = rol_es_admin(rol_id);
 
+    // Si vino device_uuid, asegurar fila en pos_devices y obtener su modo.
+    let (modo_caja, modo_configurado) = match device_uuid {
+        Some(uuid) if !uuid.trim().is_empty() => upsert_pos_device(state, uuid).await?,
+        _ => ("individual".to_string(), false),
+    };
+
     // JWT que el frontend usa para todas las RPC siguientes.
-    let token = emitir_token(
+    let token = emitir_token_con_device(
         &state.jwt_secret,
         id,
         &nombre_usuario,
         if es_admin { "admin" } else { "device" },
         1,
+        device_uuid.map(|s| s.to_string()),
         chrono::Duration::days(7),
     )?;
 
@@ -1444,6 +1509,12 @@ async fn usuario_sesion_response(
             "sesion_id":       chrono::Utc::now().timestamp(), // stateless: timestamp
             "permisos":        [],
         },
+        // El frontend usa esta info para decidir si abrir el modal de bienvenida
+        // y qué chip mostrar en el topbar. Si no hay device_uuid, queda
+        // 'individual' + configurado=true (no se muestra modal — comportamiento
+        // legado).
+        "modo_caja": modo_caja,
+        "modo_configurado": modo_configurado || device_uuid.is_none(),
     }))
 }
 
@@ -2349,24 +2420,28 @@ async fn cambiar_estado_orden(state: &AppState, args: &Value) -> Result<Value, A
 // APERTURA DE CAJA
 // =============================================================================
 
-async fn obtener_apertura_hoy(state: &AppState) -> Result<Value, ApiError> {
+async fn obtener_apertura_hoy(state: &AppState, claims: &Claims) -> Result<Value, ApiError> {
     use rust_decimal::prelude::ToPrimitive;
-    // Filtramos por origen='web' para que la "caja web" tenga su propio ciclo
-    // independiente del desktop. Si el desktop ya hizo su apertura del día
-    // (origen='desktop'), eso no impide que el web abra su propia caja.
-    let row = sqlx::query(
+    // En modo 'individual' filtramos por origen='web' (la "caja web" tiene su
+    // propio ciclo independiente del desktop). En modo 'espejo' no filtramos —
+    // si el desktop ya abrió hoy, esa apertura cuenta también para el web.
+    let modo = modo_caja_de(state, claims).await?;
+    let filtro_origen = if modo == "espejo" { "" } else { "AND a.origen = 'web'" };
+
+    let sql = format!(
         r#"
         SELECT a.id, a.usuario_id, u.nombre_completo AS usuario_nombre,
                a.fondo_declarado, a.nota, a.fecha
         FROM aperturas_caja a
         JOIN usuarios u ON u.id = a.usuario_id
         WHERE a.deleted_at IS NULL
-          AND a.origen = 'web'
+          {filtro_origen}
           AND substr(a.fecha, 1, 10)
               = to_char(now() AT TIME ZONE 'America/Mexico_City', 'YYYY-MM-DD')
         ORDER BY a.id DESC LIMIT 1
-        "#,
-    )
+        "#
+    );
+    let row = sqlx::query(&sql)
     .fetch_optional(&state.pool)
     .await?;
 
@@ -2384,7 +2459,11 @@ async fn obtener_apertura_hoy(state: &AppState) -> Result<Value, ApiError> {
     })
 }
 
-async fn crear_apertura_caja(state: &AppState, args: &Value) -> Result<Value, ApiError> {
+async fn crear_apertura_caja(
+    state: &AppState,
+    claims: &Claims,
+    args: &Value,
+) -> Result<Value, ApiError> {
     #[derive(Deserialize)]
     struct A {
         datos: NuevaAperturaWeb,
@@ -2403,18 +2482,29 @@ async fn crear_apertura_caja(state: &AppState, args: &Value) -> Result<Value, Ap
         return Err(ApiError::BadRequest("El fondo no puede ser negativo".into()));
     }
 
-    // Solo bloqueamos si YA hay una apertura de la caja web hoy. La apertura
-    // del desktop (origen='desktop') es de otra caja y no debe bloquear ésta.
-    let existe: i64 = sqlx::query_scalar(
+    // Modo 'individual': solo bloqueamos si YA hay una apertura web hoy
+    //   (la del desktop es otra caja).
+    // Modo 'espejo':     bloqueamos si hay CUALQUIER apertura hoy (web o
+    //   desktop) — el web está compartiendo la caja del desktop.
+    let modo = modo_caja_de(state, claims).await?;
+    let filtro_origen = if modo == "espejo" { "" } else { "AND origen = 'web'" };
+
+    let existe_sql = format!(
         "SELECT COUNT(*)::bigint FROM aperturas_caja \
-         WHERE deleted_at IS NULL AND origen = 'web' \
+         WHERE deleted_at IS NULL {filtro_origen} \
            AND substr(fecha, 1, 10) \
-               = to_char(now() AT TIME ZONE 'America/Mexico_City', 'YYYY-MM-DD')",
-    )
+               = to_char(now() AT TIME ZONE 'America/Mexico_City', 'YYYY-MM-DD')"
+    );
+    let existe: i64 = sqlx::query_scalar(&existe_sql)
     .fetch_one(&state.pool)
     .await?;
     if existe > 0 {
-        return Err(ApiError::BadRequest("Ya existe una apertura de caja web para hoy".into()));
+        let msg = if modo == "espejo" {
+            "Ya existe una apertura de caja para hoy (compartida con el POS desktop)"
+        } else {
+            "Ya existe una apertura de caja web para hoy"
+        };
+        return Err(ApiError::BadRequest(msg.into()));
     }
 
     let sucursal_id: i64 = 1;
@@ -2488,6 +2578,178 @@ fn pg_dec(row: &sqlx::postgres::PgRow, name: &str) -> f64 {
 }
 
 const RETIRO_LIMITE_SIN_PIN: f64 = 500.0;
+
+// =============================================================================
+// MODO DE CAJA (espejo vs individual)
+// =============================================================================
+//
+// Cada navegador web declara su modo en `pos_devices.modo_caja` (ver
+// migración 005). Los handlers de aperturas/movimientos/cortes/cálculo
+// resuelven el modo del cliente actual y deciden si filtrar por
+// `origen='web'` o no:
+//
+//   - 'individual': el web es su propia caja → filtrar todo por
+//     origen='web'. Las ventas, fondos y cortes del desktop no le importan.
+//
+//   - 'espejo':     el web es otra ventana de la caja del desktop →
+//     contar TODO sin filtrar por origen. Apertura, ventas, movimientos
+//     y cortes se comparten.
+//
+// Cuando el JWT no trae `device` (tokens viejos o flujos sin login web),
+// se asume 'individual' como default seguro — replica el comportamiento
+// previo a esta feature.
+
+/// Resuelve el modo de caja para el cliente que hizo esta llamada RPC.
+/// Hace un SELECT a `pos_devices`. Cacheado: nada — la BD lo resuelve en
+/// microsegundos por índice unique.
+async fn modo_caja_de(state: &AppState, claims: &Claims) -> ApiResult<String> {
+    let Some(uuid) = claims.device.as_deref() else {
+        return Ok("individual".to_string());
+    };
+    if uuid.trim().is_empty() {
+        return Ok("individual".to_string());
+    }
+    let modo: Option<String> = sqlx::query_scalar(
+        "SELECT modo_caja FROM pos_devices WHERE device_uuid = $1",
+    )
+    .bind(uuid)
+    .fetch_optional(&state.pool)
+    .await?;
+    Ok(modo.unwrap_or_else(|| "individual".to_string()))
+}
+
+/// Lee el modo actual del dispositivo + flag de "ya configurado".
+/// `configurado=false` solo cuando el frontend acaba de generar un device_uuid
+/// nuevo y aún no lo ha visto antes esta máquina; el frontend usa esa señal
+/// para abrir el modal de bienvenida.
+async fn obtener_modo_caja(state: &AppState, claims: &Claims) -> Result<Value, ApiError> {
+    let Some(uuid) = claims.device.as_deref() else {
+        // Sin device en el JWT: el frontend no mandó deviceUuid al login.
+        // Lo tratamos como "individual configurado" — flujo legado, sin modal.
+        return Ok(json!({
+            "modo": "individual",
+            "configurado": true,
+            "device_uuid": null,
+        }));
+    };
+
+    let row = sqlx::query(
+        "SELECT modo_caja, nombre, created_at FROM pos_devices WHERE device_uuid = $1",
+    )
+    .bind(uuid)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    match row {
+        Some(r) => Ok(json!({
+            "modo":          r.get::<String, _>("modo_caja"),
+            "configurado":   true,
+            "device_uuid":   uuid,
+            "nombre":        r.try_get::<Option<String>, _>("nombre").ok().flatten(),
+        })),
+        None => Ok(json!({
+            "modo":        "individual",
+            "configurado": false,
+            "device_uuid": uuid,
+        })),
+    }
+}
+
+/// Cambia el modo de caja del dispositivo actual.
+///
+/// Validaciones (idénticas para ambos sentidos del cambio):
+///   1. Solo 'espejo' o 'individual'.
+///   2. No puede haber un corte parcial pendiente del modo actual:
+///      a) `aperturas_caja` con corte_id NULL del día — bloqueo.
+///      b) `movimientos_caja` con corte_id NULL — bloqueo.
+///      Estas garantizan que el cambio de modo no deja registros huérfanos
+///      asociados a una semántica que ya no aplica.
+async fn configurar_modo_caja(
+    state: &AppState,
+    claims: &Claims,
+    args: &Value,
+) -> Result<Value, ApiError> {
+    #[derive(Deserialize)]
+    struct A { modo: String, #[serde(default)] nombre: Option<String> }
+
+    let a: A = serde_json::from_value(args.clone())
+        .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
+
+    if a.modo != "espejo" && a.modo != "individual" {
+        return Err(ApiError::BadRequest(
+            "Modo inválido: usa 'espejo' o 'individual'".into(),
+        ));
+    }
+
+    let Some(uuid) = claims.device.as_deref() else {
+        return Err(ApiError::BadRequest(
+            "Esta sesión no tiene un dispositivo registrado. Cierra sesión y vuelve a entrar.".into(),
+        ));
+    };
+
+    let modo_actual = modo_caja_de(state, claims).await?;
+
+    // Si está cambiando de modo (no solo re-confirmando), validar que no
+    // queden movimientos del modo viejo huérfanos.
+    if modo_actual != a.modo {
+        // Movimientos sin corte que pertenecen al modo actual.
+        let where_origen = if modo_actual == "individual" {
+            "AND origen = 'web'"
+        } else {
+            "" // espejo: cualquier movimiento pendiente bloquea
+        };
+        let sql = format!(
+            "SELECT COUNT(*)::bigint FROM movimientos_caja \
+             WHERE corte_id IS NULL AND deleted_at IS NULL {where_origen}"
+        );
+        let pendientes: i64 = sqlx::query_scalar(&sql)
+            .fetch_one(&state.pool)
+            .await?;
+        if pendientes > 0 {
+            return Err(ApiError::BadRequest(
+                "No puedes cambiar el modo: hay movimientos de caja sin corte. Haz un corte parcial primero.".into(),
+            ));
+        }
+    }
+
+    // Upsert: si no existe el device aún (caso raro: JWT con device pero
+    // sin fila — solo posible si alguien borró pos_devices a mano),
+    // crearlo. El INSERT/ON CONFLICT garantiza idempotencia.
+    sqlx::query(
+        "INSERT INTO pos_devices (device_uuid, sucursal_id, nombre, modo_caja) \
+         VALUES ($1, 1, $2, $3) \
+         ON CONFLICT (device_uuid) DO UPDATE \
+            SET modo_caja = EXCLUDED.modo_caja, \
+                nombre    = COALESCE(EXCLUDED.nombre, pos_devices.nombre)",
+    )
+    .bind(uuid)
+    .bind(a.nombre.as_deref().unwrap_or(&format!("Web {}", &uuid[..8.min(uuid.len())])))
+    .bind(&a.modo)
+    .execute(&state.pool)
+    .await?;
+
+    // Bitácora — útil para debug si las cuentas no cuadran.
+    let audit_sql = format!(
+        r#"INSERT INTO audit_log
+           (usuario_id, accion, tabla_afectada, registro_id,
+            descripcion_legible, origen, fecha)
+           VALUES ($1, 'MODO_CAJA_CAMBIADO', 'pos_devices', NULL, $2, 'WEB', {NOW_TEXT})"#
+    );
+    let _ = sqlx::query(&audit_sql)
+        .bind(claims.sub)
+        .bind(format!(
+            "Modo de caja del dispositivo {} cambiado: {} → {}",
+            &uuid[..8.min(uuid.len())], modo_actual, a.modo
+        ))
+        .execute(&state.pool)
+        .await;
+
+    Ok(json!({
+        "modo":         a.modo,
+        "configurado":  true,
+        "device_uuid":  uuid,
+    }))
+}
 
 async fn crear_movimiento_caja(state: &AppState, args: Value) -> Result<Value, ApiError> {
     #[derive(Deserialize)]
@@ -2603,8 +2865,13 @@ async fn crear_movimiento_caja(state: &AppState, args: Value) -> Result<Value, A
     }))
 }
 
-async fn listar_movimientos_sin_corte(state: &AppState) -> Result<Value, ApiError> {
-    let rows = sqlx::query(
+async fn listar_movimientos_sin_corte(
+    state: &AppState,
+    claims: &Claims,
+) -> Result<Value, ApiError> {
+    let modo = modo_caja_de(state, claims).await?;
+    let filtro_origen = if modo == "espejo" { "" } else { "AND m.origen = 'web'" };
+    let sql = format!(
         r#"
         SELECT m.id, m.tipo, m.usuario_id, u.nombre_completo AS usuario_nombre,
                m.monto, m.concepto, m.autorizado_por, m.corte_id, m.fecha
@@ -2612,10 +2879,11 @@ async fn listar_movimientos_sin_corte(state: &AppState) -> Result<Value, ApiErro
         JOIN usuarios u ON u.id = m.usuario_id
         WHERE m.corte_id IS NULL
           AND m.deleted_at IS NULL
-          AND m.origen = 'web'
+          {filtro_origen}
         ORDER BY m.fecha DESC
-        "#,
-    )
+        "#
+    );
+    let rows = sqlx::query(&sql)
     .fetch_all(&state.pool)
     .await?;
 
@@ -2632,7 +2900,11 @@ async fn listar_movimientos_sin_corte(state: &AppState) -> Result<Value, ApiErro
     })).collect::<Vec<_>>()))
 }
 
-async fn calcular_datos_corte(state: &AppState, args: &Value) -> Result<Value, ApiError> {
+async fn calcular_datos_corte(
+    state: &AppState,
+    claims: &Claims,
+    args: &Value,
+) -> Result<Value, ApiError> {
     #[derive(Deserialize)]
     struct A {
         // Frontend manda camelCase via invokeCompat (sin conversion en web).
@@ -2642,20 +2914,27 @@ async fn calcular_datos_corte(state: &AppState, args: &Value) -> Result<Value, A
     let a: A = serde_json::from_value(args.clone())
         .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
 
-    // Importante: las VENTAS no tienen columna `origen` (no quisimos migrar la
-    // tabla más grande). Las ventas hechas desde web se insertan en la misma
-    // tabla que las del desktop. Para el corte web, sumamos TODAS las ventas
-    // del rango, asumiendo que el web lleva su propio rango de fechas que no
-    // se traslapa con el corte parcial del desktop.
+    // Filtros por modo:
+    //   'individual': cada tabla filtra por su propio origen='web' — la
+    //                 caja web es independiente del desktop.
+    //   'espejo':     NO filtra — todo lo que cae en el rango cuenta,
+    //                 incluyendo ventas/movimientos/cortes del desktop.
     //
-    // En la práctica: el primer corte del día web considera ventas desde la
-    // apertura de la caja web (o, si no hay apertura web, desde el último
-    // corte web). El frontend ya pasa fecha_inicio = última apertura/corte.
+    // Antes del PR de modo_caja, ventas NO tenía columna `origen` y el
+    // filtro siempre era "espejo" para ventas. Migración 005 agregó esa
+    // columna; ahora en modo individual también filtramos ventas.
+    let modo = modo_caja_de(state, claims).await?;
+    let f_ventas = if modo == "espejo" { "" } else { "AND origen = 'web'" };
+    let f_mov   = if modo == "espejo" { "" } else { "AND m.origen = 'web'" };
+    let f_aper  = if modo == "espejo" { "" } else { "AND origen = 'web'" };
+    let f_corte = if modo == "espejo" { "" } else { "AND origen = 'web'" };
 
     let efectivo: f64 = sqlx::query_scalar::<_, rust_decimal::Decimal>(
-        "SELECT COALESCE(SUM(total), 0)::numeric FROM ventas \
-         WHERE fecha BETWEEN $1 AND $2 AND anulada = 0 \
-           AND metodo_pago = 'efectivo' AND deleted_at IS NULL",
+        &format!(
+            "SELECT COALESCE(SUM(total), 0)::numeric FROM ventas \
+             WHERE fecha BETWEEN $1 AND $2 AND anulada = 0 \
+               AND metodo_pago = 'efectivo' AND deleted_at IS NULL {f_ventas}"
+        ),
     )
     .bind(&a.fecha_inicio).bind(&a.fecha_fin)
     .fetch_one(&state.pool).await
@@ -2663,9 +2942,11 @@ async fn calcular_datos_corte(state: &AppState, args: &Value) -> Result<Value, A
     .unwrap_or(0.0);
 
     let tarjeta: f64 = sqlx::query_scalar::<_, rust_decimal::Decimal>(
-        "SELECT COALESCE(SUM(total), 0)::numeric FROM ventas \
-         WHERE fecha BETWEEN $1 AND $2 AND anulada = 0 \
-           AND metodo_pago = 'tarjeta' AND deleted_at IS NULL",
+        &format!(
+            "SELECT COALESCE(SUM(total), 0)::numeric FROM ventas \
+             WHERE fecha BETWEEN $1 AND $2 AND anulada = 0 \
+               AND metodo_pago = 'tarjeta' AND deleted_at IS NULL {f_ventas}"
+        ),
     )
     .bind(&a.fecha_inicio).bind(&a.fecha_fin)
     .fetch_one(&state.pool).await
@@ -2673,9 +2954,11 @@ async fn calcular_datos_corte(state: &AppState, args: &Value) -> Result<Value, A
     .unwrap_or(0.0);
 
     let transferencia: f64 = sqlx::query_scalar::<_, rust_decimal::Decimal>(
-        "SELECT COALESCE(SUM(total), 0)::numeric FROM ventas \
-         WHERE fecha BETWEEN $1 AND $2 AND anulada = 0 \
-           AND metodo_pago = 'transferencia' AND deleted_at IS NULL",
+        &format!(
+            "SELECT COALESCE(SUM(total), 0)::numeric FROM ventas \
+             WHERE fecha BETWEEN $1 AND $2 AND anulada = 0 \
+               AND metodo_pago = 'transferencia' AND deleted_at IS NULL {f_ventas}"
+        ),
     )
     .bind(&a.fecha_inicio).bind(&a.fecha_fin)
     .fetch_one(&state.pool).await
@@ -2683,11 +2966,13 @@ async fn calcular_datos_corte(state: &AppState, args: &Value) -> Result<Value, A
     .unwrap_or(0.0);
 
     let agg = sqlx::query(
-        "SELECT COUNT(*)::bigint AS n, \
-                COALESCE(SUM(total), 0)::numeric AS total, \
-                COALESCE(SUM(descuento), 0)::numeric AS desc \
-         FROM ventas \
-         WHERE fecha BETWEEN $1 AND $2 AND anulada = 0 AND deleted_at IS NULL",
+        &format!(
+            "SELECT COUNT(*)::bigint AS n, \
+                    COALESCE(SUM(total), 0)::numeric AS total, \
+                    COALESCE(SUM(descuento), 0)::numeric AS desc \
+             FROM ventas \
+             WHERE fecha BETWEEN $1 AND $2 AND anulada = 0 AND deleted_at IS NULL {f_ventas}"
+        ),
     )
     .bind(&a.fecha_inicio).bind(&a.fecha_fin)
     .fetch_one(&state.pool).await?;
@@ -2696,16 +2981,18 @@ async fn calcular_datos_corte(state: &AppState, args: &Value) -> Result<Value, A
     let total_descuentos: f64 = pg_dec(&agg, "desc");
 
     let total_anulaciones: f64 = sqlx::query_scalar::<_, rust_decimal::Decimal>(
-        "SELECT COALESCE(SUM(total), 0)::numeric FROM ventas \
-         WHERE fecha BETWEEN $1 AND $2 AND anulada = 1 AND deleted_at IS NULL",
+        &format!(
+            "SELECT COALESCE(SUM(total), 0)::numeric FROM ventas \
+             WHERE fecha BETWEEN $1 AND $2 AND anulada = 1 AND deleted_at IS NULL {f_ventas}"
+        ),
     )
     .bind(&a.fecha_inicio).bind(&a.fecha_fin)
     .fetch_one(&state.pool).await
     .ok().and_then(|d| { use rust_decimal::prelude::ToPrimitive; d.to_f64() })
     .unwrap_or(0.0);
 
-    // Movimientos sin corte (origen=web)
-    let mov_rows = sqlx::query(
+    // Movimientos sin corte (filtrados por modo)
+    let mov_sql = format!(
         r#"
         SELECT m.id, m.tipo, m.usuario_id, u.nombre_completo AS usuario_nombre,
                m.monto, m.concepto, m.autorizado_por, m.corte_id, m.fecha
@@ -2713,10 +3000,11 @@ async fn calcular_datos_corte(state: &AppState, args: &Value) -> Result<Value, A
         JOIN usuarios u ON u.id = m.usuario_id
         WHERE m.corte_id IS NULL
           AND m.deleted_at IS NULL
-          AND m.origen = 'web'
+          {f_mov}
         ORDER BY m.fecha ASC
-        "#,
-    )
+        "#
+    );
+    let mov_rows = sqlx::query(&mov_sql)
     .fetch_all(&state.pool)
     .await?;
 
@@ -2739,35 +3027,39 @@ async fn calcular_datos_corte(state: &AppState, args: &Value) -> Result<Value, A
         .filter(|r| r.get::<String, _>("tipo") == "RETIRO")
         .map(|r| pg_dec(r, "monto")).sum();
 
-    // Fondo inicial: apertura web del día > último fondo_siguiente del último
-    // corte web > 0.
+    // Fondo inicial: apertura del día (filtrada por modo) > último fondo_siguiente
+    // del último corte (filtrado por modo) > 0.
     let dia: &str = if a.fecha_inicio.len() >= 10 { &a.fecha_inicio[..10] } else { "" };
-    let fondo_apertura: Option<f64> = sqlx::query_scalar::<_, rust_decimal::Decimal>(
+    let aper_sql = format!(
         "SELECT fondo_declarado::numeric FROM aperturas_caja \
          WHERE substr(fecha, 1, 10) = $1 \
-           AND origen = 'web' AND deleted_at IS NULL \
-         LIMIT 1",
-    )
+           AND deleted_at IS NULL {f_aper} \
+         LIMIT 1"
+    );
+    let fondo_apertura: Option<f64> = sqlx::query_scalar::<_, rust_decimal::Decimal>(&aper_sql)
     .bind(dia)
     .fetch_optional(&state.pool).await?
     .and_then(|d| { use rust_decimal::prelude::ToPrimitive; d.to_f64() });
 
     let fondo_inicial: f64 = match fondo_apertura {
         Some(f) => f,
-        None => sqlx::query_scalar::<_, rust_decimal::Decimal>(
-            "SELECT fondo_siguiente::numeric FROM cortes \
-             WHERE origen = 'web' AND deleted_at IS NULL \
-             ORDER BY created_at DESC LIMIT 1",
-        )
-        .fetch_optional(&state.pool).await?
-        .and_then(|d| { use rust_decimal::prelude::ToPrimitive; d.to_f64() })
-        .unwrap_or(0.0),
+        None => {
+            let corte_sql = format!(
+                "SELECT fondo_siguiente::numeric FROM cortes \
+                 WHERE deleted_at IS NULL {f_corte} \
+                 ORDER BY created_at DESC LIMIT 1"
+            );
+            sqlx::query_scalar::<_, rust_decimal::Decimal>(&corte_sql)
+                .fetch_optional(&state.pool).await?
+                .and_then(|d| { use rust_decimal::prelude::ToPrimitive; d.to_f64() })
+                .unwrap_or(0.0)
+        }
     };
 
     let efectivo_esperado = fondo_inicial + efectivo + total_entradas - total_retiros;
 
     // Vendedores
-    let vrows = sqlx::query(
+    let vend_sql = format!(
         r#"
         SELECT v.usuario_id, u.nombre_completo AS usuario_nombre,
                COUNT(*)::bigint AS num_ventas,
@@ -2777,10 +3069,13 @@ async fn calcular_datos_corte(state: &AppState, args: &Value) -> Result<Value, A
         FROM ventas v
         JOIN usuarios u ON u.id = v.usuario_id
         WHERE v.fecha BETWEEN $1 AND $2 AND v.anulada = 0 AND v.deleted_at IS NULL
+          {f_ventas_v}
         GROUP BY v.usuario_id, u.nombre_completo
         ORDER BY total DESC
         "#,
-    )
+        f_ventas_v = if modo == "espejo" { "" } else { "AND v.origen = 'web'" }
+    );
+    let vrows = sqlx::query(&vend_sql)
     .bind(&a.fecha_inicio).bind(&a.fecha_fin)
     .fetch_all(&state.pool)
     .await?;
@@ -2813,7 +3108,11 @@ async fn calcular_datos_corte(state: &AppState, args: &Value) -> Result<Value, A
     }))
 }
 
-async fn crear_corte(state: &AppState, args: Value) -> Result<Value, ApiError> {
+async fn crear_corte(
+    state: &AppState,
+    claims: &Claims,
+    args: Value,
+) -> Result<Value, ApiError> {
     #[derive(Deserialize)]
     struct A { datos: NuevoCorteWeb }
     #[derive(Deserialize)]
@@ -2867,22 +3166,32 @@ async fn crear_corte(state: &AppState, args: Value) -> Result<Value, ApiError> {
     }
 
     let sucursal_id: i64 = 1;
+    let modo = modo_caja_de(state, claims).await?;
+    let f_corte_origen = if modo == "espejo" { "" } else { "AND origen = 'web'" };
+    let f_mov_origen   = if modo == "espejo" { "" } else { "AND origen = 'web'" };
+
     let mut tx = state.pool.begin().await?;
 
-    // Solo un corte DIA web por día
+    // Solo un corte DIA por día. En modo individual: web no se traslapa con
+    // su otro web. En modo espejo: cualquier corte DIA hoy bloquea (la caja
+    // unificada no puede cerrarse dos veces).
     if c.tipo == "DIA" {
         let dia = if c.fecha_inicio.len() >= 10 { &c.fecha_inicio[..10] } else { "" };
-        let existe: i64 = sqlx::query_scalar(
+        let dup_sql = format!(
             "SELECT COUNT(*)::bigint FROM cortes \
-             WHERE tipo = 'DIA' AND origen = 'web' AND deleted_at IS NULL \
-               AND substr(created_at, 1, 10) = $1",
-        )
+             WHERE tipo = 'DIA' AND deleted_at IS NULL {f_corte_origen} \
+               AND substr(created_at, 1, 10) = $1"
+        );
+        let existe: i64 = sqlx::query_scalar(&dup_sql)
         .bind(dia)
         .fetch_one(&mut *tx).await?;
         if existe > 0 {
-            return Err(ApiError::BadRequest(
-                "Ya existe un corte del día (web) para esta fecha".into(),
-            ));
+            let msg = if modo == "espejo" {
+                "Ya existe un corte del día para esta fecha (caja compartida con desktop)"
+            } else {
+                "Ya existe un corte del día (web) para esta fecha"
+            };
+            return Err(ApiError::BadRequest(msg.into()));
         }
     }
 
@@ -2934,12 +3243,15 @@ async fn crear_corte(state: &AppState, args: Value) -> Result<Value, ApiError> {
     let corte_id: i64 = row.get("id");
     let created_at: String = row.get("created_at");
 
-    // Asociar movimientos pendientes web a este corte
-    sqlx::query(
+    // Asociar movimientos pendientes a este corte. En modo individual solo
+    // los del web; en modo espejo asocia TODOS (incluyendo los del desktop)
+    // porque comparten caja.
+    let upd_sql = format!(
         "UPDATE movimientos_caja \
          SET corte_id = $1, updated_at = $2 \
-         WHERE corte_id IS NULL AND origen = 'web' AND deleted_at IS NULL",
-    )
+         WHERE corte_id IS NULL AND deleted_at IS NULL {f_mov_origen}"
+    );
+    sqlx::query(&upd_sql)
     .bind(corte_id)
     .bind(&created_at)
     .execute(&mut *tx)
@@ -3020,23 +3332,30 @@ async fn crear_corte(state: &AppState, args: Value) -> Result<Value, ApiError> {
     }))
 }
 
-async fn listar_cortes(state: &AppState, args: &Value) -> Result<Value, ApiError> {
+async fn listar_cortes(
+    state: &AppState,
+    claims: &Claims,
+    args: &Value,
+) -> Result<Value, ApiError> {
     #[derive(Deserialize, Default)]
     struct A { #[serde(default)] limite: Option<i64> }
     let a: A = serde_json::from_value(args.clone()).unwrap_or_default();
     let limite = a.limite.unwrap_or(50);
+    let modo = modo_caja_de(state, claims).await?;
+    let f_origen = if modo == "espejo" { "" } else { "AND c.origen = 'web'" };
 
-    let rows = sqlx::query(
+    let sql = format!(
         r#"
         SELECT c.id, c.tipo, u.nombre_completo AS usuario_nombre, c.created_at,
                c.efectivo_esperado, c.efectivo_contado, c.diferencia, c.fondo_siguiente
         FROM cortes c
         JOIN usuarios u ON u.id = c.usuario_id
-        WHERE c.origen = 'web' AND c.deleted_at IS NULL
+        WHERE c.deleted_at IS NULL {f_origen}
         ORDER BY c.created_at DESC
         LIMIT $1
-        "#,
-    )
+        "#
+    );
+    let rows = sqlx::query(&sql)
     .bind(limite)
     .fetch_all(&state.pool)
     .await?;
@@ -3147,41 +3466,56 @@ async fn obtener_detalle_corte(state: &AppState, args: &Value) -> Result<Value, 
     }))
 }
 
-async fn obtener_fondo_sugerido(state: &AppState) -> Result<Value, ApiError> {
-    let fondo: Option<f64> = sqlx::query_scalar::<_, rust_decimal::Decimal>(
+async fn obtener_fondo_sugerido(state: &AppState, claims: &Claims) -> Result<Value, ApiError> {
+    let modo = modo_caja_de(state, claims).await?;
+    let f_origen = if modo == "espejo" { "" } else { "AND origen = 'web'" };
+    let sql = format!(
         "SELECT fondo_siguiente::numeric FROM cortes \
-         WHERE tipo = 'DIA' AND origen = 'web' AND deleted_at IS NULL \
-         ORDER BY created_at DESC LIMIT 1",
-    )
+         WHERE tipo = 'DIA' AND deleted_at IS NULL {f_origen} \
+         ORDER BY created_at DESC LIMIT 1"
+    );
+    let fondo: Option<f64> = sqlx::query_scalar::<_, rust_decimal::Decimal>(&sql)
     .fetch_optional(&state.pool).await?
     .and_then(|d| { use rust_decimal::prelude::ToPrimitive; d.to_f64() });
 
     Ok(json!(fondo.unwrap_or(2000.0)))
 }
 
-async fn verificar_corte_dia_pendiente(state: &AppState) -> Result<Value, ApiError> {
-    // Día más reciente con ventas (cualquier origen) anterior a HOY que NO
-    // tenga corte DIA web. Igual que el desktop pero filtrando origen='web'
-    // en cortes — porque desde la web sólo nos interesa el corte web.
-    let pendiente: Option<String> = sqlx::query_scalar(
+async fn verificar_corte_dia_pendiente(
+    state: &AppState,
+    claims: &Claims,
+) -> Result<Value, ApiError> {
+    // Día más reciente con ventas anterior a HOY que NO tenga corte DIA.
+    //
+    // - 'individual': solo nos importan ventas de origen='web' y solo cortes
+    //   DIA web cubren la deuda. Mantiene el comportamiento previo.
+    // - 'espejo':     cualquier venta del día (web o desktop) cuenta y
+    //   cualquier corte DIA (web o desktop) la cubre.
+    let modo = modo_caja_de(state, claims).await?;
+    let f_v_origen = if modo == "espejo" { "" } else { "AND v.origen = 'web'" };
+    let f_c_origen = if modo == "espejo" { "" } else { "AND c.origen = 'web'" };
+
+    let sql = format!(
         r#"
         SELECT substr(v.fecha, 1, 10) AS dia
         FROM ventas v
         WHERE substr(v.fecha, 1, 10)
               < to_char(now() AT TIME ZONE 'America/Mexico_City', 'YYYY-MM-DD')
           AND v.deleted_at IS NULL
+          {f_v_origen}
           AND NOT EXISTS (
               SELECT 1 FROM cortes c
               WHERE c.tipo = 'DIA'
-                AND c.origen = 'web'
                 AND c.deleted_at IS NULL
+                {f_c_origen}
                 AND substr(c.fecha_fin, 1, 10) = substr(v.fecha, 1, 10)
           )
         GROUP BY dia
         ORDER BY dia DESC
         LIMIT 1
-        "#,
-    )
+        "#
+    );
+    let pendiente: Option<String> = sqlx::query_scalar(&sql)
     .fetch_optional(&state.pool)
     .await?;
 

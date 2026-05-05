@@ -32,6 +32,7 @@ function apiBase(): string {
 }
 
 const TOKEN_KEY = 'moto_token';
+const DEVICE_KEY = 'moto_device_uuid';
 
 export function setAuthToken(token: string | null): void {
   if (token) localStorage.setItem(TOKEN_KEY, token);
@@ -41,6 +42,38 @@ export function setAuthToken(token: string | null): void {
 export function getAuthToken(): string | null {
   if (typeof localStorage === 'undefined') return null;
   return localStorage.getItem(TOKEN_KEY);
+}
+
+/**
+ * Identifica de manera estable a esta instancia del navegador (web POS).
+ * Solo aplica en modo web — en Tauri devuelve null (el desktop ya tiene
+ * su propio sistema de identidad).
+ *
+ * Generamos un UUID v4 la primera vez y lo guardamos en localStorage.
+ * Persistente entre recargas. Si el usuario borra storage, se genera uno
+ * nuevo y `pos_devices` lo trata como dispositivo nuevo (le pide configurar
+ * su modo de caja con el modal de bienvenida).
+ */
+export function getOrCreateDeviceUuid(): string | null {
+  if (isTauri()) return null;
+  if (typeof localStorage === 'undefined') return null;
+
+  const existing = localStorage.getItem(DEVICE_KEY);
+  if (existing) return existing;
+
+  // crypto.randomUUID() requiere contexto seguro (HTTPS o localhost).
+  // Como fallback hacemos un v4 manual con Math.random — suficiente para
+  // identificar dispositivos (no es input de seguridad).
+  const uuid =
+    typeof crypto !== 'undefined' && 'randomUUID' in crypto
+      ? crypto.randomUUID()
+      : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+          const r = (Math.random() * 16) | 0;
+          const v = c === 'x' ? r : (r & 0x3) | 0x8;
+          return v.toString(16);
+        });
+  localStorage.setItem(DEVICE_KEY, uuid);
+  return uuid;
 }
 
 /**

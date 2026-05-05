@@ -2,8 +2,9 @@
 // Navegación lateral + contenido dinámico
 
 import { useState, useEffect } from 'react';
-import { useAuthStore } from '../store/authStore';
+import { useAuthStore, leerModoCaja, setModoCajaLocal } from '../store/authStore';
 import { invoke, isTauri } from '../lib/invokeCompat';
+import ModalModoCaja from '../components/ModalModoCaja';
 import PuntoDeVenta from './PuntoDeVenta';
 import Catalogo from './Catalogo';
 import UsuariosPage from './Usuarios';
@@ -48,6 +49,14 @@ export default function Dashboard() {
   const [stockBajoCount, setStockBajoCount] = useState<number>(0);
   const [stockAlertDismiss, setStockAlertDismiss] = useState<boolean>(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState<boolean>(false);
+
+  // Modo de caja (solo aplica en web). Si el usuario no ha configurado nunca,
+  // mostramos el modal de bienvenida bloqueante. Después puede cambiarlo
+  // desde el botón del topbar (chip clickeable).
+  const [modoCaja, setModoCajaState] = useState<'espejo' | 'individual'>(() => leerModoCaja().modo);
+  const [modoConfigurado, setModoConfigurado] = useState<boolean>(() => leerModoCaja().configurado);
+  const [forzarModalModo, setForzarModalModo] = useState<boolean>(false);
+  const debeMostrarModalModo = !isTauri() && (!modoConfigurado || forzarModalModo);
   const { obtenerAperturaHoy } = useCortesStore();
 
   // Triggers para abrir modales de cortes desde shortcuts globales
@@ -61,6 +70,21 @@ export default function Dashboard() {
   useEffect(() => {
     invoke<string | null>('verificar_corte_dia_pendiente')
       .then(fecha => setCortePendiente(fecha))
+      .catch(() => {});
+  }, []);
+
+  // Sync el modo de caja con la fuente de verdad (postgres). Importante por
+  // si el usuario abrió otra pestaña que cambió el modo, o si vino de un
+  // token JWT viejo sin device_uuid.
+  useEffect(() => {
+    if (isTauri()) return;
+    invoke<{ modo: 'espejo' | 'individual'; configurado: boolean } | null>('obtener_modo_caja')
+      .then((r) => {
+        if (!r) return;
+        setModoCajaState(r.modo);
+        setModoConfigurado(r.configurado);
+        setModoCajaLocal(r.modo, r.configurado);
+      })
       .catch(() => {});
   }, []);
 
@@ -134,8 +158,23 @@ export default function Dashboard() {
 
   return (
     <>
+    {/* Modal de modo de caja — bloqueante el primer login en este navegador.
+        Aparece ANTES que el modal de apertura para asegurar que el modo esté
+        decidido antes de tocar dinero. */}
+    {debeMostrarModalModo && (
+      <ModalModoCaja
+        bloqueante={!modoConfigurado}
+        modoActual={modoCaja}
+        onSeleccion={(m) => {
+          setModoCajaState(m);
+          setModoConfigurado(true);
+          setForzarModalModo(false);
+        }}
+        onCerrar={() => setForzarModalModo(false)}
+      />
+    )}
     {/* Modal bloqueante de apertura de caja — debe completarse antes de operar */}
-    {!verificandoApertura && necesitaApertura && (
+    {!verificandoApertura && necesitaApertura && !debeMostrarModalModo && (
       <ModalAperturaCaja
         bloqueante
         onSuccess={() => setNecesitaApertura(false)}
@@ -165,6 +204,33 @@ export default function Dashboard() {
             <span className="sync-dot sync-ok" />
             <span className="pos-hide-mobile" style={{ fontSize: 11, color: 'var(--color-text-muted)' }}>Local</span>
           </div>
+
+          {/* Chip de modo de caja — solo visible en web. Click para cambiar. */}
+          {!isTauri() && modoConfigurado && (
+            <button
+              onClick={() => setForzarModalModo(true)}
+              title={
+                modoCaja === 'espejo'
+                  ? 'Caja compartida con POS desktop. Click para cambiar.'
+                  : 'Caja propia independiente. Click para cambiar.'
+              }
+              className="btn-ghost"
+              style={{
+                display: 'flex', alignItems: 'center', gap: 6,
+                fontSize: 11, fontWeight: 600,
+                padding: '4px 10px', borderRadius: 999,
+                background: modoCaja === 'espejo' ? 'rgba(59,130,246,0.12)' : 'rgba(16,185,129,0.12)',
+                color:      modoCaja === 'espejo' ? '#3b82f6' : '#10b981',
+                border: '1px solid currentColor',
+                cursor: 'pointer',
+              }}
+            >
+              <span>{modoCaja === 'espejo' ? '🪞' : '🧾'}</span>
+              <span className="pos-hide-mobile">
+                {modoCaja === 'espejo' ? 'Caja espejo' : 'Caja propia'}
+              </span>
+            </button>
+          )}
 
           {/* Usuario */}
           <div style={{

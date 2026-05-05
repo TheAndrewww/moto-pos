@@ -1,7 +1,7 @@
 // store/authStore.ts — Estado global de autenticación (Zustand)
 
 import { create } from 'zustand';
-import { invoke, setAuthToken, isTauri } from '../lib/invokeCompat';
+import { invoke, setAuthToken, isTauri, getOrCreateDeviceUuid } from '../lib/invokeCompat';
 
 // En modo web, persistimos el objeto `usuario` en localStorage junto con el
 // JWT, para que recargar la página no expulse al usuario. En Tauri la sesión
@@ -22,6 +22,36 @@ function guardarUsuarioPersistido(u: UsuarioSesion | null): void {
     if (u) localStorage.setItem(USER_KEY, JSON.stringify(u));
     else localStorage.removeItem(USER_KEY);
   } catch { /* quota / safari privado: no-op */ }
+}
+
+// Cache local del modo de caja del dispositivo. La fuente de verdad vive en
+// `pos_devices` (postgres), pero guardamos copia local para evitar un round-trip
+// en cada render del topbar y para saber si abrir el modal de bienvenida sin
+// llamar al backend.
+const MODO_CAJA_KEY = 'moto_modo_caja';
+const MODO_CONFIGURADO_KEY = 'moto_modo_configurado';
+
+function guardarModoCaja(modo: 'espejo' | 'individual', configurado: boolean): void {
+  if (isTauri()) return;
+  try {
+    localStorage.setItem(MODO_CAJA_KEY, modo);
+    localStorage.setItem(MODO_CONFIGURADO_KEY, configurado ? '1' : '0');
+  } catch { /* no-op */ }
+}
+
+export function leerModoCaja(): { modo: 'espejo' | 'individual'; configurado: boolean } {
+  if (isTauri()) return { modo: 'individual', configurado: true };
+  try {
+    const modo = (localStorage.getItem(MODO_CAJA_KEY) as 'espejo' | 'individual') ?? 'individual';
+    const configurado = localStorage.getItem(MODO_CONFIGURADO_KEY) === '1';
+    return { modo, configurado };
+  } catch {
+    return { modo: 'individual', configurado: true };
+  }
+}
+
+export function setModoCajaLocal(modo: 'espejo' | 'individual', configurado: boolean): void {
+  guardarModoCaja(modo, configurado);
 }
 
 export interface Permiso {
@@ -83,12 +113,19 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   loginPin: async (pin) => {
     set({ cargando: true, error: null });
     try {
-      // En web mode el backend devuelve `token`; en Tauri viene undefined.
+      // En web: mandamos el deviceUuid para que el backend lo registre en
+      // pos_devices y embebe el modo de caja en el JWT. En Tauri es null
+      // y el backend ignora el campo.
+      const deviceUuid = getOrCreateDeviceUuid();
       const result = await invoke<{
         ok: boolean; usuario?: UsuarioSesion; error?: string; token?: string;
-      }>('login_pin', { pin });
+        modo_caja?: 'espejo' | 'individual'; modo_configurado?: boolean;
+      }>('login_pin', { pin, deviceUuid });
       if (result.ok && result.usuario) {
         if (result.token) setAuthToken(result.token);
+        if (result.modo_caja !== undefined) {
+          guardarModoCaja(result.modo_caja, result.modo_configurado ?? true);
+        }
         guardarUsuarioPersistido(result.usuario);
         set({ usuario: result.usuario, cargando: false, error: null });
         return true;
@@ -105,11 +142,16 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   loginPassword: async (nombre_usuario, password) => {
     set({ cargando: true, error: null });
     try {
+      const deviceUuid = getOrCreateDeviceUuid();
       const result = await invoke<{
         ok: boolean; usuario?: UsuarioSesion; error?: string; token?: string;
-      }>('login_password', { nombreUsuario: nombre_usuario, password });
+        modo_caja?: 'espejo' | 'individual'; modo_configurado?: boolean;
+      }>('login_password', { nombreUsuario: nombre_usuario, password, deviceUuid });
       if (result.ok && result.usuario) {
         if (result.token) setAuthToken(result.token);
+        if (result.modo_caja !== undefined) {
+          guardarModoCaja(result.modo_caja, result.modo_configurado ?? true);
+        }
         guardarUsuarioPersistido(result.usuario);
         set({ usuario: result.usuario, cargando: false, error: null });
         return true;

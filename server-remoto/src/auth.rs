@@ -5,11 +5,14 @@
 //   - Llamadas del POS a /sync/push y /sync/pull (obtenido vía configurar_sync)
 //
 // Claims:
-//   sub:      admin_users.id
-//   email:    admin_users.email
-//   role:     "admin" | "device"
-//   sucursal: i64 default
-//   exp:      unix seconds
+//   sub:        admin_users.id
+//   email:      admin_users.email
+//   role:       "admin" | "device"
+//   sucursal:   i64 default
+//   device:     device_uuid del navegador web (opcional — solo en login_pin/
+//               login_password). Permite a los handlers determinar el
+//               modo de caja del dispositivo (`pos_devices.modo_caja`).
+//   exp:        unix seconds
 
 use axum::{
     extract::State,
@@ -29,6 +32,12 @@ pub struct Claims {
     pub email: String,
     pub role: String,
     pub sucursal: i64,
+    /// UUID del dispositivo web. Llena en login_pin/login_password cuando
+    /// el frontend manda `deviceUuid`. Tokens emitidos antes del modo_caja
+    /// (o usados desde otros flujos como `/login` admin) lo dejan en None
+    /// y los handlers tratan al cliente como modo 'individual' por default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
     pub exp: i64,
 }
 
@@ -109,12 +118,28 @@ pub fn emitir_token(
     sucursal: i64,
     ttl: Duration,
 ) -> Result<String, jsonwebtoken::errors::Error> {
+    emitir_token_con_device(secret, sub, email, role, sucursal, None, ttl)
+}
+
+/// Variante de `emitir_token` que incluye el `device_uuid` en los claims.
+/// Usado por `login_pin`/`login_password` cuando el frontend web manda su
+/// identificador de dispositivo.
+pub fn emitir_token_con_device(
+    secret: &[u8],
+    sub: i64,
+    email: &str,
+    role: &str,
+    sucursal: i64,
+    device: Option<String>,
+    ttl: Duration,
+) -> Result<String, jsonwebtoken::errors::Error> {
     let exp = (Utc::now() + ttl).timestamp();
     let claims = Claims {
         sub,
         email: email.to_string(),
         role: role.to_string(),
         sucursal,
+        device,
         exp,
     };
     encode(
