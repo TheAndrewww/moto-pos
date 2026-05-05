@@ -136,14 +136,14 @@ pub async fn dispatch(
         "crear_corte"                   => crear_corte(&state, &claims, args).await?,
 
         // ─── Ventas ──────────────────────────────────────────
-        "buscar_ventas"                 => buscar_ventas(&state, &args).await?,
+        "buscar_ventas"                 => buscar_ventas(&state, &claims, &args).await?,
         "obtener_detalle_venta"         => obtener_detalle_venta(&state, &args).await?,
         "crear_venta"                   => crear_venta(&state, &claims, args).await?,
-        "listar_ventas_dia"             => listar_ventas_dia(&state).await?,
-        "anular_venta"                  => anular_venta(&state, &args).await?,
+        "listar_ventas_dia"             => listar_ventas_dia(&state, &claims).await?,
+        "anular_venta"                  => anular_venta(&state, &claims, &args).await?,
 
         // ─── Estadísticas ────────────────────────────────────
-        "obtener_estadisticas_dia"      => obtener_estadisticas_dia(&state, &args).await?,
+        "obtener_estadisticas_dia"      => obtener_estadisticas_dia(&state, &claims, &args).await?,
 
         // ─── Bitácora (read) ─────────────────────────────────
         "listar_bitacora"               => listar_bitacora(&state, &args).await?,
@@ -154,7 +154,7 @@ pub async fn dispatch(
         // ─── Devoluciones ────────────────────────────────────
         "listar_devoluciones"           => listar_devoluciones(&state, &args).await?,
         "obtener_detalle_devolucion"    => obtener_detalle_devolucion(&state, &args).await?,
-        "crear_devolucion"              => crear_devolucion(&state, args).await?,
+        "crear_devolucion"              => crear_devolucion(&state, &claims, args).await?,
 
         // ─── Recepciones ─────────────────────────────────────
         "listar_recepciones"            => listar_recepciones(&state).await?,
@@ -920,13 +920,22 @@ struct BuscarVentasArgs {
     #[serde(default)] texto:  Option<String>,
 }
 
-async fn buscar_ventas(state: &AppState, args: &Value) -> Result<Value, ApiError> {
+async fn buscar_ventas(
+    state: &AppState,
+    claims: &Claims,
+    args: &Value,
+) -> Result<Value, ApiError> {
     use rust_decimal::prelude::ToPrimitive;
     let a: BuscarVentasArgs = serde_json::from_value(args.clone()).unwrap_or_default();
     let limite  = a.limite.unwrap_or(100).clamp(1, 500);
     let q_like  = a.texto.as_ref().map(|s| format!("%{}%", s.to_lowercase()));
 
-    let rows = sqlx::query(
+    // En modo individual el historial muestra solo ventas web (la caja del
+    // dispositivo). En modo espejo, todas — el web ve la historia compartida.
+    let modo = modo_caja_de(state, claims).await?;
+    let f_origen = if modo == "espejo" { "" } else { "AND v.origen = 'web'" };
+
+    let sql = format!(
         r#"
         SELECT v.id, v.folio, v.total, v.metodo_pago, v.anulada, v.fecha,
                u.nombre_completo AS usuario_nombre,
@@ -938,13 +947,15 @@ async fn buscar_ventas(state: &AppState, args: &Value) -> Result<Value, ApiError
         LEFT JOIN usuarios u ON u.id = v.usuario_id
         LEFT JOIN clientes c ON c.id = v.cliente_id
         WHERE v.deleted_at IS NULL
+          {f_origen}
           AND ($1::text IS NULL
                OR lower(v.folio) LIKE $1
                OR lower(COALESCE(c.nombre,'')) LIKE $1)
         ORDER BY v.fecha DESC
         LIMIT $2
-        "#,
-    )
+        "#
+    );
+    let rows = sqlx::query(&sql)
     .bind(&q_like)
     .bind(limite)
     .fetch_all(&state.pool)
@@ -1275,20 +1286,30 @@ async fn crear_venta(
 // ESTADÍSTICAS DÍA
 // =============================================================================
 
-async fn obtener_estadisticas_dia(state: &AppState, _args: &Value) -> Result<Value, ApiError> {
+async fn obtener_estadisticas_dia(
+    state: &AppState,
+    claims: &Claims,
+    _args: &Value,
+) -> Result<Value, ApiError> {
     use rust_decimal::prelude::ToPrimitive;
     // Misma shape que el comando Tauri `obtener_estadisticas_dia`:
     //   { total_ventas, num_transacciones, efectivo, tarjeta, transferencia,
     //     producto_top_nombre, producto_top_cantidad }
     // El frontend hace `stats.total_ventas.toFixed(2)` etc., así que
     // CUALQUIER campo faltante revienta el render del Dashboard.
+    //
+    // Modo individual: solo cuenta ventas web (la caja del usuario).
+    // Modo espejo:     cuenta todas las ventas (web + desktop unificados).
+    let modo = modo_caja_de(state, claims).await?;
+    let f_v = if modo == "espejo" { "" } else { "AND origen = 'web'" };
+    let f_v_alias = if modo == "espejo" { "" } else { "AND v.origen = 'web'" };
     let dec = |row: &sqlx::postgres::PgRow, name: &str| -> f64 {
         row.try_get::<rust_decimal::Decimal, _>(name).ok()
             .and_then(|d| d.to_f64()).unwrap_or(0.0)
     };
 
     let row = sqlx::query(
-        r#"
+        &format!(r#"
         SELECT
           COALESCE(SUM(total), 0)::numeric AS total_ventas,
           COUNT(*)::bigint                 AS num_transacciones,
@@ -1299,7 +1320,8 @@ async fn obtener_estadisticas_dia(state: &AppState, _args: &Value) -> Result<Val
         WHERE deleted_at IS NULL AND anulada = 0
           AND substr(fecha, 1, 10)
               = to_char(now() AT TIME ZONE 'America/Mexico_City', 'YYYY-MM-DD')
-        "#,
+          {f_v}
+        "#),
     )
     .fetch_one(&state.pool)
     .await?;
@@ -1308,7 +1330,7 @@ async fn obtener_estadisticas_dia(state: &AppState, _args: &Value) -> Result<Val
 
     // Producto top del día
     let top = sqlx::query(
-        r#"
+        &format!(r#"
         SELECT p.nombre, SUM(vd.cantidad)::numeric AS qty
           FROM venta_detalle vd
           JOIN ventas v   ON v.id = vd.venta_id
@@ -1316,10 +1338,11 @@ async fn obtener_estadisticas_dia(state: &AppState, _args: &Value) -> Result<Val
          WHERE v.deleted_at IS NULL AND v.anulada = 0
            AND substr(v.fecha, 1, 10)
                = to_char(now() AT TIME ZONE 'America/Mexico_City', 'YYYY-MM-DD')
+           {f_v_alias}
          GROUP BY vd.producto_id, p.nombre
          ORDER BY qty DESC
          LIMIT 1
-        "#,
+        "#),
     )
     .fetch_optional(&state.pool)
     .await?;
@@ -1913,7 +1936,11 @@ async fn obtener_detalle_devolucion(state: &AppState, args: &Value) -> Result<Va
     }))
 }
 
-async fn crear_devolucion(state: &AppState, args: Value) -> Result<Value, ApiError> {
+async fn crear_devolucion(
+    state: &AppState,
+    claims: &Claims,
+    args: Value,
+) -> Result<Value, ApiError> {
     use rust_decimal::prelude::ToPrimitive;
 
     #[derive(Deserialize)]
@@ -1952,16 +1979,28 @@ async fn crear_devolucion(state: &AppState, args: Value) -> Result<Value, ApiErr
     }
 
     let sucursal_id: i64 = 1;
+    let modo = modo_caja_de(state, claims).await?;
     let mut tx = state.pool.begin().await?;
 
-    // Verificar venta no anulada y obtener su folio
-    let venta_folio: String = sqlx::query_scalar(
-        "SELECT folio FROM ventas WHERE id = $1 AND anulada = 0 AND deleted_at IS NULL",
+    // Verificar venta no anulada y obtener su folio + origen.
+    // En modo individual, NO permitimos devolver ventas que no son web —
+    // esas pertenecen a la caja del desktop.
+    let venta_row = sqlx::query(
+        "SELECT folio, origen FROM ventas \
+         WHERE id = $1 AND anulada = 0 AND deleted_at IS NULL",
     )
     .bind(d.venta_id)
     .fetch_optional(&mut *tx)
     .await?
     .ok_or_else(|| ApiError::BadRequest("Venta no encontrada o está anulada".into()))?;
+    let venta_folio: String = venta_row.get("folio");
+    let origen_venta: String = venta_row.try_get("origen").unwrap_or_else(|_| "desktop".to_string());
+
+    if modo == "individual" && origen_venta != "web" {
+        return Err(ApiError::BadRequest(
+            "Esta venta pertenece a otra caja (POS desktop). La devolución debe hacerse desde allá, o cambia tu modo a 'espejo'.".into(),
+        ));
+    }
 
     // Si el usuario no es admin/dueño, requiere autorizado_por.
     // Postgres no tiene tabla `roles`; usamos la convención del POS:
@@ -3246,6 +3285,16 @@ async fn crear_corte(
     // Asociar movimientos pendientes a este corte. En modo individual solo
     // los del web; en modo espejo asocia TODOS (incluyendo los del desktop)
     // porque comparten caja.
+    //
+    // LIMITACIÓN CONOCIDA (modo espejo + desktop activo):
+    // Este UPDATE marca movimientos `origen='desktop'` con corte_id=N, pero
+    // NO emite `sync_cursor` para esas filas — el sync_cursor solo se emite
+    // para el corte (no para cada movimiento). Resultado: si el desktop
+    // sigue activo y luego sincroniza, su SQLite local seguirá viendo esos
+    // movimientos como sin corte y podría intentar incluirlos en SU propio
+    // corte. La práctica recomendada en modo espejo es: solo una de las dos
+    // puntas (web o desktop) hace cortes; la otra es cliente lector. Si se
+    // necesita doble cierre, agregar sync_cursor por movimiento aquí.
     let upd_sql = format!(
         "UPDATE movimientos_caja \
          SET corte_id = $1, updated_at = $2 \
@@ -3772,13 +3821,15 @@ async fn toggle_cliente_activo(state: &AppState, args: &Value) -> Result<Value, 
 /// Ventas del día actual en zona horaria de México.
 /// El web NO filtra por `origen` (no existe esa columna en `ventas`); muestra
 /// todas las ventas del día — simétrico a desktop.
-async fn listar_ventas_dia(state: &AppState) -> Result<Value, ApiError> {
+async fn listar_ventas_dia(state: &AppState, claims: &Claims) -> Result<Value, ApiError> {
     use rust_decimal::prelude::ToPrimitive;
 
-    // `date(v.fecha)` sobre la columna TEXT funciona porque el formato
-    // canónico es `YYYY-MM-DD HH:MM:SS` (mismo que SQLite).
-    // Comparamos contra "hoy" en zona MX para no traer otros días.
-    let rows = sqlx::query(
+    // En modo individual filtramos por origen='web' — el listado del día es
+    // específico de "mi caja". En modo espejo se muestra todo.
+    let modo = modo_caja_de(state, claims).await?;
+    let f_origen = if modo == "espejo" { "" } else { "AND v.origen = 'web'" };
+
+    let sql = format!(
         r#"
         SELECT v.id, v.folio, v.total, v.metodo_pago, v.anulada, v.fecha,
                u.nombre_completo AS usuario_nombre,
@@ -3791,9 +3842,11 @@ async fn listar_ventas_dia(state: &AppState) -> Result<Value, ApiError> {
         LEFT JOIN clientes c ON c.id = v.cliente_id
         WHERE v.deleted_at IS NULL
           AND substr(v.fecha, 1, 10) = to_char(now() AT TIME ZONE 'America/Mexico_City', 'YYYY-MM-DD')
+          {f_origen}
         ORDER BY v.fecha DESC
-        "#,
-    )
+        "#
+    );
+    let rows = sqlx::query(&sql)
     .fetch_all(&state.pool)
     .await?;
 
@@ -3817,7 +3870,11 @@ async fn listar_ventas_dia(state: &AppState) -> Result<Value, ApiError> {
 ///   3. Restaura stock de cada partida.
 ///   4. NO crea movimiento de caja: `calcular_datos_corte` ya excluye
 ///      ventas con `anulada = 1`, así que generar un retiro contaría doble.
-async fn anular_venta(state: &AppState, args: &Value) -> Result<Value, ApiError> {
+async fn anular_venta(
+    state: &AppState,
+    claims: &Claims,
+    args: &Value,
+) -> Result<Value, ApiError> {
     use rust_decimal::prelude::ToPrimitive;
 
     #[derive(Deserialize)]
@@ -3834,11 +3891,15 @@ async fn anular_venta(state: &AppState, args: &Value) -> Result<Value, ApiError>
         return Err(ApiError::BadRequest("El motivo es obligatorio".into()));
     }
 
+    let modo = modo_caja_de(state, claims).await?;
     let mut tx = state.pool.begin().await?;
 
     // Verificar que existe, no está anulada, y es del día en curso.
+    // Traemos también `origen` para validar que pertenece al modo del cliente:
+    // en modo individual NO permitimos anular ventas que no son del web (esas
+    // pertenecen a la caja del desktop y deben anularse desde allá).
     let v = sqlx::query(
-        "SELECT folio, fecha FROM ventas \
+        "SELECT folio, fecha, origen FROM ventas \
          WHERE id = $1 AND anulada = 0 AND deleted_at IS NULL",
     )
     .bind(a.venta_id)
@@ -3848,6 +3909,13 @@ async fn anular_venta(state: &AppState, args: &Value) -> Result<Value, ApiError>
 
     let folio: String = v.get("folio");
     let fecha_venta: String = v.get("fecha");
+    let origen_venta: String = v.try_get("origen").unwrap_or_else(|_| "desktop".to_string());
+
+    if modo == "individual" && origen_venta != "web" {
+        return Err(ApiError::BadRequest(
+            "Esta venta pertenece a otra caja (POS desktop). Anúlala desde allá o cambia tu modo a 'espejo'.".into(),
+        ));
+    }
 
     let hoy: String = sqlx::query_scalar(
         "SELECT to_char(now() AT TIME ZONE 'America/Mexico_City', 'YYYY-MM-DD')",
