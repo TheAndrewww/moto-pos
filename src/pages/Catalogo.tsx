@@ -1171,14 +1171,34 @@ function ExportarModal({
       }
       const csvContent = "\uFEFF" + lineas.join('\n');
 
-      const { save } = await import('@tauri-apps/plugin-dialog');
-      const ruta = await save({
-        defaultPath: getNombreArchivo(),
-        filters: [{ name: 'CSV', extensions: ['csv'] }],
-      });
-      if (ruta) {
-        await invoke('escribir_archivo', { ruta, contenido: csvContent });
-        alert(`✅ Exportado exitosamente:\n${lista.length} productos guardados.`);
+      // Detectar si estamos en Tauri (desktop) o en navegador (web)
+      const enTauri = typeof window !== 'undefined' &&
+        typeof (window as any).__TAURI_INTERNALS__ !== 'undefined';
+
+      if (enTauri) {
+        // Desktop: diálogo nativo de guardado
+        const { save } = await import('@tauri-apps/plugin-dialog');
+        const ruta = await save({
+          defaultPath: getNombreArchivo(),
+          filters: [{ name: 'CSV', extensions: ['csv'] }],
+        });
+        if (ruta) {
+          await invoke('escribir_archivo', { ruta, contenido: csvContent });
+          alert(`✅ Exportado exitosamente:\n${lista.length} productos guardados.`);
+          onClose();
+        }
+      } else {
+        // Web: descarga directa vía navegador
+        const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = getNombreArchivo();
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        alert(`✅ Exportado exitosamente:\n${lista.length} productos descargados.`);
         onClose();
       }
     } catch (err: any) {

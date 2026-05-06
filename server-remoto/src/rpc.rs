@@ -3286,25 +3286,39 @@ async fn crear_corte(
     // los del web; en modo espejo asocia TODOS (incluyendo los del desktop)
     // porque comparten caja.
     //
-    // LIMITACIÓN CONOCIDA (modo espejo + desktop activo):
-    // Este UPDATE marca movimientos `origen='desktop'` con corte_id=N, pero
-    // NO emite `sync_cursor` para esas filas — el sync_cursor solo se emite
-    // para el corte (no para cada movimiento). Resultado: si el desktop
-    // sigue activo y luego sincroniza, su SQLite local seguirá viendo esos
-    // movimientos como sin corte y podría intentar incluirlos en SU propio
-    // corte. La práctica recomendada en modo espejo es: solo una de las dos
-    // puntas (web o desktop) hace cortes; la otra es cliente lector. Si se
-    // necesita doble cierre, agregar sync_cursor por movimiento aquí.
+    // RETURNING uuid: necesitamos los UUIDs de las filas modificadas para
+    // emitir sync_cursor por cada uno. Sin esto, el desktop nunca se entera
+    // que sus movimientos quedaron asignados a un corte web → en su próximo
+    // corte los volvería a contar (doble conteo).
     let upd_sql = format!(
         "UPDATE movimientos_caja \
          SET corte_id = $1, updated_at = $2 \
-         WHERE corte_id IS NULL AND deleted_at IS NULL {f_mov_origen}"
+         WHERE corte_id IS NULL AND deleted_at IS NULL {f_mov_origen} \
+         RETURNING uuid"
     );
-    sqlx::query(&upd_sql)
-    .bind(corte_id)
-    .bind(&created_at)
-    .execute(&mut *tx)
-    .await?;
+    let movs_actualizados = sqlx::query(&upd_sql)
+        .bind(corte_id)
+        .bind(&created_at)
+        .fetch_all(&mut *tx)
+        .await?;
+
+    // Emitir sync_cursor por cada movimiento tocado. Critical en modo
+    // espejo (movimientos origen='desktop' regresan al desktop con su
+    // corte_id resuelto). En modo individual también es safe — los uuids
+    // del web están en sync_cursor y el desktop los pull-ea para tener
+    // el historial completo.
+    for r in &movs_actualizados {
+        let mov_uuid: String = r.get("uuid");
+        sqlx::query(
+            "INSERT INTO sync_cursor (tabla, uuid, sucursal_id, origen_device) \
+             VALUES ('movimientos_caja', $1, $2, $3)",
+        )
+        .bind(&mov_uuid)
+        .bind(sucursal_id)
+        .bind(WEB_ORIGIN)
+        .execute(&mut *tx)
+        .await?;
+    }
 
     // Denominaciones
     if let Some(denoms) = &c.denominaciones {

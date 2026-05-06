@@ -18,16 +18,15 @@ import CortesCaja, { ModalAperturaCaja } from './CortesCaja';
 import HistorialVentas from './HistorialVentas';
 import Reportes from './Reportes';
 import Ajustes from './Ajustes';
-import ConexionMovil from './ConexionMovil';
 import Sincronizacion from './Sincronizacion';
 import { useCortesStore } from '../store/cortesStore';
 import {
   ShoppingCart, Package, BarChart3, LogOut, ClipboardList,
   TruckIcon, Tag, Users, ScrollText, DollarSign, History, Settings, UserPlus, TrendingUp,
-  Smartphone, Menu, X, Cloud,
+  Menu, X, Cloud,
 } from 'lucide-react';
 
-type Modulo = 'venta' | 'catalogo' | 'dashboard' | 'presupuestos' | 'recepcion' | 'pedidos' | 'etiquetas' | 'bitacora' | 'usuarios' | 'clientes' | 'cortes' | 'historial' | 'reportes' | 'ajustes' | 'conexion' | 'sincronizacion';
+type Modulo = 'venta' | 'catalogo' | 'dashboard' | 'presupuestos' | 'recepcion' | 'pedidos' | 'etiquetas' | 'bitacora' | 'usuarios' | 'clientes' | 'cortes' | 'historial' | 'reportes' | 'ajustes' | 'sincronizacion';
 
 interface EstadisticasDia {
   total_ventas: number;
@@ -151,7 +150,6 @@ export default function Dashboard() {
     { id: 'usuarios', label: 'Usuarios', icon: <Users size={18} />, key: '', visible: esAdmin },
     { id: 'cortes', label: 'Cortes de Caja', icon: <DollarSign size={18} />, key: 'F11', visible: true },
     { id: 'reportes', label: 'Reportes', icon: <TrendingUp size={18} />, key: 'F10', visible: esAdmin },
-    { id: 'conexion', label: 'Conexión móvil', icon: <Smartphone size={18} />, key: '', visible: esAdmin && isTauri() },
     { id: 'sincronizacion', label: 'Sincronización', icon: <Cloud size={18} />, key: '', visible: esAdmin },
     { id: 'ajustes', label: 'Ajustes', icon: <Settings size={18} />, key: '', visible: esAdmin },
   ];
@@ -395,7 +393,6 @@ export default function Dashboard() {
           />
         </div>
         {modulo === 'ajustes' && <Ajustes />}
-        {modulo === 'conexion' && <ConexionMovil />}
         {modulo === 'sincronizacion' && <Sincronizacion />}
       </div>
     </div>
