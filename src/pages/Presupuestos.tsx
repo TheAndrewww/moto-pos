@@ -331,35 +331,40 @@ export default function Presupuestos({ onIrAVenta }: PresupuestosProps = {}) {
               return (
                 <div
                   key={p.id}
-                  className="pos-list-row"
+                  className="card pos-list-row"
                   style={{
-                    display: 'flex', alignItems: 'center', gap: 14,
-                    padding: '12px 20px', borderBottom: '1px solid var(--color-border)',
-                    cursor: 'pointer', transition: 'background 0.1s',
+                    display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 14,
+                    padding: '12px 16px', marginBottom: 8,
+                    cursor: 'pointer', transition: 'box-shadow 0.1s',
                   }}
-                  onMouseEnter={e => (e.currentTarget.style.background = 'var(--color-surface)')}
-                  onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
+                  onMouseEnter={e => (e.currentTarget.style.boxShadow = '0 2px 8px rgba(0,0,0,0.08)')}
+                  onMouseLeave={e => (e.currentTarget.style.boxShadow = '0 1px 3px rgba(12, 2, 4, 0.06), 0 1px 2px rgba(12, 2, 4, 0.04)')}
                   onClick={() => verDetalle(p)}
                 >
-                  <span className="mono" style={{ fontSize: 13, fontWeight: 700, color: 'var(--color-text-muted)', minWidth: 90 }}>
-                    {p.folio}
-                  </span>
-                  <span style={{
-                    fontSize: 10, fontWeight: 700, padding: '2px 10px', borderRadius: 10,
-                    background: est.bg, color: est.color, minWidth: 80, textAlign: 'center',
-                  }}>
-                    {est.label}
-                  </span>
-                  <span style={{ flex: 1, fontSize: 13, color: 'var(--color-text)' }}>
-                    {p.cliente_nombre || 'Público general'}
-                  </span>
-                  <span className="mono" style={{ fontSize: 15, fontWeight: 800, color: 'var(--color-primary)' }}>
-                    {fmt(p.total)}
-                  </span>
-                  <span style={{ fontSize: 11, color: 'var(--color-text-dim)', minWidth: 120, textAlign: 'right' }}>
-                    {formatFecha(p.fecha)}
-                  </span>
-                  <Eye size={14} style={{ color: 'var(--color-text-dim)' }} />
+                  <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 4 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                      <span className="mono" style={{ fontSize: 13, fontWeight: 700, color: 'var(--color-text)' }}>
+                        {p.folio}
+                      </span>
+                      <span style={{
+                        fontSize: 10, fontWeight: 700, padding: '2px 8px', borderRadius: 10,
+                        background: est.bg, color: est.color,
+                      }}>
+                        {est.label}
+                      </span>
+                    </div>
+                    <div style={{ fontSize: 12, color: 'var(--color-text-muted)', display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                      <span style={{ fontWeight: 600 }}>{p.cliente_nombre || 'Público general'}</span>
+                      <span style={{ color: 'var(--color-text-dim)' }}>· {formatFecha(p.fecha)}</span>
+                    </div>
+                  </div>
+                  
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                    <span className="mono" style={{ fontSize: 16, fontWeight: 800, color: 'var(--color-primary)' }}>
+                      {fmt(p.total)}
+                    </span>
+                    <Eye size={16} style={{ color: 'var(--color-text-dim)' }} />
+                  </div>
                 </div>
               );
             })}
