@@ -3764,7 +3764,31 @@ async fn verificar_corte_dia_pendiente(
               WHERE c.tipo = 'DIA'
                 AND c.deleted_at IS NULL
                 {f_c_origen}
-                AND substr(c.fecha_fin, 1, 10) = substr(v.fecha, 1, 10)
+                AND (
+                  -- Comparamos la fecha del día de la venta contra el rango
+                  -- del corte, tomando en cuenta que fecha_fin puede estar
+                  -- almacenada como ISO UTC (ej. '2026-04-27T05:00:00.000Z')
+                  -- lo que al hacer substr da el día SIGUIENTE en hora México.
+                  -- Solución: parsear como timestamptz y convertir a México.
+                  substr(v.fecha, 1, 10) BETWEEN
+                    to_char(
+                      CASE
+                        WHEN c.fecha_inicio ~ 'Z$|[+-][0-9]{{2}}:[0-9]{{2}}$'
+                        THEN c.fecha_inicio::timestamptz AT TIME ZONE 'America/Mexico_City'
+                        ELSE (c.fecha_inicio || '-06')::timestamptz AT TIME ZONE 'America/Mexico_City'
+                      END,
+                      'YYYY-MM-DD'
+                    )
+                    AND
+                    to_char(
+                      CASE
+                        WHEN c.fecha_fin ~ 'Z$|[+-][0-9]{{2}}:[0-9]{{2}}$'
+                        THEN c.fecha_fin::timestamptz AT TIME ZONE 'America/Mexico_City'
+                        ELSE (c.fecha_fin || '-06')::timestamptz AT TIME ZONE 'America/Mexico_City'
+                      END,
+                      'YYYY-MM-DD'
+                    )
+                )
           )
         GROUP BY dia
         ORDER BY dia DESC
