@@ -16,6 +16,7 @@ const MIGRATIONS: &[MigrationFn] = &[
     migracion_008_reparar_esquema_sync,
     migracion_009_proveedores_activo,
     migracion_010_limpiar_movimientos_caja_ventas,
+    migracion_011_audit_log_sync,
 ];
 
 pub fn aplicar_migraciones(conn: &Connection) -> Result<()> {
@@ -717,5 +718,123 @@ fn migracion_010_limpiar_movimientos_caja_ventas(conn: &Connection) -> Result<()
         "DELETE FROM movimientos_caja WHERE corte_id IS NULL AND (concepto LIKE 'Venta %' OR concepto LIKE 'Anulación venta %')",
         [],
     );
+    Ok(())
+}
+
+// ─── Migración 011 ────────────────────────────────────────
+// Habilita sync bidireccional de `audit_log`. Hasta hoy la bitácora
+// desktop vivía solo en SQLite local; las entradas web vivían en
+// postgres. El admin desde el web no podía ver lo que pasó en el
+// desktop y viceversa.
+//
+// Tres pasos:
+//   1. Añadir columnas `uuid` (UNIQUE), `updated_at` y `deleted_at` al
+//      `audit_log` SQLite (las que pide el sync pipeline).
+//   2. Backfill: poblar uuid/updated_at en filas existentes.
+//   3. Triggers que encolen cada INSERT en `sync_outbox`. Diferimos del
+//      patrón estándar (v5) porque audit_log es append-only:
+//        - NO creamos trigger AFTER UPDATE (la bitácora no se edita)
+//        - NO creamos trigger AFTER DELETE (no se borra desde UI)
+//        - Sí necesitamos manejar el caso "INSERT sin uuid" (los 26
+//          call sites NO pasan uuid; uuid_auto lo genera por trigger).
+//
+// El postgres lado tiene migración 006 paralela que agrega las mismas
+// columnas + un trigger que registra sync_cursor automáticamente.
+fn migracion_011_audit_log_sync(conn: &Connection) -> Result<()> {
+    if !columna_existe(conn, "audit_log", "uuid") {
+        let _ = conn.execute("ALTER TABLE audit_log ADD COLUMN uuid TEXT", []);
+    }
+    if !columna_existe(conn, "audit_log", "updated_at") {
+        let _ = conn.execute(
+            "ALTER TABLE audit_log ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+    }
+    if !columna_existe(conn, "audit_log", "deleted_at") {
+        let _ = conn.execute("ALTER TABLE audit_log ADD COLUMN deleted_at TEXT", []);
+    }
+
+    // Backfill: uuid + updated_at en filas viejas. El uuid usa
+    // hex(randomblob(16)) como otras tablas (32 hex chars, único).
+    let _ = conn.execute(
+        "UPDATE audit_log SET uuid = lower(hex(randomblob(16))) WHERE uuid IS NULL",
+        [],
+    );
+    let _ = conn.execute(
+        "UPDATE audit_log SET updated_at = COALESCE(NULLIF(fecha, ''), datetime('now')) \
+         WHERE updated_at IS NULL OR updated_at = ''",
+        [],
+    );
+
+    let _ = conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_log_uuid ON audit_log(uuid)",
+        [],
+    );
+
+    // Trigger A: si se inserta una fila sin uuid (los 26 call sites no
+    // lo pasan), generamos uno y bumpeamos updated_at. El UPDATE
+    // recursivo dispara el trigger B abajo (que SÍ encola en outbox).
+    conn.execute_batch(r#"
+        DROP TRIGGER IF EXISTS trg_audit_log_uuid_auto;
+        CREATE TRIGGER trg_audit_log_uuid_auto
+        AFTER INSERT ON audit_log
+        FOR EACH ROW
+        WHEN NEW.uuid IS NULL
+        BEGIN
+            UPDATE audit_log
+               SET uuid = lower(hex(randomblob(16))),
+                   updated_at = COALESCE(NULLIF(NEW.fecha, ''), datetime('now'))
+             WHERE rowid = NEW.rowid;
+        END;
+    "#)?;
+
+    // Trigger B: encolar en outbox cuando el INSERT trajo uuid (caso
+    // del sync apply o de algún call site futuro que sí lo genere).
+    conn.execute_batch(r#"
+        DROP TRIGGER IF EXISTS trg_audit_log_outbox_ins;
+        CREATE TRIGGER trg_audit_log_outbox_ins
+        AFTER INSERT ON audit_log
+        FOR EACH ROW
+        WHEN NEW.uuid IS NOT NULL
+         AND NOT EXISTS (SELECT 1 FROM sync_suppress_flag WHERE id=1)
+        BEGIN
+            INSERT INTO sync_outbox (tabla, uuid, operacion)
+            VALUES ('audit_log', NEW.uuid, 'UPDATE')
+            ON CONFLICT(tabla, uuid) WHERE synced_at IS NULL
+            DO UPDATE SET created_at = datetime('now'), intentos = 0, ultimo_error = NULL;
+        END;
+    "#)?;
+
+    // Trigger C: cuando trigger A pone el uuid (caso del INSERT sin
+    // uuid de los 26 call sites), nos enteramos vía AFTER UPDATE OF uuid
+    // y encolamos en outbox.
+    conn.execute_batch(r#"
+        DROP TRIGGER IF EXISTS trg_audit_log_outbox_after_uuid;
+        CREATE TRIGGER trg_audit_log_outbox_after_uuid
+        AFTER UPDATE OF uuid ON audit_log
+        FOR EACH ROW
+        WHEN NEW.uuid IS NOT NULL AND OLD.uuid IS NULL
+         AND NOT EXISTS (SELECT 1 FROM sync_suppress_flag WHERE id=1)
+        BEGIN
+            INSERT INTO sync_outbox (tabla, uuid, operacion)
+            VALUES ('audit_log', NEW.uuid, 'UPDATE')
+            ON CONFLICT(tabla, uuid) WHERE synced_at IS NULL
+            DO UPDATE SET created_at = datetime('now'), intentos = 0, ultimo_error = NULL;
+        END;
+    "#)?;
+
+    // Re-encolar todas las filas con uuid en outbox para que el primer
+    // sync después de aplicar esta migración las empuje todas al
+    // postgres. Idempotente.
+    let _ = conn.execute(
+        r#"INSERT INTO sync_outbox (tabla, uuid, operacion)
+           SELECT 'audit_log', uuid, 'UPDATE'
+             FROM audit_log
+            WHERE uuid IS NOT NULL
+           ON CONFLICT(tabla, uuid) WHERE synced_at IS NULL
+           DO UPDATE SET created_at = datetime('now'), intentos = 0, ultimo_error = NULL"#,
+        [],
+    );
+
     Ok(())
 }

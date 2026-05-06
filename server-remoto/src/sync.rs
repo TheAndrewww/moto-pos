@@ -36,6 +36,10 @@ const TABLAS_SYNC: &[&str] = &[
     "ventas", "recepciones", "ordenes_pedido", "presupuestos", "cortes",
     "devoluciones", "transferencias",
     "movimientos_caja", "aperturas_caja",
+    // Bitácora bidireccional (migración 006). El desktop la empuja con
+    // origen='POS', el web genera entradas con origen='WEB' y ambos lados
+    // las pull-ean para tener visión completa.
+    "audit_log",
     // Hijos (no vienen como "cambio" independiente; llegan bajo __children,
     // pero se listan para que pull pueda reconstruirlos si hiciera falta)
     "venta_detalle", "recepcion_detalle", "orden_pedido_detalle",
@@ -169,6 +173,16 @@ async fn aplicar_cambio(
         .to_string();
 
     let mut tx = pool.begin().await?;
+
+    // Setear `sync.origin` = device_uuid para que cualquier trigger postgres
+    // (e.g. trg_audit_log_sync_cursor de migración 006) registre la fila
+    // en sync_cursor con el `origen_device` correcto. Sin esto, el trigger
+    // usaría el default 'web-pos' y el desktop pull-earía sus propias
+    // entradas de bitácora en un loop benigno (LWW las descarta) pero ruidoso.
+    sqlx::query("SELECT set_config('sync.origin', $1, true)")
+        .bind(device_uuid)
+        .execute(&mut *tx)
+        .await?;
 
     // LWW: updated_at ya es TEXT con el mismo formato que SQLite
     // ("YYYY-MM-DD HH24:MI:SS"), la comparación es byte-por-byte directa.
