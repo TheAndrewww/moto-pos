@@ -445,7 +445,7 @@ function DashboardHome({ stats, fmt, stockBajo, onVerInventario }: { stats: Esta
       <div className="dashboard-stats-grid" style={{ marginBottom: 24 }}>
         <StatCard label="Total Ventas" value={fmt(stats.total_ventas)} color="var(--color-success)" />
         <StatCard label="Transacciones" value={String(stats.num_transacciones)} color="var(--color-primary)" />
-        <StatCard label="Producto Top" value={stats.producto_top_nombre || '—'} sub={stats.producto_top_cantidad > 0 ? `${stats.producto_top_cantidad} unidades` : ''} color="var(--color-warning)" />
+        <StatCard label="Producto Top" value={stats.producto_top_nombre || '—'} sub={stats.producto_top_cantidad > 0 ? `${stats.producto_top_cantidad} unidades` : ''} color="var(--color-warning)" isText />
         <StatCard label="Promedio / Venta" value={stats.num_transacciones > 0 ? fmt(stats.total_ventas / stats.num_transacciones) : '$0.00'} color="var(--color-text-muted)" />
       </div>
 
@@ -464,14 +464,27 @@ function DashboardHome({ stats, fmt, stockBajo, onVerInventario }: { stats: Esta
   );
 }
 
-function StatCard({ label, value, sub, color }: { label: string; value: string; sub?: string; color: string }) {
+function StatCard({ label, value, sub, color, isText }: { label: string; value: string; sub?: string; color: string; isText?: boolean }) {
   return (
-    <div className="card" style={{ padding: 16 }}>
+    <div className="card" style={{ padding: 16, display: 'flex', flexDirection: 'column' }}>
       <p style={{ fontSize: 11, fontWeight: 600, color: 'var(--color-text-dim)', textTransform: 'uppercase', marginBottom: 6 }}>
         {label}
       </p>
-      <p className="mono" style={{ fontSize: 24, fontWeight: 800, color }}>{value}</p>
-      {sub && <p style={{ fontSize: 12, color: 'var(--color-text-dim)', marginTop: 2 }}>{sub}</p>}
+      <p className={isText ? '' : 'mono'} style={{ 
+        fontSize: isText ? 14 : 24, 
+        fontWeight: 800, 
+        color,
+        ...(isText ? {
+          display: '-webkit-box',
+          WebkitLineClamp: 3,
+          WebkitBoxOrient: 'vertical',
+          overflow: 'hidden',
+          wordBreak: 'break-word',
+          lineHeight: 1.3
+        } : {})
+      }}>{value}</p>
+      <div style={{ flex: 1 }} />
+      {sub && <p style={{ fontSize: 12, color: 'var(--color-text-dim)', marginTop: 8 }}>{sub}</p>}
     </div>
   );
 }
