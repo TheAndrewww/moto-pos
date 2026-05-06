@@ -3571,12 +3571,29 @@ async fn listar_cortes(
     let modo = modo_caja_de(state, claims).await?;
     let f_origen = if modo == "espejo" { "" } else { "AND c.origen = 'web'" };
 
+    // LEFT JOIN para no ocultar cortes cuyo usuario aún no llegó por sync
+    // (ej. corte del desktop con un usuario_id que el postgres todavía no
+    // tiene). Sin esto un corte huérfano desaparece del historial.
+    //
+    // SHAPE COMPLETA: el frontend (TarjetaCorte) lee total_ventas_*,
+    // num_transacciones, total_entradas_efectivo, total_retiros_efectivo,
+    // fondo_inicial, nota_diferencia. Si faltan, el render hace
+    // `undefined.toFixed(2)` y revienta.
     let sql = format!(
         r#"
-        SELECT c.id, c.tipo, u.nombre_completo AS usuario_nombre, c.created_at,
-               c.efectivo_esperado, c.efectivo_contado, c.diferencia, c.fondo_siguiente
+        SELECT c.id, c.tipo,
+               COALESCE(u.nombre_completo, '(usuario id ' || c.usuario_id || ')') AS usuario_nombre,
+               c.created_at,
+               c.fondo_inicial,
+               c.total_ventas_efectivo, c.total_ventas_tarjeta,
+               c.total_ventas_transferencia, c.total_ventas,
+               c.num_transacciones,
+               c.total_entradas_efectivo, c.total_retiros_efectivo,
+               c.efectivo_esperado, c.efectivo_contado,
+               c.diferencia, c.nota_diferencia,
+               c.fondo_siguiente
         FROM cortes c
-        JOIN usuarios u ON u.id = c.usuario_id
+        LEFT JOIN usuarios u ON u.id = c.usuario_id
         WHERE c.deleted_at IS NULL {f_origen}
         ORDER BY c.created_at DESC
         LIMIT $1
@@ -3588,14 +3605,23 @@ async fn listar_cortes(
     .await?;
 
     Ok(json!(rows.iter().map(|r| json!({
-        "id":                r.get::<i64, _>("id"),
-        "tipo":              r.get::<String, _>("tipo"),
-        "usuario_nombre":    r.try_get::<Option<String>, _>("usuario_nombre").ok().flatten().unwrap_or_default(),
-        "created_at":        r.get::<String, _>("created_at"),
-        "efectivo_esperado": pg_dec(r, "efectivo_esperado"),
-        "efectivo_contado":  pg_dec(r, "efectivo_contado"),
-        "diferencia":        pg_dec(r, "diferencia"),
-        "fondo_siguiente":   pg_dec(r, "fondo_siguiente"),
+        "id":                         r.get::<i64, _>("id"),
+        "tipo":                       r.get::<String, _>("tipo"),
+        "usuario_nombre":             r.try_get::<Option<String>, _>("usuario_nombre").ok().flatten().unwrap_or_default(),
+        "created_at":                 r.get::<String, _>("created_at"),
+        "fondo_inicial":              pg_dec(r, "fondo_inicial"),
+        "total_ventas_efectivo":      pg_dec(r, "total_ventas_efectivo"),
+        "total_ventas_tarjeta":       pg_dec(r, "total_ventas_tarjeta"),
+        "total_ventas_transferencia": pg_dec(r, "total_ventas_transferencia"),
+        "total_ventas":               pg_dec(r, "total_ventas"),
+        "num_transacciones":          r.try_get::<i64, _>("num_transacciones").unwrap_or(0),
+        "total_entradas_efectivo":    pg_dec(r, "total_entradas_efectivo"),
+        "total_retiros_efectivo":     pg_dec(r, "total_retiros_efectivo"),
+        "efectivo_esperado":          pg_dec(r, "efectivo_esperado"),
+        "efectivo_contado":           pg_dec(r, "efectivo_contado"),
+        "diferencia":                 pg_dec(r, "diferencia"),
+        "nota_diferencia":            r.try_get::<Option<String>, _>("nota_diferencia").ok().flatten(),
+        "fondo_siguiente":            pg_dec(r, "fondo_siguiente"),
     })).collect::<Vec<_>>()))
 }
 
@@ -3605,12 +3631,15 @@ async fn obtener_detalle_corte(state: &AppState, args: &Value) -> Result<Value, 
     let a: A = serde_json::from_value(args.clone())
         .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
 
+    // LEFT JOIN para no ocultar cortes con usuario aún sin sincronizar.
     let cab = sqlx::query(
         r#"
-        SELECT c.id, c.tipo, u.nombre_completo AS usuario_nombre, c.created_at,
+        SELECT c.id, c.tipo,
+               COALESCE(u.nombre_completo, '(usuario id ' || c.usuario_id || ')') AS usuario_nombre,
+               c.created_at,
                c.efectivo_esperado, c.efectivo_contado, c.diferencia, c.fondo_siguiente
         FROM cortes c
-        JOIN usuarios u ON u.id = c.usuario_id
+        LEFT JOIN usuarios u ON u.id = c.usuario_id
         WHERE c.id = $1 AND c.deleted_at IS NULL
         "#,
     )
