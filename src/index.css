@@ -344,6 +344,17 @@
 /* ============================================================
    LAYOUT DASHBOARD (responsive)
    ============================================================ */
+.dashboard-stats-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 16px;
+}
+.dashboard-payment-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 16px;
+}
+
 .pos-dashboard {
   display: grid;
   grid-template-columns: 200px 1fr;

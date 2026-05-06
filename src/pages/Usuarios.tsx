@@ -144,7 +144,7 @@ export default function UsuariosPage() {
                 placeholder="Ej: Juan Pérez" autoFocus />
             </div>
 
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+            <div className="pos-2col-grid" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
               <div>
                 <label style={labelStyle}>USUARIO *</label>
                 <input className="input" value={form.nombre_usuario}
@@ -164,7 +164,7 @@ export default function UsuariosPage() {
               </div>
             </div>
 
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+            <div className="pos-2col-grid" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
               <div>
                 <label style={labelStyle}>
                   PIN (4 dígitos) {editando ? '(vacío = sin cambio)' : '*'}
@@ -254,7 +254,7 @@ export default function UsuariosPage() {
       <div style={{ flex: 1, overflow: 'auto', padding: 16 }}>
         <div style={{ display: 'grid', gap: 8 }}>
           {usuarios.map(u => (
-            <div key={u.id} className="card" style={{
+            <div key={u.id} className="card pos-list-row" style={{
               padding: '14px 18px',
               display: 'flex', alignItems: 'center', gap: 14,
               opacity: u.activo ? 1 : 0.5,

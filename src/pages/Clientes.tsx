@@ -124,7 +124,7 @@ export default function ClientesPage() {
                 placeholder="Nombre del cliente" autoFocus />
             </div>
 
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+            <div className="pos-2col-grid" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
               <div>
                 <label style={labelStyle}>TELÉFONO</label>
                 <input className="input" value={form.telefono}
@@ -226,7 +226,7 @@ export default function ClientesPage() {
         ) : (
           <div style={{ display: 'grid', gap: 8 }}>
             {filtrados.map(c => (
-              <div key={c.id} className="card" style={{
+              <div key={c.id} className="card pos-list-row" style={{
                 padding: '14px 18px',
                 display: 'flex', alignItems: 'center', gap: 14,
                 opacity: c.activo ? 1 : 0.5,

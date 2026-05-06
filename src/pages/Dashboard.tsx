@@ -442,7 +442,7 @@ function DashboardHome({ stats, fmt, stockBajo, onVerInventario }: { stats: Esta
       )}
 
       {/* Cards de stats */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 16, marginBottom: 24 }}>
+      <div className="dashboard-stats-grid" style={{ marginBottom: 24 }}>
         <StatCard label="Total Ventas" value={fmt(stats.total_ventas)} color="var(--color-success)" />
         <StatCard label="Transacciones" value={String(stats.num_transacciones)} color="var(--color-primary)" />
         <StatCard label="Producto Top" value={stats.producto_top_nombre || '—'} sub={stats.producto_top_cantidad > 0 ? `${stats.producto_top_cantidad} unidades` : ''} color="var(--color-warning)" />
@@ -454,7 +454,7 @@ function DashboardHome({ stats, fmt, stockBajo, onVerInventario }: { stats: Esta
         <h3 style={{ fontSize: 14, fontWeight: 700, marginBottom: 16, color: 'var(--color-text-muted)' }}>
           DESGLOSE POR MÉTODO DE PAGO
         </h3>
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 16 }}>
+        <div className="dashboard-payment-grid">
           <PaymentBar label="Efectivo" value={stats.efectivo} total={stats.total_ventas} color="var(--color-success)" fmt={fmt} />
           <PaymentBar label="Tarjeta" value={stats.tarjeta} total={stats.total_ventas} color="var(--color-primary)" fmt={fmt} />
           <PaymentBar label="Transferencia" value={stats.transferencia} total={stats.total_ventas} color="var(--color-warning)" fmt={fmt} />
