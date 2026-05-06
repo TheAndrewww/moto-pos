@@ -71,7 +71,10 @@ pub async fn dispatch(
         "actualizar_cliente"            => actualizar_cliente(&state, args).await?,
         "toggle_cliente_activo"         => toggle_cliente_activo(&state, &args).await?,
         "listar_usuarios"               => listar_usuarios(&state).await?,
-        "listar_roles"                  => listar_roles(),
+        "crear_usuario"                 => crear_usuario(&state, &claims, args).await?,
+        "actualizar_usuario"            => actualizar_usuario(&state, &claims, args).await?,
+        "toggle_usuario_activo"         => toggle_usuario_activo(&state, &claims, &args).await?,
+        "listar_roles"                  => listar_roles(&state).await?,
 
         // ─── Productos (mutaciones) ──────────────────────────
         "crear_producto"                => crear_producto(&state, args).await?,
@@ -82,8 +85,9 @@ pub async fn dispatch(
         "historial_precios_producto"    => historial_precios_producto(&state, &args).await?,
 
         // ─── Config / sistema ────────────────────────────────
-        "obtener_config_negocio"        => obtener_config_negocio(),
-        "obtener_config_descuentos"     => obtener_config_descuentos(),
+        "obtener_config_negocio"        => obtener_config_negocio(&state).await?,
+        "obtener_config_descuentos"     => obtener_config_descuentos(&state).await?,
+        "actualizar_config_negocio"     => actualizar_config_negocio(&state, &claims, args).await?,
         "listar_impresoras"             => json!([]),
         "obtener_info_bd"               => json!(0),
         "obtener_info_servidor"         => obtener_info_servidor(&state).await?,
@@ -836,9 +840,15 @@ async fn listar_clientes(state: &AppState) -> Result<Value, ApiError> {
 // =============================================================================
 
 async fn listar_usuarios(state: &AppState) -> Result<Value, ApiError> {
+    // JOIN con roles para evitar N+1 (resolvemos rol_nombre y es_admin en
+    // una sola query). Antes esto era hardcodeado: rol id<=2 = admin.
     let rows = sqlx::query(
-        "SELECT id, nombre_completo, nombre_usuario, rol_id, activo, ultimo_login \
-         FROM usuarios WHERE deleted_at IS NULL ORDER BY nombre_completo",
+        "SELECT u.id, u.nombre_completo, u.nombre_usuario, u.rol_id, u.activo, \
+                u.ultimo_login, r.nombre AS rol_nombre, r.es_admin \
+         FROM usuarios u \
+         LEFT JOIN roles r ON r.id = u.rol_id \
+         WHERE u.deleted_at IS NULL \
+         ORDER BY u.nombre_completo",
     )
     .fetch_all(&state.pool)
     .await?;
@@ -847,50 +857,199 @@ async fn listar_usuarios(state: &AppState) -> Result<Value, ApiError> {
         "nombre_completo": r.get::<String, _>("nombre_completo"),
         "nombre_usuario":  r.get::<String, _>("nombre_usuario"),
         "rol_id":          r.get::<i64, _>("rol_id"),
-        "rol_nombre":      rol_nombre_por_id(r.get::<i64, _>("rol_id")),
-        "es_admin":        rol_es_admin(r.get::<i64, _>("rol_id")),
+        "rol_nombre":      r.try_get::<Option<String>, _>("rol_nombre").ok().flatten().unwrap_or_else(|| "desconocido".into()),
+        "es_admin":        r.try_get::<i32, _>("es_admin").map(|v| v != 0).unwrap_or(false),
         "activo":          r.get::<i32, _>("activo") != 0,
         "ultimo_login":    r.try_get::<Option<String>, _>("ultimo_login").ok().flatten(),
     })).collect::<Vec<_>>()))
 }
 
-/// En el POS local hay tabla `roles` con 3 filas seed. En web se hardcodea.
-fn listar_roles() -> Value {
-    json!([
-        { "id": 1, "nombre": "dueño",    "es_admin": true  },
-        { "id": 2, "nombre": "gerente",  "es_admin": true  },
-        { "id": 3, "nombre": "vendedor", "es_admin": false },
-    ])
+/// Lista los roles desde la tabla `roles` (sembrada por migración 007).
+async fn listar_roles(state: &AppState) -> Result<Value, ApiError> {
+    let rows = sqlx::query(
+        "SELECT id, nombre, COALESCE(descripcion, '') AS descripcion, es_admin \
+         FROM roles ORDER BY id",
+    )
+    .fetch_all(&state.pool)
+    .await?;
+    Ok(json!(rows.iter().map(|r| json!({
+        "id":          r.get::<i64, _>("id"),
+        "nombre":      r.get::<String, _>("nombre"),
+        "descripcion": r.try_get::<String, _>("descripcion").unwrap_or_default(),
+        "es_admin":    r.get::<i32, _>("es_admin") != 0,
+    })).collect::<Vec<_>>()))
 }
 
-fn rol_nombre_por_id(id: i64) -> &'static str {
-    match id { 1 => "dueño", 2 => "gerente", _ => "vendedor" }
+/// Obtiene el nombre del rol leyendo de la tabla. Devuelve "desconocido" si
+/// no existe (caso raro: rol_id inválido en algún registro).
+async fn rol_nombre_por_id(state: &AppState, id: i64) -> String {
+    sqlx::query_scalar::<_, String>("SELECT nombre FROM roles WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "desconocido".into())
 }
-fn rol_es_admin(id: i64) -> bool { id <= 2 }
+
+/// Verifica si el rol es admin leyendo de la tabla `roles`. Devuelve `false`
+/// si no existe el rol (defensa: nunca confunde "rol inválido" con admin).
+async fn rol_es_admin(state: &AppState, id: i64) -> bool {
+    sqlx::query_scalar::<_, i32>("SELECT es_admin FROM roles WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await
+        .ok()
+        .flatten()
+        .map(|v| v != 0)
+        .unwrap_or(false)
+}
+
+/// Lista los permisos de un rol específico. Usado por usuario_sesion_response
+/// para devolver al frontend los permisos del usuario logueado.
+async fn permisos_de_rol(state: &AppState, rol_id: i64) -> Vec<Value> {
+    let rows = sqlx::query(
+        "SELECT modulo, accion, permitido FROM permisos WHERE rol_id = $1",
+    )
+    .bind(rol_id)
+    .fetch_all(&state.pool)
+    .await
+    .unwrap_or_default();
+    rows.iter().map(|r| json!({
+        "modulo":    r.get::<String, _>("modulo"),
+        "accion":    r.get::<String, _>("accion"),
+        "permitido": r.get::<i32, _>("permitido") != 0,
+    })).collect()
+}
 
 // =============================================================================
 // CONFIG NEGOCIO / DESCUENTOS (web POS usa defaults)
 // =============================================================================
 
-fn obtener_config_negocio() -> Value {
-    json!({
-        "nombre": "Moto Refaccionaria",
-        "direccion": "",
-        "telefono": "",
-        "rfc": "",
-        "mensaje_pie": "¡Gracias por su compra!",
-        "respaldo_auto_activo": false,
-        "respaldo_auto_hora": "23:00",
-        "impresora_termica": "",
+async fn obtener_config_negocio(state: &AppState) -> Result<Value, ApiError> {
+    let row = sqlx::query(
+        "SELECT nombre, direccion, telefono, rfc, mensaje_pie, \
+                respaldo_auto_activo, respaldo_auto_hora, impresora_termica \
+         FROM config_negocio WHERE id = 1",
+    )
+    .fetch_optional(&state.pool)
+    .await?;
+
+    Ok(match row {
+        Some(r) => json!({
+            "nombre":               r.get::<String, _>("nombre"),
+            "direccion":            r.get::<String, _>("direccion"),
+            "telefono":             r.get::<String, _>("telefono"),
+            "rfc":                  r.get::<String, _>("rfc"),
+            "mensaje_pie":          r.get::<String, _>("mensaje_pie"),
+            "respaldo_auto_activo": r.get::<i32, _>("respaldo_auto_activo") != 0,
+            "respaldo_auto_hora":   r.get::<String, _>("respaldo_auto_hora"),
+            "impresora_termica":    r.get::<String, _>("impresora_termica"),
+        }),
+        // Fallback (la migración 007 inserta la fila id=1, no debería pasar).
+        None => json!({
+            "nombre": "Moto Refaccionaria",
+            "direccion": "", "telefono": "", "rfc": "",
+            "mensaje_pie": "¡Gracias por su compra!",
+            "respaldo_auto_activo": false, "respaldo_auto_hora": "23:00",
+            "impresora_termica": "",
+        }),
     })
 }
 
-fn obtener_config_descuentos() -> Value {
-    json!({
-        "descuento_max_vendedor_pct": 15.0,
-        "descuento_max_total_pct":    10.0,
-        "precio_minimo_global_margen": 5.0,
+async fn obtener_config_descuentos(state: &AppState) -> Result<Value, ApiError> {
+    use rust_decimal::prelude::ToPrimitive;
+    let row = sqlx::query(
+        "SELECT descuento_max_vendedor_pct, descuento_max_total_pct, \
+                precio_minimo_global_margen \
+         FROM config_descuentos WHERE id = 1",
+    )
+    .fetch_optional(&state.pool)
+    .await?;
+
+    let dec = |r: &sqlx::postgres::PgRow, name: &str| -> f64 {
+        r.try_get::<rust_decimal::Decimal, _>(name).ok()
+            .and_then(|d| d.to_f64()).unwrap_or(0.0)
+    };
+
+    Ok(match row {
+        Some(r) => json!({
+            "descuento_max_vendedor_pct":  dec(&r, "descuento_max_vendedor_pct"),
+            "descuento_max_total_pct":     dec(&r, "descuento_max_total_pct"),
+            "precio_minimo_global_margen": dec(&r, "precio_minimo_global_margen"),
+        }),
+        None => json!({
+            "descuento_max_vendedor_pct": 15.0,
+            "descuento_max_total_pct":    10.0,
+            "precio_minimo_global_margen": 5.0,
+        }),
     })
+}
+
+/// Actualiza la fila singleton id=1 de config_negocio. Frontend manda
+/// `{ datos: ConfigNegocio }`. Devuelve la config actualizada.
+async fn actualizar_config_negocio(
+    state: &AppState,
+    claims: &Claims,
+    args: Value,
+) -> Result<Value, ApiError> {
+    #[derive(Deserialize)]
+    struct A { datos: ConfigIn }
+    #[derive(Deserialize)]
+    struct ConfigIn {
+        nombre: String,
+        #[serde(default)] direccion: String,
+        #[serde(default)] telefono: String,
+        #[serde(default)] rfc: String,
+        #[serde(default)] mensaje_pie: String,
+        #[serde(default)] respaldo_auto_activo: bool,
+        #[serde(default = "default_hora")] respaldo_auto_hora: String,
+        #[serde(default)] impresora_termica: String,
+    }
+    fn default_hora() -> String { "23:00".into() }
+
+    let a: A = serde_json::from_value(args)
+        .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
+    let c = a.datos;
+
+    if c.nombre.trim().is_empty() {
+        return Err(ApiError::BadRequest("El nombre del negocio es obligatorio".into()));
+    }
+
+    let upd_sql = format!(
+        r#"UPDATE config_negocio SET
+               nombre = $1, direccion = $2, telefono = $3, rfc = $4,
+               mensaje_pie = $5, respaldo_auto_activo = $6,
+               respaldo_auto_hora = $7, impresora_termica = $8,
+               updated_at = {NOW_TEXT}
+           WHERE id = 1"#
+    );
+    sqlx::query(&upd_sql)
+        .bind(&c.nombre)
+        .bind(&c.direccion)
+        .bind(&c.telefono)
+        .bind(&c.rfc)
+        .bind(&c.mensaje_pie)
+        .bind(if c.respaldo_auto_activo { 1 } else { 0 })
+        .bind(&c.respaldo_auto_hora)
+        .bind(&c.impresora_termica)
+        .execute(&state.pool)
+        .await?;
+
+    // Bitácora
+    let audit_sql = format!(
+        r#"INSERT INTO audit_log
+           (usuario_id, accion, tabla_afectada, registro_id,
+            descripcion_legible, origen, fecha)
+           VALUES ($1, 'CONFIG_NEGOCIO_EDITADO', 'config_negocio', 1, $2, 'WEB', {NOW_TEXT})"#
+    );
+    let _ = sqlx::query(&audit_sql)
+        .bind(claims.sub)
+        .bind(format!("Configuración del negocio actualizada"))
+        .execute(&state.pool)
+        .await;
+
+    obtener_config_negocio(state).await
 }
 
 async fn obtener_info_servidor(_state: &AppState) -> Result<Value, ApiError> {
@@ -1500,7 +1659,12 @@ async fn usuario_sesion_response(
     let nombre_completo: String = r.get("nombre_completo");
     let nombre_usuario: String  = r.get("nombre_usuario");
     let rol_id: i64           = r.get("rol_id");
-    let es_admin              = rol_es_admin(rol_id);
+
+    // Resolver rol + permisos desde la tabla `roles`/`permisos` (migración 007).
+    // Antes esto era hardcoded `id <= 2`; ahora respeta lo que esté en BD.
+    let es_admin = rol_es_admin(state, rol_id).await;
+    let rol_nombre = rol_nombre_por_id(state, rol_id).await;
+    let permisos = permisos_de_rol(state, rol_id).await;
 
     // Si vino device_uuid, asegurar fila en pos_devices y obtener su modo.
     let (modo_caja, modo_configurado) = match device_uuid {
@@ -1527,10 +1691,10 @@ async fn usuario_sesion_response(
             "nombre_completo": nombre_completo,
             "nombre_usuario":  nombre_usuario,
             "rol_id":          rol_id,
-            "rol_nombre":      rol_nombre_por_id(rol_id),
+            "rol_nombre":      rol_nombre,
             "es_admin":        es_admin,
             "sesion_id":       chrono::Utc::now().timestamp(), // stateless: timestamp
-            "permisos":        [],
+            "permisos":        permisos,
         },
         // El frontend usa esta info para decidir si abrir el modal de bienvenida
         // y qué chip mostrar en el topbar. Si no hay device_uuid, queda
@@ -2012,7 +2176,7 @@ async fn crear_devolucion(
     .fetch_optional(&mut *tx)
     .await?
     .unwrap_or(3);
-    let es_admin = rol_es_admin(rol_id);
+    let es_admin = rol_es_admin(state, rol_id).await;
 
     if !es_admin && d.autorizado_por.is_none() {
         return Err(ApiError::BadRequest(
@@ -2827,7 +2991,7 @@ async fn crear_movimiento_caja(state: &AppState, args: Value) -> Result<Value, A
     .fetch_optional(&state.pool)
     .await?
     .unwrap_or(3);
-    let solicitante_es_admin = rol_es_admin(rol_id);
+    let solicitante_es_admin = rol_es_admin(state, rol_id).await;
 
     let autorizado_por_validado: Option<i64> =
         if d.tipo == "RETIRO" && d.monto > RETIRO_LIMITE_SIN_PIN && !solicitante_es_admin {
@@ -4060,3 +4224,314 @@ async fn listar_bitacora(state: &AppState, args: &Value) -> Result<Value, ApiErr
         "fecha":               r.get::<String, _>("fecha"),
     })).collect::<Vec<_>>()))
 }
+
+// =============================================================================
+// USUARIOS — CRUD (paridad con `commands/usuarios.rs:103-269`)
+// =============================================================================
+//
+// Frontend (`pages/Usuarios.tsx`) manda:
+//   - crear_usuario:        { usuario: {...}, adminId }
+//   - actualizar_usuario:   { usuario: {...}, adminId }
+//   - toggle_usuario_activo:{ usuarioId, activo, adminId }
+//
+// El admin que realiza la acción se loguea en `audit_log` con su id.
+// PIN y password se guardan como bcrypt hash (10 rounds, mismo cost del desktop).
+
+async fn crear_usuario(
+    state: &AppState,
+    claims: &Claims,
+    args: Value,
+) -> Result<Value, ApiError> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct A {
+        usuario: NuevoUsuario,
+        #[serde(default)] admin_id: Option<i64>,
+    }
+    #[derive(Deserialize)]
+    struct NuevoUsuario {
+        nombre_completo: String,
+        nombre_usuario: String,
+        pin: String,
+        password: String,
+        rol_id: i64,
+    }
+
+    let a: A = serde_json::from_value(args)
+        .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
+    let u = a.usuario;
+
+    if u.nombre_completo.trim().is_empty() {
+        return Err(ApiError::BadRequest("Nombre completo obligatorio".into()));
+    }
+    if u.nombre_usuario.trim().is_empty() {
+        return Err(ApiError::BadRequest("Nombre de usuario obligatorio".into()));
+    }
+    if u.pin.len() < 4 {
+        return Err(ApiError::BadRequest("El PIN debe tener al menos 4 caracteres".into()));
+    }
+    if u.password.len() < 4 {
+        return Err(ApiError::BadRequest("La contraseña debe tener al menos 4 caracteres".into()));
+    }
+
+    let existe: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM usuarios \
+         WHERE lower(nombre_usuario) = lower($1) AND deleted_at IS NULL",
+    )
+    .bind(&u.nombre_usuario)
+    .fetch_one(&state.pool)
+    .await?;
+    if existe > 0 {
+        return Err(ApiError::BadRequest("Ya existe un usuario con ese nombre".into()));
+    }
+
+    let pin_hash = bcrypt::hash(&u.pin, 10)
+        .map_err(|e| ApiError::BadRequest(format!("Error al hashear PIN: {}", e)))?;
+    let pwd_hash = bcrypt::hash(&u.password, 10)
+        .map_err(|e| ApiError::BadRequest(format!("Error al hashear contraseña: {}", e)))?;
+
+    let uuid = uuid::Uuid::now_v7().to_string();
+    let mut tx = state.pool.begin().await?;
+
+    let ins_sql = format!(
+        r#"INSERT INTO usuarios
+              (uuid, nombre_completo, nombre_usuario, pin, password_hash,
+               rol_id, activo, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, 1, {NOW_TEXT}, {NOW_TEXT})
+           RETURNING id, created_at"#
+    );
+    let row = sqlx::query(&ins_sql)
+        .bind(&uuid)
+        .bind(&u.nombre_completo)
+        .bind(&u.nombre_usuario)
+        .bind(&pin_hash)
+        .bind(&pwd_hash)
+        .bind(u.rol_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let id: i64 = row.get("id");
+    let created_at: String = row.get("created_at");
+
+    sqlx::query(
+        "INSERT INTO sync_cursor (tabla, uuid, sucursal_id, origen_device) \
+         VALUES ('usuarios', $1, 1, $2)",
+    )
+    .bind(&uuid)
+    .bind(WEB_ORIGIN)
+    .execute(&mut *tx)
+    .await?;
+
+    let admin_id = a.admin_id.unwrap_or(claims.sub);
+    let audit_sql = format!(
+        r#"INSERT INTO audit_log
+           (usuario_id, accion, tabla_afectada, registro_id,
+            descripcion_legible, origen, fecha)
+           VALUES ($1, 'USUARIO_CREADO', 'usuarios', $2, $3, 'WEB', {NOW_TEXT})"#
+    );
+    let _ = sqlx::query(&audit_sql)
+        .bind(admin_id)
+        .bind(id)
+        .bind(format!("Usuario creado: {} ({})", u.nombre_completo, u.nombre_usuario))
+        .execute(&mut *tx)
+        .await;
+
+    tx.commit().await?;
+
+    let rol_nombre = rol_nombre_por_id(state, u.rol_id).await;
+    let es_admin = rol_es_admin(state, u.rol_id).await;
+
+    Ok(json!({
+        "id":              id,
+        "nombre_completo": u.nombre_completo,
+        "nombre_usuario":  u.nombre_usuario,
+        "rol_id":          u.rol_id,
+        "rol_nombre":      rol_nombre,
+        "es_admin":        es_admin,
+        "activo":          true,
+        "ultimo_login":    Value::Null,
+        "created_at":      created_at,
+    }))
+}
+
+async fn actualizar_usuario(
+    state: &AppState,
+    claims: &Claims,
+    args: Value,
+) -> Result<Value, ApiError> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct A {
+        usuario: ActualizarIn,
+        #[serde(default)] admin_id: Option<i64>,
+    }
+    #[derive(Deserialize)]
+    struct ActualizarIn {
+        id: i64,
+        nombre_completo: String,
+        nombre_usuario: String,
+        rol_id: i64,
+        #[serde(default)] nuevo_pin: Option<String>,
+        #[serde(default)] nuevo_password: Option<String>,
+    }
+
+    let a: A = serde_json::from_value(args)
+        .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
+    let u = a.usuario;
+
+    let existe: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM usuarios \
+         WHERE lower(nombre_usuario) = lower($1) AND id != $2 AND deleted_at IS NULL",
+    )
+    .bind(&u.nombre_usuario)
+    .bind(u.id)
+    .fetch_one(&state.pool)
+    .await?;
+    if existe > 0 {
+        return Err(ApiError::BadRequest("Ya existe otro usuario con ese nombre".into()));
+    }
+
+    let mut tx = state.pool.begin().await?;
+
+    let uuid: String = sqlx::query_scalar(
+        "SELECT uuid FROM usuarios WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(u.id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(ApiError::NotFound)?;
+
+    let upd_sql = format!(
+        "UPDATE usuarios SET nombre_completo = $1, nombre_usuario = $2, \
+                             rol_id = $3, updated_at = {NOW_TEXT} \
+         WHERE id = $4 AND deleted_at IS NULL"
+    );
+    sqlx::query(&upd_sql)
+        .bind(&u.nombre_completo)
+        .bind(&u.nombre_usuario)
+        .bind(u.rol_id)
+        .bind(u.id)
+        .execute(&mut *tx)
+        .await?;
+
+    if let Some(p) = u.nuevo_pin.as_deref() {
+        if !p.is_empty() {
+            if p.len() < 4 {
+                return Err(ApiError::BadRequest("El PIN debe tener al menos 4 caracteres".into()));
+            }
+            let h = bcrypt::hash(p, 10)
+                .map_err(|e| ApiError::BadRequest(format!("Error PIN: {}", e)))?;
+            sqlx::query("UPDATE usuarios SET pin = $1 WHERE id = $2")
+                .bind(&h).bind(u.id).execute(&mut *tx).await?;
+        }
+    }
+    if let Some(p) = u.nuevo_password.as_deref() {
+        if !p.is_empty() {
+            if p.len() < 4 {
+                return Err(ApiError::BadRequest("La contraseña debe tener al menos 4 caracteres".into()));
+            }
+            let h = bcrypt::hash(p, 10)
+                .map_err(|e| ApiError::BadRequest(format!("Error pwd: {}", e)))?;
+            sqlx::query("UPDATE usuarios SET password_hash = $1 WHERE id = $2")
+                .bind(&h).bind(u.id).execute(&mut *tx).await?;
+        }
+    }
+
+    sqlx::query(
+        "INSERT INTO sync_cursor (tabla, uuid, sucursal_id, origen_device) \
+         VALUES ('usuarios', $1, 1, $2)",
+    )
+    .bind(&uuid)
+    .bind(WEB_ORIGIN)
+    .execute(&mut *tx)
+    .await?;
+
+    let admin_id = a.admin_id.unwrap_or(claims.sub);
+    let audit_sql = format!(
+        r#"INSERT INTO audit_log
+           (usuario_id, accion, tabla_afectada, registro_id,
+            descripcion_legible, origen, fecha)
+           VALUES ($1, 'USUARIO_EDITADO', 'usuarios', $2, $3, 'WEB', {NOW_TEXT})"#
+    );
+    let _ = sqlx::query(&audit_sql)
+        .bind(admin_id)
+        .bind(u.id)
+        .bind(format!("Usuario editado: {}", u.nombre_completo))
+        .execute(&mut *tx)
+        .await;
+
+    tx.commit().await?;
+    Ok(json!(true))
+}
+
+async fn toggle_usuario_activo(
+    state: &AppState,
+    claims: &Claims,
+    args: &Value,
+) -> Result<Value, ApiError> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct A {
+        usuario_id: i64,
+        activo: bool,
+        #[serde(default)] admin_id: Option<i64>,
+    }
+    let a: A = serde_json::from_value(args.clone())
+        .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
+
+    let admin_id = a.admin_id.unwrap_or(claims.sub);
+
+    if a.usuario_id == admin_id && !a.activo {
+        return Err(ApiError::BadRequest("No puedes desactivarte a ti mismo".into()));
+    }
+
+    let mut tx = state.pool.begin().await?;
+
+    let row = sqlx::query(
+        "SELECT uuid, nombre_completo FROM usuarios \
+         WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(a.usuario_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(ApiError::NotFound)?;
+    let uuid: String = row.get("uuid");
+    let nombre: String = row.get("nombre_completo");
+
+    let upd_sql = format!(
+        "UPDATE usuarios SET activo = $1, updated_at = {NOW_TEXT} WHERE id = $2"
+    );
+    sqlx::query(&upd_sql)
+        .bind(if a.activo { 1 } else { 0 })
+        .bind(a.usuario_id)
+        .execute(&mut *tx)
+        .await?;
+
+    sqlx::query(
+        "INSERT INTO sync_cursor (tabla, uuid, sucursal_id, origen_device) \
+         VALUES ('usuarios', $1, 1, $2)",
+    )
+    .bind(&uuid)
+    .bind(WEB_ORIGIN)
+    .execute(&mut *tx)
+    .await?;
+
+    let accion = if a.activo { "USUARIO_ACTIVADO" } else { "USUARIO_DESACTIVADO" };
+    let descr = format!("Usuario {} {}", nombre, if a.activo { "activado" } else { "desactivado" });
+    let audit_sql = format!(
+        r#"INSERT INTO audit_log
+           (usuario_id, accion, tabla_afectada, registro_id,
+            descripcion_legible, origen, fecha)
+           VALUES ($1, $2, 'usuarios', $3, $4, 'WEB', {NOW_TEXT})"#
+    );
+    let _ = sqlx::query(&audit_sql)
+        .bind(admin_id)
+        .bind(accion)
+        .bind(a.usuario_id)
+        .bind(descr)
+        .execute(&mut *tx)
+        .await;
+
+    tx.commit().await?;
+    Ok(json!(true))
+}
+
