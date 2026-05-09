@@ -1073,10 +1073,22 @@ async fn listar_dispositivos(_state: &AppState) -> Result<Value, ApiError> {
 // VENTAS — lectura
 // =============================================================================
 
+// Args del frontend (camelCase, idénticos a los que manda HistorialVentas
+// y Reportes). Todos los campos son opcionales y filtran solo si vienen.
+//
+// IMPORTANTE: el bug "Reportes siempre muestra los mismos números aunque
+// cambies el rango" venía de que esta struct ignoraba fechaInicio/fechaFin
+// (solo leía `texto` y `limite`). Sin filtro, el SQL devolvía las últimas
+// 500 ventas sin importar qué rango pidiera el frontend.
 #[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 struct BuscarVentasArgs {
+    #[serde(default)] folio: Option<String>,
+    #[serde(default)] fecha_inicio: Option<String>,
+    #[serde(default)] fecha_fin: Option<String>,
+    #[serde(default)] cliente_texto: Option<String>,
+    #[serde(default)] articulo_texto: Option<String>,
     #[serde(default)] limite: Option<i64>,
-    #[serde(default)] texto:  Option<String>,
 }
 
 async fn buscar_ventas(
@@ -1086,14 +1098,26 @@ async fn buscar_ventas(
 ) -> Result<Value, ApiError> {
     use rust_decimal::prelude::ToPrimitive;
     let a: BuscarVentasArgs = serde_json::from_value(args.clone()).unwrap_or_default();
-    let limite  = a.limite.unwrap_or(100).clamp(1, 500);
-    let q_like  = a.texto.as_ref().map(|s| format!("%{}%", s.to_lowercase()));
+    // Reportes pide hasta 5000, HistorialVentas hasta 100. Subimos el techo
+    // a 10k para no truncar reportes mensuales grandes.
+    let limite        = a.limite.unwrap_or(100).clamp(1, 10_000);
+    let folio_like    = a.folio.as_ref().filter(|s| !s.trim().is_empty())
+        .map(|s| format!("%{}%", s.to_lowercase()));
+    let cliente_like  = a.cliente_texto.as_ref().filter(|s| !s.trim().is_empty())
+        .map(|s| format!("%{}%", s.to_lowercase()));
+    let articulo_like = a.articulo_texto.as_ref().filter(|s| !s.trim().is_empty())
+        .map(|s| format!("%{}%", s.to_lowercase()));
+    let fecha_inicio  = a.fecha_inicio.as_ref().filter(|s| !s.trim().is_empty()).cloned();
+    let fecha_fin     = a.fecha_fin.as_ref().filter(|s| !s.trim().is_empty()).cloned();
 
     // En modo individual el historial muestra solo ventas web (la caja del
     // dispositivo). En modo espejo, todas — el web ve la historia compartida.
     let modo = modo_caja_de(state, claims).await?;
     let f_origen = if modo == "espejo" { "" } else { "AND v.origen = 'web'" };
 
+    // Subquery para filtrar por nombre/código de producto vendido. Solo se
+    // aplica si vino articuloTexto. Mantener `$5::text IS NULL` evita
+    // ejecutar la subquery cuando no hay filtro.
     let sql = format!(
         r#"
         SELECT v.id, v.folio, v.total, v.metodo_pago, v.anulada, v.fecha,
@@ -1107,15 +1131,26 @@ async fn buscar_ventas(
         LEFT JOIN clientes c ON c.id = v.cliente_id
         WHERE v.deleted_at IS NULL
           {f_origen}
-          AND ($1::text IS NULL
-               OR lower(v.folio) LIKE $1
-               OR lower(COALESCE(c.nombre,'')) LIKE $1)
+          AND ($1::text IS NULL OR lower(v.folio) LIKE $1)
+          AND ($2::text IS NULL OR lower(COALESCE(c.nombre, '')) LIKE $2)
+          AND ($3::text IS NULL OR v.fecha >= $3)
+          AND ($4::text IS NULL OR v.fecha <= $4)
+          AND ($5::text IS NULL OR EXISTS (
+              SELECT 1 FROM venta_detalle vd2
+              JOIN productos p ON p.id = vd2.producto_id
+              WHERE vd2.venta_id = v.id AND vd2.deleted_at IS NULL
+                AND (lower(p.nombre) LIKE $5 OR lower(p.codigo) LIKE $5)
+          ))
         ORDER BY v.fecha DESC
-        LIMIT $2
+        LIMIT $6
         "#
     );
     let rows = sqlx::query(&sql)
-    .bind(&q_like)
+    .bind(&folio_like)
+    .bind(&cliente_like)
+    .bind(&fecha_inicio)
+    .bind(&fecha_fin)
+    .bind(&articulo_like)
     .bind(limite)
     .fetch_all(&state.pool)
     .await?;
