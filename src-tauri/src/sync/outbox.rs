@@ -13,13 +13,28 @@ pub struct CambioPendiente {
     pub intentos: i64,
 }
 
-/// Lee hasta `limite` entradas pendientes (synced_at IS NULL) ordenadas por id.
+/// Lee hasta `limite` entradas pendientes (synced_at IS NULL).
+///
+/// ORDER BY `intentos ASC, id ASC` (no solo `id ASC`) para evitar el
+/// bug de "una fila mala bloquea la cola entera":
+///
+/// Si una fila vieja falla cada vez que se intenta empujar (foreign key
+/// inválido, conflicto LWW persistente, malformación), el worker la
+/// seguía trayendo en cada ciclo porque tenía el id más bajo. Las nuevas
+/// filas (insertadas después) NUNCA llegaban a tocarse aunque estuvieran
+/// perfectamente bien. Esto causa que el sync "se detenga" desde la
+/// fecha en que ocurrió el error persistente.
+///
+/// Con `intentos ASC` primero: las filas con `intentos=0` (recién
+/// encoladas, nunca probadas) tienen prioridad. Las falladas siguen
+/// reintentándose pero solo después de drenar las nuevas. Ninguna fila
+/// se pierde y la cola avanza.
 pub fn pendientes(conn: &Connection, limite: i64) -> SqlResult<Vec<CambioPendiente>> {
     let mut stmt = conn.prepare(
         "SELECT id, tabla, uuid, operacion, created_at, intentos \
          FROM sync_outbox \
          WHERE synced_at IS NULL \
-         ORDER BY id ASC \
+         ORDER BY intentos ASC, id ASC \
          LIMIT ?",
     )?;
     let rows = stmt.query_map([limite], |r| {
