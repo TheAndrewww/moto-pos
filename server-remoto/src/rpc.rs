@@ -1118,6 +1118,17 @@ async fn buscar_ventas(
     // Subquery para filtrar por nombre/código de producto vendido. Solo se
     // aplica si vino articuloTexto. Mantener `$5::text IS NULL` evita
     // ejecutar la subquery cuando no hay filtro.
+    //
+    // NOTA sobre el filtro de fecha (substr 1..10 en ambos lados):
+    // Antes comparábamos `v.fecha >= $3` directo. Eso falla cuando v.fecha
+    // está en formato ISO con 'T' (ej. "2026-05-23T18:30:00.000Z") y el
+    // filtro viene en formato con espacio ("2026-05-23 00:00:00"): la 'T'
+    // (0x54) es lexicográficamente MAYOR que el espacio (0x20), así que
+    // una venta del 23 de mayo termina FUERA del rango [2026-05-23 00:00,
+    // 2026-05-23 23:59:59]. Resultado: las filas en formato ISO
+    // desaparecen del historial/reportes.
+    // Fix: comparar solo la parte YYYY-MM-DD (substr 1..10), que es
+    // idéntica en ambos formatos.
     let sql = format!(
         r#"
         SELECT v.id, v.folio, v.total, v.metodo_pago, v.anulada, v.fecha,
@@ -1133,8 +1144,8 @@ async fn buscar_ventas(
           {f_origen}
           AND ($1::text IS NULL OR lower(v.folio) LIKE $1)
           AND ($2::text IS NULL OR lower(COALESCE(c.nombre, '')) LIKE $2)
-          AND ($3::text IS NULL OR v.fecha >= $3)
-          AND ($4::text IS NULL OR v.fecha <= $4)
+          AND ($3::text IS NULL OR substr(v.fecha, 1, 10) >= substr($3, 1, 10))
+          AND ($4::text IS NULL OR substr(v.fecha, 1, 10) <= substr($4, 1, 10))
           AND ($5::text IS NULL OR EXISTS (
               SELECT 1 FROM venta_detalle vd2
               JOIN productos p ON p.id = vd2.producto_id
@@ -3170,7 +3181,7 @@ async fn calcular_datos_corte(
     let efectivo: f64 = sqlx::query_scalar::<_, rust_decimal::Decimal>(
         &format!(
             "SELECT COALESCE(SUM(total), 0)::numeric FROM ventas \
-             WHERE fecha BETWEEN $1 AND $2 AND anulada = 0 \
+             WHERE substr(fecha, 1, 10) BETWEEN substr($1, 1, 10) AND substr($2, 1, 10) AND anulada = 0 \
                AND metodo_pago = 'efectivo' AND deleted_at IS NULL {f_ventas}"
         ),
     )
@@ -3182,7 +3193,7 @@ async fn calcular_datos_corte(
     let tarjeta: f64 = sqlx::query_scalar::<_, rust_decimal::Decimal>(
         &format!(
             "SELECT COALESCE(SUM(total), 0)::numeric FROM ventas \
-             WHERE fecha BETWEEN $1 AND $2 AND anulada = 0 \
+             WHERE substr(fecha, 1, 10) BETWEEN substr($1, 1, 10) AND substr($2, 1, 10) AND anulada = 0 \
                AND metodo_pago = 'tarjeta' AND deleted_at IS NULL {f_ventas}"
         ),
     )
@@ -3194,7 +3205,7 @@ async fn calcular_datos_corte(
     let transferencia: f64 = sqlx::query_scalar::<_, rust_decimal::Decimal>(
         &format!(
             "SELECT COALESCE(SUM(total), 0)::numeric FROM ventas \
-             WHERE fecha BETWEEN $1 AND $2 AND anulada = 0 \
+             WHERE substr(fecha, 1, 10) BETWEEN substr($1, 1, 10) AND substr($2, 1, 10) AND anulada = 0 \
                AND metodo_pago = 'transferencia' AND deleted_at IS NULL {f_ventas}"
         ),
     )
@@ -3209,7 +3220,7 @@ async fn calcular_datos_corte(
                     COALESCE(SUM(total), 0)::numeric AS total, \
                     COALESCE(SUM(descuento), 0)::numeric AS desc \
              FROM ventas \
-             WHERE fecha BETWEEN $1 AND $2 AND anulada = 0 AND deleted_at IS NULL {f_ventas}"
+             WHERE substr(fecha, 1, 10) BETWEEN substr($1, 1, 10) AND substr($2, 1, 10) AND anulada = 0 AND deleted_at IS NULL {f_ventas}"
         ),
     )
     .bind(&a.fecha_inicio).bind(&a.fecha_fin)
@@ -3221,7 +3232,7 @@ async fn calcular_datos_corte(
     let total_anulaciones: f64 = sqlx::query_scalar::<_, rust_decimal::Decimal>(
         &format!(
             "SELECT COALESCE(SUM(total), 0)::numeric FROM ventas \
-             WHERE fecha BETWEEN $1 AND $2 AND anulada = 1 AND deleted_at IS NULL {f_ventas}"
+             WHERE substr(fecha, 1, 10) BETWEEN substr($1, 1, 10) AND substr($2, 1, 10) AND anulada = 1 AND deleted_at IS NULL {f_ventas}"
         ),
     )
     .bind(&a.fecha_inicio).bind(&a.fecha_fin)
@@ -3306,7 +3317,8 @@ async fn calcular_datos_corte(
                MAX(v.fecha) AS hora_fin
         FROM ventas v
         JOIN usuarios u ON u.id = v.usuario_id
-        WHERE v.fecha BETWEEN $1 AND $2 AND v.anulada = 0 AND v.deleted_at IS NULL
+        WHERE substr(v.fecha, 1, 10) BETWEEN substr($1, 1, 10) AND substr($2, 1, 10)
+          AND v.anulada = 0 AND v.deleted_at IS NULL
           {f_ventas_v}
         GROUP BY v.usuario_id, u.nombre_completo
         ORDER BY total DESC
