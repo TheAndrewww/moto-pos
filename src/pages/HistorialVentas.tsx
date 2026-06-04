@@ -61,6 +61,11 @@ export default function HistorialVentas() {
         fecha_inicio: fechaInicio,
         fecha_fin: fechaFin,
         articulo_texto: termino,
+        // Subimos a 10000 — el default era 100 y un día con muchas ventas
+        // (>100) mostraba la lista cortada sin avisar. 10000 es el techo
+        // del backend buscar_ventas; cubre con holgura cualquier rango
+        // razonable (un mes promedio).
+        limite: 10000,
       });
       // Si se buscó por artículo y devolvió resultados, abrirlos todos automáticamente
       if (termino !== '' && r && r.length > 0) {
@@ -163,6 +168,17 @@ export default function HistorialVentas() {
             >
               <RefreshCw size={14} /> Limpiar
             </button>
+            {/* Contador para que se vea de un vistazo cuántas ventas trajo
+                el rango actual. Sin esto no había forma de saber si la
+                lista estaba truncada por el límite del backend. */}
+            {!cargando && ventas.length > 0 && (
+              <span style={{
+                marginLeft: 'auto', alignSelf: 'center', fontSize: 12,
+                color: 'var(--color-text-muted)', fontWeight: 600,
+              }}>
+                {ventas.length.toLocaleString('es-MX')} venta{ventas.length === 1 ? '' : 's'}
+              </span>
+            )}
           </div>
 
           {/* Tabla ventas */}

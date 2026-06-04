@@ -59,6 +59,8 @@ use commands::conexion::{
 use commands::sync_remoto::{
     obtener_estado_sync, configurar_sync, desactivar_sync, probar_conexion_sync,
     backfill_outbox,
+    forzar_sync_ahora, listar_errores_outbox, reintentar_errores_outbox,
+    descartar_filas_outbox,
 };
 use commands::exportar::escribir_archivo;
 use db::connection::init_database;
@@ -259,6 +261,10 @@ pub fn run() {
             desactivar_sync,
             probar_conexion_sync,
             backfill_outbox,
+            forzar_sync_ahora,
+            listar_errores_outbox,
+            reintentar_errores_outbox,
+            descartar_filas_outbox,
         ])
         .run(tauri::generate_context!())
         .expect("Error al iniciar el POS");

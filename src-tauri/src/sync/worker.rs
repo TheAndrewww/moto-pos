@@ -36,6 +36,14 @@ pub fn arrancar(db: Arc<Mutex<Connection>>) {
     });
 }
 
+/// Ejecuta un ciclo de sync (push + pull) inmediatamente, fuera del loop
+/// periódico. Usado por el botón "Forzar sincronización" de la UI cuando
+/// hay backlog acumulado y el usuario no quiere esperar el próximo intervalo
+/// de 30s. Devuelve `Ok(())` aunque haya errores parciales — solo loguea.
+pub async fn forzar_ciclo(db: Arc<Mutex<Connection>>) -> Result<(), String> {
+    ciclo(&db).await
+}
+
 async fn ciclo(db: &Arc<Mutex<Connection>>) -> Result<(), String> {
     // 1. Leer configuración de sync
     let cfg = {

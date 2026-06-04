@@ -154,3 +154,54 @@ pub fn backfill_outbox(state: State<AppState>) -> Result<i64, String> {
     log::info!("backfill_outbox: {} filas encoladas", total);
     Ok(total)
 }
+
+/// Fuerza un ciclo de sync (push + pull) inmediatamente, sin esperar al
+/// intervalo de 30s del worker. Útil cuando la cola está atorada o cuando
+/// el usuario quiere ver datos en el servidor de inmediato.
+#[tauri::command]
+pub async fn forzar_sync_ahora(state: State<'_, AppState>) -> Result<(), String> {
+    let db = state.db.clone();
+    crate::sync::worker::forzar_ciclo(db).await
+}
+
+/// Devuelve hasta `limite` filas del outbox que han fallado al sincronizar
+/// (intentos > 0). Ordenadas por intentos DESC para mostrar primero las
+/// más problemáticas. La UI puede mostrar `ultimo_error` para diagnóstico.
+#[tauri::command]
+pub fn listar_errores_outbox(
+    limite: Option<i64>,
+    state: State<AppState>,
+) -> Result<Vec<crate::sync::outbox::OutboxErrorFila>, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    crate::sync::outbox::errores(&conn, limite.unwrap_or(50))
+        .map_err(|e| e.to_string())
+}
+
+/// Resetea intentos y errores de TODAS las filas pendientes fallidas. El
+/// próximo ciclo del worker las reintentará. Útil cuando el problema que
+/// causaba los errores ya se resolvió (e.g. ahora hay red, ahora existe
+/// la fila referenciada en postgres, etc.).
+#[tauri::command]
+pub fn reintentar_errores_outbox(state: State<AppState>) -> Result<i64, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let n = crate::sync::outbox::reintentar_fallidos(&conn)
+        .map_err(|e| e.to_string())?;
+    log::info!("reintentar_errores_outbox: {} filas reseteadas", n);
+    Ok(n as i64)
+}
+
+/// Marca filas específicas como sincronizadas SIN enviarlas. Operación
+/// destructiva — el dato local se mantiene pero el servidor nunca lo verá.
+/// Solo úsalo para descartar filas que bloquean la cola y cuya pérdida en
+/// el servidor es aceptable.
+#[tauri::command]
+pub fn descartar_filas_outbox(
+    ids: Vec<i64>,
+    state: State<AppState>,
+) -> Result<i64, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let n = crate::sync::outbox::descartar(&conn, &ids)
+        .map_err(|e| e.to_string())?;
+    log::info!("descartar_filas_outbox: {} filas descartadas", n);
+    Ok(n as i64)
+}

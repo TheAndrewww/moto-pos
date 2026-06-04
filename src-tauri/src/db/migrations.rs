@@ -17,6 +17,7 @@ const MIGRATIONS: &[MigrationFn] = &[
     migracion_009_proveedores_activo,
     migracion_010_limpiar_movimientos_caja_ventas,
     migracion_011_audit_log_sync,
+    migracion_012_vendedor_sin_inventario,
 ];
 
 pub fn aplicar_migraciones(conn: &Connection) -> Result<()> {
@@ -836,5 +837,17 @@ fn migracion_011_audit_log_sync(conn: &Connection) -> Result<()> {
         [],
     );
 
+    Ok(())
+}
+
+// ─── Migración 012 ────────────────────────────────────────
+// Revoca los permisos de inventario del rol vendedor (rol_id=2).
+// Antes el vendedor tenía acceso a ver, crear y editar inventario;
+// ahora esas acciones quedan restringidas al dueño y almacenista.
+fn migracion_012_vendedor_sin_inventario(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "UPDATE permisos SET permitido = 0 WHERE rol_id = 2 AND modulo = 'inventario'",
+        [],
+    )?;
     Ok(())
 }
