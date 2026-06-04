@@ -63,6 +63,10 @@ use commands::sync_remoto::{
     descartar_filas_outbox,
 };
 use commands::exportar::escribir_archivo;
+use commands::reportes::{
+    obtener_top_productos, obtener_ventas_por_vendedor,
+    obtener_ventas_por_metodo, obtener_ventas_por_dia,
+};
 use db::connection::init_database;
 use std::sync::{Arc, Mutex};
 use tauri::Manager;
@@ -265,6 +269,11 @@ pub fn run() {
             listar_errores_outbox,
             reintentar_errores_outbox,
             descartar_filas_outbox,
+            // Reportes (agregaciones)
+            obtener_top_productos,
+            obtener_ventas_por_vendedor,
+            obtener_ventas_por_metodo,
+            obtener_ventas_por_dia,
         ])
         .run(tauri::generate_context!())
         .expect("Error al iniciar el POS");
