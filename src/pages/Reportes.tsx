@@ -11,46 +11,16 @@ import {
 
 // ─── Tipos ────────────────────────────────────────────────
 
-interface VentaResumen {
-  id: number;
-  folio: string;
-  usuario_nombre: string;
-  cliente_nombre: string | null;
-  total: number;
-  metodo_pago: string;
-  anulada: boolean;
-  fecha: string;
-  num_productos: number;
-}
-
-interface VentaDetalleItem {
-  id: number;
-  producto_id: number;
-  codigo: string;
-  nombre: string;
-  cantidad: number;
-  cantidad_devuelta: number;
-  cantidad_disponible: number;
-  precio_original: number;
-  descuento_porcentaje: number;
-  descuento_monto: number;
-  precio_final: number;
-  subtotal: number;
-}
-
-interface VentaDetalleCompleto {
-  id: number;
-  folio: string;
-  usuario_id: number;
-  usuario_nombre: string;
-  total: number;
-  metodo_pago: string;
-  anulada: boolean;
-  fecha: string;
-  items: VentaDetalleItem[];
-}
-
 type TabReporte = 'ventas_dia' | 'top_productos' | 'por_vendedor' | 'por_metodo';
+
+// Shapes que devuelven los nuevos handlers del servidor.
+// Antes la página iteraba VentaResumen[] + VentaDetalleCompleto[] desde
+// `buscar_ventas` + `obtener_detalle_venta`. Eso era lento (200 RPCs) y
+// además el .slice(0, 200) falseaba el top de productos.
+interface TopProducto { producto_id: number; codigo: string; nombre: string; cantidad: number; total: number; }
+interface VendedorAgg { nombre: string; count: number; total: number; }
+interface MetodoAgg   { metodo: string; count: number; total: number; }
+interface DiaAgg      { fecha: string; count: number; total: number; }
 
 // ─── Helpers ──────────────────────────────────────────────
 
@@ -98,8 +68,11 @@ const METODO_LABELS: Record<string, string> = {
 
 export default function Reportes() {
   const [tab, setTab] = useState<TabReporte>('ventas_dia');
-  const [ventas, setVentas] = useState<VentaResumen[]>([]);
-  const [detalles, setDetalles] = useState<VentaDetalleCompleto[]>([]);
+  // Agregaciones del servidor (en lugar de iterar ventas en memoria).
+  const [ventasPorDia, setVentasPorDia]           = useState<DiaAgg[]>([]);
+  const [topProductos, setTopProductos]           = useState<TopProducto[]>([]);
+  const [ventasPorVendedor, setVentasPorVendedor] = useState<VendedorAgg[]>([]);
+  const [ventasPorMetodo, setVentasPorMetodo]     = useState<MetodoAgg[]>([]);
   const [cargando, setCargando] = useState(false);
 
   // Rango de fechas predefinidos
@@ -114,37 +87,39 @@ export default function Reportes() {
     { label: '60 días', dias: 60 },
   ];
 
+  // Total general y conteos derivados de las agregaciones.
+  // Usamos ventasPorDia como fuente porque siempre se carga.
+  const totalGeneral = ventasPorDia.reduce((s, d) => s + d.total, 0);
+  const numTransacciones = ventasPorDia.reduce((s, d) => s + d.count, 0);
+
+  // Carga reportes desde el servidor. UNA query agregada por sección
+  // (ya no hay iteración venta-por-venta ni .slice(0, 200) que falseaba
+  // el top de productos).
   const cargarDatos = useCallback(async () => {
     setCargando(true);
+    const args = {
+      fechaInicio: `${fechaInicio} 00:00:00`,
+      fechaFin: `${fechaFin} 23:59:59`,
+    };
     try {
-      const rows = await invoke<VentaResumen[]>('buscar_ventas', {
-        folio: null,
-        fechaInicio: `${fechaInicio} 00:00:00`,
-        fechaFin: `${fechaFin} 23:59:59`,
-        clienteTexto: null,
-        limite: 5000,
-      });
-      setVentas(rows.filter(v => !v.anulada));
-
-      // Para Top 10, necesitamos los detalles de cada venta
-      if (tab === 'top_productos') {
-        const detallesArr: VentaDetalleCompleto[] = [];
-        // Cargamos detalles en lotes para evitar saturar
-        const ventasActivas = rows.filter(v => !v.anulada).slice(0, 200);
-        for (const v of ventasActivas) {
-          try {
-            const det = await invoke<VentaDetalleCompleto>('obtener_detalle_venta', { ventaId: v.id });
-            detallesArr.push(det);
-          } catch { /* skip */ }
-        }
-        setDetalles(detallesArr);
-      }
+      // Cargamos las 4 agregaciones en paralelo. La que aplique a la tab
+      // actual decide lo que se ve; las demás quedan listas si cambia.
+      const [dia, top, vendedores, metodos] = await Promise.all([
+        invoke<DiaAgg[]>('obtener_ventas_por_dia', args).catch(() => []),
+        invoke<TopProducto[]>('obtener_top_productos', { ...args, limite: 10 }).catch(() => []),
+        invoke<VendedorAgg[]>('obtener_ventas_por_vendedor', args).catch(() => []),
+        invoke<MetodoAgg[]>('obtener_ventas_por_metodo', args).catch(() => []),
+      ]);
+      setVentasPorDia(dia);
+      setTopProductos(top);
+      setVentasPorVendedor(vendedores);
+      setVentasPorMetodo(metodos);
     } catch (e) {
       console.error('Error cargando reportes:', e);
     } finally {
       setCargando(false);
     }
-  }, [fechaInicio, fechaFin, tab]);
+  }, [fechaInicio, fechaFin]);
 
   useEffect(() => { cargarDatos(); }, [cargarDatos]);
 
@@ -154,60 +129,13 @@ export default function Reportes() {
     setRangoLabel(label);
   };
 
-  // ─── Datos procesados ───────────────────────────────────
-
-  // Ventas por día
-  const ventasPorDia = (() => {
-    const mapa: Record<string, { fecha: string; total: number; count: number }> = {};
-    for (const v of ventas) {
-      const dia = v.fecha.substring(0, 10);
-      if (!mapa[dia]) mapa[dia] = { fecha: dia, total: 0, count: 0 };
-      mapa[dia].total += v.total;
-      mapa[dia].count += 1;
-    }
-    return Object.values(mapa).sort((a, b) => a.fecha.localeCompare(b.fecha));
-  })();
-
-  // Top 10 productos
-  const topProductos = (() => {
-    if (tab !== 'top_productos') return [];
-    const mapa: Record<string, { nombre: string; cantidad: number; total: number }> = {};
-    for (const d of detalles) {
-      for (const item of d.items) {
-        const key = item.nombre;
-        if (!mapa[key]) mapa[key] = { nombre: item.nombre, cantidad: 0, total: 0 };
-        mapa[key].cantidad += item.cantidad;
-        mapa[key].total += item.subtotal;
-      }
-    }
-    return Object.values(mapa).sort((a, b) => b.cantidad - a.cantidad).slice(0, 10);
-  })();
-
-  // Ventas por vendedor
-  const ventasPorVendedor = (() => {
-    const mapa: Record<string, { nombre: string; total: number; count: number }> = {};
-    for (const v of ventas) {
-      const nombre = v.usuario_nombre;
-      if (!mapa[nombre]) mapa[nombre] = { nombre, total: 0, count: 0 };
-      mapa[nombre].total += v.total;
-      mapa[nombre].count += 1;
-    }
-    return Object.values(mapa).sort((a, b) => b.total - a.total);
-  })();
-
-  // Ventas por método de pago
-  const ventasPorMetodo = (() => {
-    const mapa: Record<string, { metodo: string; label: string; total: number; count: number }> = {};
-    for (const v of ventas) {
-      const met = v.metodo_pago;
-      if (!mapa[met]) mapa[met] = { metodo: met, label: METODO_LABELS[met] || met, total: 0, count: 0 };
-      mapa[met].total += v.total;
-      mapa[met].count += 1;
-    }
-    return Object.values(mapa).sort((a, b) => b.total - a.total);
-  })();
-
-  const totalGeneral = ventas.reduce((sum, v) => sum + v.total, 0);
+  // Por método con label legible (los handlers devuelven 'efectivo'/'tarjeta'/etc).
+  const ventasPorMetodoUI = ventasPorMetodo.map(m => ({
+    metodo: m.metodo,
+    label: METODO_LABELS[m.metodo] || m.metodo,
+    total: m.total,
+    count: m.count,
+  }));
 
   // ─── Tabs ───────────────────────────────────────────────
 
@@ -231,7 +159,7 @@ export default function Reportes() {
           <h2 style={{ fontSize: 17, fontWeight: 800, color: 'var(--color-text)' }}>Reportes</h2>
           <span style={{ fontSize: 12, color: 'var(--color-text-dim)' }}>·</span>
           <span style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>
-            {ventas.length} ventas en rango
+            {numTransacciones.toLocaleString('es-MX')} ventas en rango
           </span>
         </div>
 
@@ -300,8 +228,8 @@ export default function Reportes() {
             {/* Resumen rápido */}
             <div className="pos-stats-4" style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 14, marginBottom: 24 }}>
               <MiniCard label="Total Ventas" value={fmt(totalGeneral)} />
-              <MiniCard label="Transacciones" value={String(ventas.length)} />
-              <MiniCard label="Promedio / Venta" value={ventas.length > 0 ? fmt(totalGeneral / ventas.length) : '$0.00'} />
+              <MiniCard label="Transacciones" value={String(numTransacciones)} />
+              <MiniCard label="Promedio / Venta" value={numTransacciones > 0 ? fmt(totalGeneral / numTransacciones) : '$0.00'} />
               <MiniCard label="Días con ventas" value={String(ventasPorDia.length)} />
             </div>
 
@@ -309,7 +237,7 @@ export default function Reportes() {
             {tab === 'ventas_dia' && <GraficaVentasDia data={ventasPorDia} />}
             {tab === 'top_productos' && <TablaTopProductos data={topProductos} />}
             {tab === 'por_vendedor' && <GraficaVendedores data={ventasPorVendedor} totalGeneral={totalGeneral} />}
-            {tab === 'por_metodo' && <GraficaMetodoPago data={ventasPorMetodo} totalGeneral={totalGeneral} />}
+            {tab === 'por_metodo' && <GraficaMetodoPago data={ventasPorMetodoUI} totalGeneral={totalGeneral} />}
           </>
         )}
       </div>

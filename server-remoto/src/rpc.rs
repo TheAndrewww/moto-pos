@@ -137,6 +137,10 @@ pub async fn dispatch(
         "obtener_fondo_sugerido"        => obtener_fondo_sugerido(&state, &claims).await?,
         "crear_movimiento_caja"         => crear_movimiento_caja(&state, args).await?,
         "calcular_datos_corte"          => calcular_datos_corte(&state, &claims, &args).await?,
+        "obtener_top_productos"         => obtener_top_productos(&state, &claims, &args).await?,
+        "obtener_ventas_por_vendedor"   => obtener_ventas_por_vendedor(&state, &claims, &args).await?,
+        "obtener_ventas_por_metodo"     => obtener_ventas_por_metodo(&state, &claims, &args).await?,
+        "obtener_ventas_por_dia"        => obtener_ventas_por_dia(&state, &claims, &args).await?,
         "crear_corte"                   => crear_corte(&state, &claims, args).await?,
 
         // ─── Ventas ──────────────────────────────────────────
@@ -3356,6 +3360,205 @@ async fn calcular_datos_corte(
         "movimientos":                movimientos,
         "vendedores":                 vendedores,
     }))
+}
+
+// =============================================================================
+// REPORTES — agregaciones del servidor
+// =============================================================================
+//
+// Antes la página Reportes hacía esto en el FRONTEND:
+//   1. buscar_ventas() → 1799 filas
+//   2. .slice(0, 200)              ← BUG: cortaba a las 200 más recientes
+//   3. for cada venta: invoke('obtener_detalle_venta')  ← 200 round-trips
+//   4. agregaba productos en memoria
+//
+// Problemas:
+//   - El slice falseaba los conteos (un producto con 20 ventas distribuidas
+//     en el rango aparecía con 11 si esas 9 caían fuera de las 200 más
+//     recientes).
+//   - 200 RPCs serializados era lentísimo.
+//
+// Estos handlers hacen la agregación en una sola query SQL en el servidor.
+// Devuelven exactamente lo que necesita la UI sin necesidad de iterar.
+//
+// Todos respetan el modo de caja (individual filtra origen='web', espejo no).
+
+// Args comunes a los 4: solo rango de fechas (camelCase desde frontend).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RangoReporte {
+    fecha_inicio: String,
+    fecha_fin: String,
+    #[serde(default)] limite: Option<i64>,
+}
+
+/// Top N productos vendidos en el rango (cantidad + total).
+/// Reemplaza el patrón frontend de iterar venta por venta.
+async fn obtener_top_productos(
+    state: &AppState,
+    claims: &Claims,
+    args: &Value,
+) -> Result<Value, ApiError> {
+    let a: RangoReporte = serde_json::from_value(args.clone())
+        .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
+    let limite = a.limite.unwrap_or(10).clamp(1, 100);
+
+    let modo = modo_caja_de(state, claims).await?;
+    let f_v = if modo == "espejo" { "" } else { "AND v.origen = 'web'" };
+
+    let sql = format!(
+        r#"
+        SELECT vd.producto_id,
+               COALESCE(p.codigo, '') AS codigo,
+               COALESCE(p.nombre, '(producto eliminado)') AS nombre,
+               SUM(vd.cantidad)::numeric    AS cantidad,
+               SUM(vd.subtotal)::numeric    AS total
+        FROM venta_detalle vd
+        JOIN ventas v ON v.id = vd.venta_id
+        LEFT JOIN productos p ON p.id = vd.producto_id
+        WHERE v.deleted_at IS NULL
+          AND vd.deleted_at IS NULL
+          AND v.anulada = 0
+          AND substr(v.fecha, 1, 10) BETWEEN substr($1, 1, 10) AND substr($2, 1, 10)
+          {f_v}
+        GROUP BY vd.producto_id, p.codigo, p.nombre
+        ORDER BY cantidad DESC
+        LIMIT $3
+        "#
+    );
+    let rows = sqlx::query(&sql)
+        .bind(&a.fecha_inicio)
+        .bind(&a.fecha_fin)
+        .bind(limite)
+        .fetch_all(&state.pool)
+        .await?;
+
+    Ok(json!(rows.iter().map(|r| json!({
+        "producto_id": r.get::<i64, _>("producto_id"),
+        "codigo":      r.get::<String, _>("codigo"),
+        "nombre":      r.get::<String, _>("nombre"),
+        "cantidad":    pg_dec(r, "cantidad"),
+        "total":       pg_dec(r, "total"),
+    })).collect::<Vec<_>>()))
+}
+
+/// Totales de venta agrupados por vendedor.
+async fn obtener_ventas_por_vendedor(
+    state: &AppState,
+    claims: &Claims,
+    args: &Value,
+) -> Result<Value, ApiError> {
+    let a: RangoReporte = serde_json::from_value(args.clone())
+        .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
+
+    let modo = modo_caja_de(state, claims).await?;
+    let f_v = if modo == "espejo" { "" } else { "AND v.origen = 'web'" };
+
+    let sql = format!(
+        r#"
+        SELECT v.usuario_id,
+               COALESCE(u.nombre_completo, '(usuario ' || v.usuario_id || ')') AS nombre,
+               COUNT(*)::bigint            AS count,
+               COALESCE(SUM(v.total), 0)::numeric AS total
+        FROM ventas v
+        LEFT JOIN usuarios u ON u.id = v.usuario_id
+        WHERE v.deleted_at IS NULL
+          AND v.anulada = 0
+          AND substr(v.fecha, 1, 10) BETWEEN substr($1, 1, 10) AND substr($2, 1, 10)
+          {f_v}
+        GROUP BY v.usuario_id, u.nombre_completo
+        ORDER BY total DESC
+        "#
+    );
+    let rows = sqlx::query(&sql)
+        .bind(&a.fecha_inicio)
+        .bind(&a.fecha_fin)
+        .fetch_all(&state.pool)
+        .await?;
+
+    Ok(json!(rows.iter().map(|r| json!({
+        "nombre": r.get::<String, _>("nombre"),
+        "count":  r.get::<i64, _>("count"),
+        "total":  pg_dec(r, "total"),
+    })).collect::<Vec<_>>()))
+}
+
+/// Totales agrupados por método de pago.
+async fn obtener_ventas_por_metodo(
+    state: &AppState,
+    claims: &Claims,
+    args: &Value,
+) -> Result<Value, ApiError> {
+    let a: RangoReporte = serde_json::from_value(args.clone())
+        .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
+
+    let modo = modo_caja_de(state, claims).await?;
+    let f_v = if modo == "espejo" { "" } else { "AND v.origen = 'web'" };
+
+    let sql = format!(
+        r#"
+        SELECT v.metodo_pago AS metodo,
+               COUNT(*)::bigint            AS count,
+               COALESCE(SUM(v.total), 0)::numeric AS total
+        FROM ventas v
+        WHERE v.deleted_at IS NULL
+          AND v.anulada = 0
+          AND substr(v.fecha, 1, 10) BETWEEN substr($1, 1, 10) AND substr($2, 1, 10)
+          {f_v}
+        GROUP BY v.metodo_pago
+        ORDER BY total DESC
+        "#
+    );
+    let rows = sqlx::query(&sql)
+        .bind(&a.fecha_inicio)
+        .bind(&a.fecha_fin)
+        .fetch_all(&state.pool)
+        .await?;
+
+    Ok(json!(rows.iter().map(|r| json!({
+        "metodo": r.get::<String, _>("metodo"),
+        "count":  r.get::<i64, _>("count"),
+        "total":  pg_dec(r, "total"),
+    })).collect::<Vec<_>>()))
+}
+
+/// Totales agrupados por día del rango.
+async fn obtener_ventas_por_dia(
+    state: &AppState,
+    claims: &Claims,
+    args: &Value,
+) -> Result<Value, ApiError> {
+    let a: RangoReporte = serde_json::from_value(args.clone())
+        .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
+
+    let modo = modo_caja_de(state, claims).await?;
+    let f_v = if modo == "espejo" { "" } else { "AND v.origen = 'web'" };
+
+    let sql = format!(
+        r#"
+        SELECT substr(v.fecha, 1, 10) AS fecha,
+               COUNT(*)::bigint            AS count,
+               COALESCE(SUM(v.total), 0)::numeric AS total
+        FROM ventas v
+        WHERE v.deleted_at IS NULL
+          AND v.anulada = 0
+          AND substr(v.fecha, 1, 10) BETWEEN substr($1, 1, 10) AND substr($2, 1, 10)
+          {f_v}
+        GROUP BY substr(v.fecha, 1, 10)
+        ORDER BY fecha ASC
+        "#
+    );
+    let rows = sqlx::query(&sql)
+        .bind(&a.fecha_inicio)
+        .bind(&a.fecha_fin)
+        .fetch_all(&state.pool)
+        .await?;
+
+    Ok(json!(rows.iter().map(|r| json!({
+        "fecha": r.get::<String, _>("fecha"),
+        "count": r.get::<i64, _>("count"),
+        "total": pg_dec(r, "total"),
+    })).collect::<Vec<_>>()))
 }
 
 async fn crear_corte(
