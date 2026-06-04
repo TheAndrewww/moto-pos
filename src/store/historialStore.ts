@@ -58,6 +58,8 @@ export interface FiltrosBusqueda {
   cliente_texto?: string;
   articulo_texto?: string;
   limite?: number;
+  /// Salto inicial para paginación. Default 0.
+  offset?: number;
 }
 
 export interface ItemDevolucion {
@@ -102,6 +104,7 @@ interface HistorialState {
   cargando: boolean;
 
   buscarVentas: (filtros: FiltrosBusqueda) => Promise<VentaResumen[]>;
+  contarVentas: (filtros: FiltrosBusqueda) => Promise<number>;
   obtenerDetalleVenta: (ventaId: number) => Promise<VentaDetalleCompleto>;
   obtenerDetalleCached: (ventaId: number) => Promise<VentaDetalleCompleto>;
   anularVenta: (ventaId: number, usuarioId: number, motivo: string) => Promise<boolean>;
@@ -125,6 +128,7 @@ export const useHistorialStore = create<HistorialState>((set, get) => ({
         clienteTexto: filtros.cliente_texto || null,
         articuloTexto: filtros.articulo_texto || null,
         limite: filtros.limite || 100,
+        offset: filtros.offset || 0,
       });
       set({ ventas: rows, cargando: false });
       return rows;
@@ -132,6 +136,19 @@ export const useHistorialStore = create<HistorialState>((set, get) => ({
       set({ cargando: false });
       throw e;
     }
+  },
+
+  contarVentas: async (filtros) => {
+    // Devuelve solo el total con los mismos filtros. Web: usa el handler
+    // postgres; Tauri: usa el handler SQLite. Ambos devuelven { total }.
+    const r = await invoke<{ total: number }>('contar_ventas', {
+      folio: filtros.folio || null,
+      fechaInicio: filtros.fecha_inicio || null,
+      fechaFin: filtros.fecha_fin || null,
+      clienteTexto: filtros.cliente_texto || null,
+      articuloTexto: filtros.articulo_texto || null,
+    });
+    return r?.total ?? 0;
   },
 
   obtenerDetalleVenta: async (ventaId) => {

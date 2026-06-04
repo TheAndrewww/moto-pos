@@ -145,6 +145,7 @@ pub async fn dispatch(
 
         // ─── Ventas ──────────────────────────────────────────
         "buscar_ventas"                 => buscar_ventas(&state, &claims, &args).await?,
+        "contar_ventas"                 => contar_ventas(&state, &claims, &args).await?,
         "obtener_detalle_venta"         => obtener_detalle_venta(&state, &args).await?,
         "crear_venta"                   => crear_venta(&state, &claims, args).await?,
         "listar_ventas_dia"             => listar_ventas_dia(&state, &claims).await?,
@@ -1093,6 +1094,11 @@ struct BuscarVentasArgs {
     #[serde(default)] cliente_texto: Option<String>,
     #[serde(default)] articulo_texto: Option<String>,
     #[serde(default)] limite: Option<i64>,
+    /// Salto inicial para paginación. Combinado con `limite`, permite
+    /// navegar páginas grandes (Historial puede tener >10k filas). El
+    /// frontend pide primero `contar_ventas` con los mismos filtros para
+    /// saber cuántas páginas hay y después este handler con offset.
+    #[serde(default)] offset: Option<i64>,
 }
 
 async fn buscar_ventas(
@@ -1105,6 +1111,7 @@ async fn buscar_ventas(
     // Reportes pide hasta 5000, HistorialVentas hasta 100. Subimos el techo
     // a 10k para no truncar reportes mensuales grandes.
     let limite        = a.limite.unwrap_or(100).clamp(1, 10_000);
+    let offset        = a.offset.unwrap_or(0).max(0);
     let folio_like    = a.folio.as_ref().filter(|s| !s.trim().is_empty())
         .map(|s| format!("%{}%", s.to_lowercase()));
     let cliente_like  = a.cliente_texto.as_ref().filter(|s| !s.trim().is_empty())
@@ -1157,7 +1164,7 @@ async fn buscar_ventas(
                 AND (lower(p.nombre) LIKE $5 OR lower(p.codigo) LIKE $5)
           ))
         ORDER BY v.fecha DESC
-        LIMIT $6
+        LIMIT $6 OFFSET $7
         "#
     );
     let rows = sqlx::query(&sql)
@@ -1167,6 +1174,7 @@ async fn buscar_ventas(
     .bind(&fecha_fin)
     .bind(&articulo_like)
     .bind(limite)
+    .bind(offset)
     .fetch_all(&state.pool)
     .await?;
 
@@ -1191,6 +1199,61 @@ struct VentaIdArg {
     // mandan `id` directo o `venta_id` snake.
     #[serde(alias = "ventaId", alias = "venta_id")]
     id: i64,
+}
+
+/// Cuenta total de ventas que coinciden con los filtros, sin traer las
+/// filas. Lo usa el Historial paginado para mostrar "Página X de Y" y
+/// para saber cuántos botones de página renderizar.
+///
+/// Acepta los mismos filtros que `buscar_ventas` (folio, fechas, cliente,
+/// artículo) pero ignora `limite` y `offset` — siempre devuelve el total.
+async fn contar_ventas(
+    state: &AppState,
+    claims: &Claims,
+    args: &Value,
+) -> Result<Value, ApiError> {
+    let a: BuscarVentasArgs = serde_json::from_value(args.clone()).unwrap_or_default();
+    let folio_like    = a.folio.as_ref().filter(|s| !s.trim().is_empty())
+        .map(|s| format!("%{}%", s.to_lowercase()));
+    let cliente_like  = a.cliente_texto.as_ref().filter(|s| !s.trim().is_empty())
+        .map(|s| format!("%{}%", s.to_lowercase()));
+    let articulo_like = a.articulo_texto.as_ref().filter(|s| !s.trim().is_empty())
+        .map(|s| format!("%{}%", s.to_lowercase()));
+    let fecha_inicio  = a.fecha_inicio.as_ref().filter(|s| !s.trim().is_empty()).cloned();
+    let fecha_fin     = a.fecha_fin.as_ref().filter(|s| !s.trim().is_empty()).cloned();
+
+    let modo = modo_caja_de(state, claims).await?;
+    let f_origen = if modo == "espejo" { "" } else { "AND v.origen = 'web'" };
+
+    let sql = format!(
+        r#"
+        SELECT COUNT(*)::bigint AS total
+        FROM ventas v
+        LEFT JOIN clientes c ON c.id = v.cliente_id
+        WHERE v.deleted_at IS NULL
+          {f_origen}
+          AND ($1::text IS NULL OR lower(v.folio) LIKE $1)
+          AND ($2::text IS NULL OR lower(COALESCE(c.nombre, '')) LIKE $2)
+          AND ($3::text IS NULL OR substr(v.fecha, 1, 10) >= substr($3, 1, 10))
+          AND ($4::text IS NULL OR substr(v.fecha, 1, 10) <= substr($4, 1, 10))
+          AND ($5::text IS NULL OR EXISTS (
+              SELECT 1 FROM venta_detalle vd2
+              JOIN productos p ON p.id = vd2.producto_id
+              WHERE vd2.venta_id = v.id AND vd2.deleted_at IS NULL
+                AND (lower(p.nombre) LIKE $5 OR lower(p.codigo) LIKE $5)
+          ))
+        "#
+    );
+    let total: i64 = sqlx::query_scalar(&sql)
+        .bind(&folio_like)
+        .bind(&cliente_like)
+        .bind(&fecha_inicio)
+        .bind(&fecha_fin)
+        .bind(&articulo_like)
+        .fetch_one(&state.pool)
+        .await?;
+
+    Ok(json!({ "total": total }))
 }
 
 async fn obtener_detalle_venta(state: &AppState, args: &Value) -> Result<Value, ApiError> {

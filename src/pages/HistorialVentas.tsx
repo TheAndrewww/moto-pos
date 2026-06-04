@@ -35,9 +35,13 @@ function hoyISO(): string {
   return d.toISOString().slice(0, 10);
 }
 
+// Paginación: tamaño fijo de página. 100 es buen compromiso entre traer
+// pocos datos (rápido en mobile) y no fragmentar demasiado.
+const POR_PAGINA = 100;
+
 export default function HistorialVentas() {
   const { usuario } = useAuthStore();
-  const { buscarVentas, listarDevoluciones, ventas, devoluciones, cargando } = useHistorialStore();
+  const { buscarVentas, contarVentas, listarDevoluciones, ventas, devoluciones, cargando } = useHistorialStore();
   const [tab, setTab] = useState<Tab>('ventas');
 
   // Filtros
@@ -47,30 +51,46 @@ export default function HistorialVentas() {
   const [articuloBuscado, setArticuloBuscado] = useState(''); // Texto activo usado para highlight
   const [expandedRows, setExpandedRows] = useState<Set<number>>(new Set());
 
+  // Paginación
+  const [pagina, setPagina] = useState(0);           // 0-indexed
+  const [totalVentas, setTotalVentas] = useState(0);
+  const totalPaginas = Math.max(1, Math.ceil(totalVentas / POR_PAGINA));
+
   // Modal de detalle (para acciones, se usarán desde el detalle en línea)
   const [ventaSeleccionada, setVentaSeleccionada] = useState<VentaDetalleCompleto | null>(null);
   const [modalAnular, setModalAnular] = useState(false);
   const [modalDevolver, setModalDevolver] = useState(false);
 
-  const cargar = async () => {
+  // Carga una página específica. El conteo total se actualiza solo cuando
+  // cambia el filtro (no al cambiar página) — pasar `recontar=true` para
+  // forzarlo.
+  const cargar = async (paginaSolicitada = 0, recontar = true) => {
     try {
       setExpandedRows(new Set());
       const termino = articuloTexto.trim();
       setArticuloBuscado(termino);
-      const r = await buscarVentas({
+      const filtros = {
         fecha_inicio: fechaInicio,
         fecha_fin: fechaFin,
         articulo_texto: termino,
-        // Subimos a 10000 — el default era 100 y un día con muchas ventas
-        // (>100) mostraba la lista cortada sin avisar. 10000 es el techo
-        // del backend buscar_ventas; cubre con holgura cualquier rango
-        // razonable (un mes promedio).
-        limite: 10000,
-      });
-      // Si se buscó por artículo y devolvió resultados, abrirlos todos automáticamente
-      if (termino !== '' && r && r.length > 0) {
-        setExpandedRows(new Set(r.map(v => v.id)));
-      }
+      };
+
+      // En paralelo: contar (si recontar) + página solicitada.
+      const [totalResult] = await Promise.all([
+        recontar ? contarVentas(filtros) : Promise.resolve(totalVentas),
+        (async () => {
+          const r = await buscarVentas({
+            ...filtros,
+            limite: POR_PAGINA,
+            offset: paginaSolicitada * POR_PAGINA,
+          });
+          if (termino !== '' && r && r.length > 0) {
+            setExpandedRows(new Set(r.map(v => v.id)));
+          }
+        })(),
+      ]);
+      if (recontar) setTotalVentas(totalResult);
+      setPagina(paginaSolicitada);
     } catch (e) {
       alert('Error al buscar: ' + e);
     }
@@ -135,7 +155,7 @@ export default function HistorialVentas() {
               <input
                 value={articuloTexto}
                 onChange={(e) => setArticuloTexto(e.target.value)}
-                onKeyDown={(e) => { if (e.key === 'Enter') cargar(); }}
+                onKeyDown={(e) => { if (e.key === 'Enter') cargar(0, true); }}
                 placeholder="Código, nombre o descripción del producto"
                 className="input input-sm"
                 autoFocus
@@ -159,7 +179,7 @@ export default function HistorialVentas() {
                 className="input input-sm"
               />
             </div>
-            <button className="btn btn-sm" onClick={cargar} disabled={cargando}>
+            <button className="btn btn-sm" onClick={() => cargar()} disabled={cargando}>
               <Search size={14} /> Buscar
             </button>
             <button
@@ -168,15 +188,20 @@ export default function HistorialVentas() {
             >
               <RefreshCw size={14} /> Limpiar
             </button>
-            {/* Contador para que se vea de un vistazo cuántas ventas trajo
-                el rango actual. Sin esto no había forma de saber si la
-                lista estaba truncada por el límite del backend. */}
-            {!cargando && ventas.length > 0 && (
+            {/* Contador con paginación. totalVentas se calcula con un
+                COUNT(*) por separado en el backend, así escalan miles
+                de filas sin truncar. */}
+            {!cargando && totalVentas > 0 && (
               <span style={{
                 marginLeft: 'auto', alignSelf: 'center', fontSize: 12,
                 color: 'var(--color-text-muted)', fontWeight: 600,
               }}>
-                {ventas.length.toLocaleString('es-MX')} venta{ventas.length === 1 ? '' : 's'}
+                {totalVentas.toLocaleString('es-MX')} venta{totalVentas === 1 ? '' : 's'}
+                {totalPaginas > 1 && (
+                  <span style={{ color: 'var(--color-text-dim)', fontWeight: 400 }}>
+                    {' '}· pág. {pagina + 1}/{totalPaginas}
+                  </span>
+                )}
               </span>
             )}
           </div>
@@ -259,6 +284,51 @@ export default function HistorialVentas() {
               </tbody>
             </table>
           </div>
+
+          {/* Controles de paginación. Solo se muestran si hay más de una
+              página. Pasamos `recontar=false` al cambiar página: el total
+              no cambia, solo navegamos la ventana del rango. */}
+          {totalPaginas > 1 && (
+            <div style={{
+              padding: '10px 20px',
+              borderTop: '1px solid var(--color-border)',
+              background: 'var(--color-surface)',
+              display: 'flex', alignItems: 'center', gap: 10,
+              justifyContent: 'center', flexWrap: 'wrap',
+            }}>
+              <button
+                className="btn btn-ghost btn-sm"
+                onClick={() => cargar(0, false)}
+                disabled={cargando || pagina === 0}
+              >
+                ⟪ Primera
+              </button>
+              <button
+                className="btn btn-ghost btn-sm"
+                onClick={() => cargar(Math.max(0, pagina - 1), false)}
+                disabled={cargando || pagina === 0}
+              >
+                ← Anterior
+              </button>
+              <span style={{ fontSize: 13, color: 'var(--color-text-muted)', fontWeight: 600 }}>
+                Página {pagina + 1} de {totalPaginas}
+              </span>
+              <button
+                className="btn btn-ghost btn-sm"
+                onClick={() => cargar(Math.min(totalPaginas - 1, pagina + 1), false)}
+                disabled={cargando || pagina >= totalPaginas - 1}
+              >
+                Siguiente →
+              </button>
+              <button
+                className="btn btn-ghost btn-sm"
+                onClick={() => cargar(totalPaginas - 1, false)}
+                disabled={cargando || pagina >= totalPaginas - 1}
+              >
+                Última ⟫
+              </button>
+            </div>
+          )}
         </>
       )}
 

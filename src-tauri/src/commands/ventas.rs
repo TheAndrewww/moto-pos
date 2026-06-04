@@ -394,6 +394,8 @@ pub fn anular_venta(
 }
 
 /// Buscar ventas por folio / rango de fechas / cliente (histórico completo)
+/// Soporta paginación con `offset` (default 0) — el frontend lo usa para
+/// el historial cuando hay miles de filas.
 #[tauri::command]
 pub fn buscar_ventas(
     folio: Option<String>,
@@ -402,6 +404,7 @@ pub fn buscar_ventas(
     cliente_texto: Option<String>,
     articulo_texto: Option<String>,
     limite: Option<i64>,
+    offset: Option<i64>,
     state: State<'_, AppState>,
 ) -> Result<Vec<VentaResumen>, String> {
     let db = state.db.lock().unwrap();
@@ -446,8 +449,9 @@ pub fn buscar_ventas(
         params.push(Box::new(like_codigo));
         params.push(Box::new(like));
     }
-    sql.push_str(" ORDER BY v.fecha DESC LIMIT ?");
+    sql.push_str(" ORDER BY v.fecha DESC LIMIT ? OFFSET ?");
     params.push(Box::new(limite.unwrap_or(100)));
+    params.push(Box::new(offset.unwrap_or(0)));
 
     let mut stmt = db.prepare(&sql).map_err(|e| e.to_string())?;
     let rows = stmt
@@ -468,6 +472,72 @@ pub fn buscar_ventas(
         .filter_map(|r| r.ok())
         .collect();
     Ok(rows)
+}
+
+#[derive(Serialize)]
+pub struct ConteoVentas {
+    pub total: i64,
+}
+
+/// Cuenta total de ventas que coinciden con los filtros (sin traer las
+/// filas). Acepta los mismos parámetros que `buscar_ventas` pero ignora
+/// `limite` y `offset`. Usado por el historial paginado para calcular
+/// cuántas páginas hay.
+#[tauri::command]
+pub fn contar_ventas(
+    folio: Option<String>,
+    fecha_inicio: Option<String>,
+    fecha_fin: Option<String>,
+    cliente_texto: Option<String>,
+    articulo_texto: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<ConteoVentas, String> {
+    let db = state.db.lock().unwrap();
+
+    let mut sql = String::from(
+        r#"SELECT COUNT(*) FROM ventas v
+           LEFT JOIN clientes cl ON cl.id = v.cliente_id
+           WHERE 1=1"#,
+    );
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+    if let Some(f) = folio.as_ref().filter(|s| !s.trim().is_empty()) {
+        sql.push_str(" AND v.folio LIKE ?");
+        params.push(Box::new(format!("%{}%", f.trim())));
+    }
+    if let Some(fi) = fecha_inicio.as_ref().filter(|s| !s.trim().is_empty()) {
+        sql.push_str(" AND date(v.fecha) >= date(?)");
+        params.push(Box::new(fi.clone()));
+    }
+    if let Some(ff) = fecha_fin.as_ref().filter(|s| !s.trim().is_empty()) {
+        sql.push_str(" AND date(v.fecha) <= date(?)");
+        params.push(Box::new(ff.clone()));
+    }
+    if let Some(c) = cliente_texto.as_ref().filter(|s| !s.trim().is_empty()) {
+        sql.push_str(" AND (cl.nombre LIKE ? OR cl.telefono LIKE ?)");
+        let like = format!("%{}%", c.trim());
+        params.push(Box::new(like.clone()));
+        params.push(Box::new(like));
+    }
+    if let Some(a) = articulo_texto.as_ref().filter(|s| !s.trim().is_empty()) {
+        sql.push_str(r#" AND EXISTS (
+            SELECT 1 FROM venta_detalle vd
+            JOIN productos p ON p.id = vd.producto_id
+            WHERE vd.venta_id = v.id AND (p.codigo LIKE ? OR p.search_text LIKE ?)
+        )"#);
+        let like = format!("%{}%", super::productos::normalizar_texto(a.trim()));
+        let like_codigo = format!("%{}%", a.trim());
+        params.push(Box::new(like_codigo));
+        params.push(Box::new(like));
+    }
+
+    let total: i64 = db.query_row(
+        &sql,
+        rusqlite::params_from_iter(params.iter().map(|p| p.as_ref())),
+        |row| row.get(0),
+    ).map_err(|e| e.to_string())?;
+
+    Ok(ConteoVentas { total })
 }
 
 /// Detalle completo de una venta (items + cantidades devueltas)
