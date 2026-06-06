@@ -456,17 +456,31 @@ pub fn crear_corte(
     let db = state.db.lock().unwrap();
     let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
-    // Solo un corte DIA por día
+    // Solo un corte DIA por día — comparado por `fecha_fin` (el día que
+    // CUBRE el corte), NO por `created_at` (cuándo se hizo el clic).
+    //
+    // El bug histórico: si un corte cubría el día N pero se creó el día
+    // N+1 (extemporáneo, muy común — se cierra ayer en la mañana de hoy),
+    // tenía `date(created_at) = N+1`. Al intentar cerrar HOY (día N+1),
+    // el frontend mandaba `fecha_inicio = N+1` y el filtro
+    // `date(created_at) = ?` encontraba el corte de ayer y bloqueaba
+    // diciendo "ya existe". Lo correcto es preguntar "¿ya hay un corte
+    // que cubra este día?", comparando `date(fecha_fin)` con el día del
+    // rango solicitado.
     if datos.tipo == "DIA" {
-        let fecha_hoy = &datos.fecha_inicio[..10]; // YYYY-MM-DD
+        let dia_cubierto = &datos.fecha_fin[..10]; // YYYY-MM-DD del día a cerrar
         let existe: i64 = db.query_row(
-            "SELECT COUNT(*) FROM cortes WHERE tipo = 'DIA' AND date(created_at) = ?",
-            rusqlite::params![fecha_hoy],
+            "SELECT COUNT(*) FROM cortes \
+             WHERE tipo = 'DIA' AND date(fecha_fin) = ?",
+            rusqlite::params![dia_cubierto],
             |row| row.get(0),
         ).unwrap_or(0);
 
         if existe > 0 {
-            return Err("Ya existe un corte del día para esta fecha".to_string());
+            return Err(format!(
+                "Ya existe un corte del día que cubre el {}. Cada día solo puede cerrarse una vez.",
+                dia_cubierto
+            ));
         }
     }
 

@@ -3688,26 +3688,26 @@ async fn crear_corte(
 
     let mut tx = state.pool.begin().await?;
 
-    // Solo un corte DIA por día. En modo individual: web no se traslapa con
-    // su otro web. En modo espejo: cualquier corte DIA hoy bloquea (la caja
-    // unificada no puede cerrarse dos veces).
+    // Solo un corte DIA por día — comparado por `fecha_fin` (el día que
+    // CUBRE el corte), NO por `created_at` (cuándo se hizo el clic).
+    // Ver comentario detallado del bug en commands/cortes.rs del desktop.
     if c.tipo == "DIA" {
-        let dia = if c.fecha_inicio.len() >= 10 { &c.fecha_inicio[..10] } else { "" };
+        let dia = if c.fecha_fin.len() >= 10 { &c.fecha_fin[..10] } else { "" };
         let dup_sql = format!(
             "SELECT COUNT(*)::bigint FROM cortes \
              WHERE tipo = 'DIA' AND deleted_at IS NULL {f_corte_origen} \
-               AND substr(created_at, 1, 10) = $1"
+               AND substr(fecha_fin, 1, 10) = $1"
         );
         let existe: i64 = sqlx::query_scalar(&dup_sql)
         .bind(dia)
         .fetch_one(&mut *tx).await?;
         if existe > 0 {
             let msg = if modo == "espejo" {
-                "Ya existe un corte del día para esta fecha (caja compartida con desktop)"
+                format!("Ya existe un corte del día que cubre el {} (caja compartida con desktop). Cada día solo puede cerrarse una vez.", dia)
             } else {
-                "Ya existe un corte del día (web) para esta fecha"
+                format!("Ya existe un corte del día (web) que cubre el {}. Cada día solo puede cerrarse una vez.", dia)
             };
-            return Err(ApiError::BadRequest(msg.into()));
+            return Err(ApiError::BadRequest(msg));
         }
     }
 

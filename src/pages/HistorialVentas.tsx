@@ -31,8 +31,16 @@ function formatFecha(fecha: string): string {
 }
 
 function hoyISO(): string {
+  // IMPORTANTE: usar la fecha LOCAL, no UTC.
+  // toISOString().slice(0,10) devolvía la fecha en UTC, así que en
+  // México (UTC-6) después de las 18:00 hora local el "default hoy"
+  // del historial se adelantaba un día — el usuario veía siempre
+  // mañana y tenía que retroceder manualmente.
   const d = new Date();
-  return d.toISOString().slice(0, 10);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
 }
 
 // Paginación: tamaño fijo de página. 100 es buen compromiso entre traer
@@ -430,7 +438,7 @@ function DetalleVentaInline({
 
   if (!venta) return <div style={{ padding: 20, textAlign: 'center', color: 'var(--color-text-muted)' }}>Cargando detalles...</div>;
 
-  const hoy = new Date().toISOString().slice(0, 10);
+  const hoy = hoyISO(); // misma rutina local-time que el filtro
   const fechaVenta = venta.fecha.slice(0, 10);
   const esHoy = fechaVenta === hoy;
   const totalDisponibleADevolver = venta.items.reduce((s, i) => s + i.cantidad_disponible, 0);
