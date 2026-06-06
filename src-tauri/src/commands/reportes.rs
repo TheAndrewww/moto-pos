@@ -63,19 +63,24 @@ pub fn obtener_top_productos(
 ) -> Result<Vec<TopProducto>, String> {
     let limite = limite.unwrap_or(10).clamp(1, 100);
     let db = state.db.lock().map_err(|e| e.to_string())?;
+    // COALESCE(SUM(...), 0) y casts a REAL/INTEGER previenen que una fila
+    // con cantidad/subtotal NULL haga panic al hacer row.get::<f64>().
+    // También usamos COALESCE(v.anulada, 0) para tratar filas viejas sin
+    // columna como no-anuladas.
     let mut stmt = db.prepare(
         r#"
         SELECT vd.producto_id,
                COALESCE(p.codigo, '') AS codigo,
                COALESCE(p.nombre, '(producto eliminado)') AS nombre,
-               SUM(vd.cantidad) AS cantidad,
-               SUM(vd.subtotal) AS total
+               CAST(COALESCE(SUM(vd.cantidad), 0) AS REAL) AS cantidad,
+               CAST(COALESCE(SUM(vd.subtotal), 0) AS REAL) AS total
         FROM venta_detalle vd
         JOIN ventas v ON v.id = vd.venta_id
         LEFT JOIN productos p ON p.id = vd.producto_id
-        WHERE v.anulada = 0
+        WHERE COALESCE(v.anulada, 0) = 0
           AND substr(v.fecha, 1, 10) BETWEEN substr(?, 1, 10) AND substr(?, 1, 10)
         GROUP BY vd.producto_id, p.codigo, p.nombre
+        HAVING cantidad > 0
         ORDER BY cantidad DESC
         LIMIT ?
         "#,
@@ -108,11 +113,11 @@ pub fn obtener_ventas_por_vendedor(
     let mut stmt = db.prepare(
         r#"
         SELECT COALESCE(u.nombre_completo, '(usuario ' || v.usuario_id || ')') AS nombre,
-               COUNT(*) AS count,
-               COALESCE(SUM(v.total), 0) AS total
+               CAST(COUNT(*) AS INTEGER) AS count,
+               CAST(COALESCE(SUM(v.total), 0) AS REAL) AS total
         FROM ventas v
         LEFT JOIN usuarios u ON u.id = v.usuario_id
-        WHERE v.anulada = 0
+        WHERE COALESCE(v.anulada, 0) = 0
           AND substr(v.fecha, 1, 10) BETWEEN substr(?, 1, 10) AND substr(?, 1, 10)
         GROUP BY v.usuario_id, u.nombre_completo
         ORDER BY total DESC
@@ -143,11 +148,11 @@ pub fn obtener_ventas_por_metodo(
     let db = state.db.lock().map_err(|e| e.to_string())?;
     let mut stmt = db.prepare(
         r#"
-        SELECT v.metodo_pago AS metodo,
-               COUNT(*) AS count,
-               COALESCE(SUM(v.total), 0) AS total
+        SELECT COALESCE(v.metodo_pago, 'efectivo') AS metodo,
+               CAST(COUNT(*) AS INTEGER) AS count,
+               CAST(COALESCE(SUM(v.total), 0) AS REAL) AS total
         FROM ventas v
-        WHERE v.anulada = 0
+        WHERE COALESCE(v.anulada, 0) = 0
           AND substr(v.fecha, 1, 10) BETWEEN substr(?, 1, 10) AND substr(?, 1, 10)
         GROUP BY v.metodo_pago
         ORDER BY total DESC
@@ -179,10 +184,10 @@ pub fn obtener_ventas_por_dia(
     let mut stmt = db.prepare(
         r#"
         SELECT substr(v.fecha, 1, 10) AS fecha,
-               COUNT(*) AS count,
-               COALESCE(SUM(v.total), 0) AS total
+               CAST(COUNT(*) AS INTEGER) AS count,
+               CAST(COALESCE(SUM(v.total), 0) AS REAL) AS total
         FROM ventas v
-        WHERE v.anulada = 0
+        WHERE COALESCE(v.anulada, 0) = 0
           AND substr(v.fecha, 1, 10) BETWEEN substr(?, 1, 10) AND substr(?, 1, 10)
         GROUP BY substr(v.fecha, 1, 10)
         ORDER BY fecha ASC

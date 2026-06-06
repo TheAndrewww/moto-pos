@@ -74,6 +74,11 @@ export default function Reportes() {
   const [ventasPorVendedor, setVentasPorVendedor] = useState<VendedorAgg[]>([]);
   const [ventasPorMetodo, setVentasPorMetodo]     = useState<MetodoAgg[]>([]);
   const [cargando, setCargando] = useState(false);
+  // Mensaje de error visible. Antes los .catch(() => []) silenciaban
+  // los fallos y el usuario veía las tarjetas vacías sin pista de qué
+  // pasaba; ahora aquí guardamos el primer error que ocurra para
+  // mostrarlo en pantalla.
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   // Rango de fechas predefinidos
   const [rangoLabel, setRangoLabel] = useState('7 días');
@@ -95,27 +100,40 @@ export default function Reportes() {
   // Carga reportes desde el servidor. UNA query agregada por sección
   // (ya no hay iteración venta-por-venta ni .slice(0, 200) que falseaba
   // el top de productos).
+  //
+  // Cada handler se llama por separado dentro de un try/catch propio
+  // para que si UNO falla los demás se vean. El mensaje del primero
+  // que falle se guarda en errorMsg y se muestra arriba.
   const cargarDatos = useCallback(async () => {
     setCargando(true);
+    setErrorMsg(null);
     const args = {
       fechaInicio: `${fechaInicio} 00:00:00`,
       fechaFin: `${fechaFin} 23:59:59`,
     };
+    let primerError: string | null = null;
+    const capturar = (label: string) => (e: unknown) => {
+      const msg = typeof e === 'string' ? e : (e as { message?: string })?.message ?? String(e);
+      console.error(`Reportes::${label} falló:`, e);
+      if (!primerError) primerError = `${label}: ${msg}`;
+      return [];
+    };
+
     try {
-      // Cargamos las 4 agregaciones en paralelo. La que aplique a la tab
-      // actual decide lo que se ve; las demás quedan listas si cambia.
       const [dia, top, vendedores, metodos] = await Promise.all([
-        invoke<DiaAgg[]>('obtener_ventas_por_dia', args).catch(() => []),
-        invoke<TopProducto[]>('obtener_top_productos', { ...args, limite: 10 }).catch(() => []),
-        invoke<VendedorAgg[]>('obtener_ventas_por_vendedor', args).catch(() => []),
-        invoke<MetodoAgg[]>('obtener_ventas_por_metodo', args).catch(() => []),
+        invoke<DiaAgg[]>('obtener_ventas_por_dia', args).catch(capturar('ventas_por_dia')),
+        invoke<TopProducto[]>('obtener_top_productos', { ...args, limite: 10 }).catch(capturar('top_productos')),
+        invoke<VendedorAgg[]>('obtener_ventas_por_vendedor', args).catch(capturar('ventas_por_vendedor')),
+        invoke<MetodoAgg[]>('obtener_ventas_por_metodo', args).catch(capturar('ventas_por_metodo')),
       ]);
-      setVentasPorDia(dia);
-      setTopProductos(top);
-      setVentasPorVendedor(vendedores);
-      setVentasPorMetodo(metodos);
+      setVentasPorDia(dia as DiaAgg[]);
+      setTopProductos(top as TopProducto[]);
+      setVentasPorVendedor(vendedores as VendedorAgg[]);
+      setVentasPorMetodo(metodos as MetodoAgg[]);
+      if (primerError) setErrorMsg(primerError);
     } catch (e) {
       console.error('Error cargando reportes:', e);
+      setErrorMsg(String(e));
     } finally {
       setCargando(false);
     }
@@ -225,6 +243,22 @@ export default function Reportes() {
           </div>
         ) : (
           <>
+            {/* Banner de error. Solo aparece si alguno de los 4 handlers
+                falló. Antes se silenciaba con .catch(() => []) y el
+                usuario veía las cards vacías sin saber qué pasó. */}
+            {errorMsg && (
+              <div style={{
+                padding: 12, marginBottom: 16,
+                background: 'rgba(239,68,68,0.10)',
+                border: '1px solid rgba(239,68,68,0.4)',
+                borderRadius: 8, fontSize: 13,
+                color: 'var(--color-danger)',
+              }}>
+                <strong>Hubo un error al cargar parte del reporte:</strong>{' '}
+                <code style={{ fontSize: 12 }}>{errorMsg}</code>
+              </div>
+            )}
+
             {/* Resumen rápido */}
             <div className="pos-stats-4" style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 14, marginBottom: 24 }}>
               <MiniCard label="Total Ventas" value={fmt(totalGeneral)} />
