@@ -3,29 +3,21 @@
 // Estos comandos son la paridad Tauri (SQLite local) de los handlers
 // `obtener_top_productos`/`obtener_ventas_por_*` que viven en
 // `server-remoto/src/rpc.rs` para la web. La página `Reportes.tsx` los
-// invoca por igual en ambas plataformas — sin estos en Tauri, el desktop
-// daría "command not found".
+// invoca por igual en ambas plataformas.
 //
-// El bug que estos reemplazan: la versión vieja del frontend iteraba
-// hasta 200 ventas y agregaba en memoria. Eso falseaba el top de productos
-// cuando había más de 200 ventas en el rango. Con SQL agregado en el
-// servidor (o en SQLite vía estos handlers) el conteo es exacto.
+// IMPORTANTE sobre la convención Tauri: los args van al nivel raíz del
+// mensaje, NO envueltos en una struct. El frontend invoca
+//    invoke('obtener_top_productos', { fechaInicio, fechaFin, limite })
+// → Tauri mapea camelCase ↔ snake_case y los pasa como argumentos
+// individuales. Si declaras `fn handler(rango: RangoReporte)` Tauri
+// busca el campo "rango" en el mensaje y falla con "missing field" —
+// los reportes aparecerían vacíos sin error visible al usuario. Por
+// eso cada handler recibe `fecha_inicio: String`, `fecha_fin: String`
+// directamente.
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tauri::State;
 use super::auth::AppState;
-
-// Args comunes: rango de fechas en formato "YYYY-MM-DD HH:MM:SS" y límite
-// opcional (solo lo usa top_productos; los demás devuelven todas las
-// agregaciones del rango porque la cardinalidad es baja).
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RangoReporte {
-    pub fecha_inicio: String,
-    pub fecha_fin: String,
-    #[serde(default)]
-    pub limite: Option<i64>,
-}
 
 #[derive(Serialize)]
 pub struct TopProducto {
@@ -64,10 +56,12 @@ pub struct DiaAgg {
 /// fechas en formato con espacio o ISO con 'T'.
 #[tauri::command]
 pub fn obtener_top_productos(
-    rango: RangoReporte,
+    fecha_inicio: String,
+    fecha_fin: String,
+    limite: Option<i64>,
     state: State<'_, AppState>,
 ) -> Result<Vec<TopProducto>, String> {
-    let limite = rango.limite.unwrap_or(10).clamp(1, 100);
+    let limite = limite.unwrap_or(10).clamp(1, 100);
     let db = state.db.lock().map_err(|e| e.to_string())?;
     let mut stmt = db.prepare(
         r#"
@@ -88,7 +82,7 @@ pub fn obtener_top_productos(
     ).map_err(|e| e.to_string())?;
 
     let rows = stmt.query_map(
-        rusqlite::params![rango.fecha_inicio, rango.fecha_fin, limite],
+        rusqlite::params![fecha_inicio, fecha_fin, limite],
         |row| {
             Ok(TopProducto {
                 producto_id: row.get(0)?,
@@ -106,7 +100,8 @@ pub fn obtener_top_productos(
 /// Totales agrupados por vendedor.
 #[tauri::command]
 pub fn obtener_ventas_por_vendedor(
-    rango: RangoReporte,
+    fecha_inicio: String,
+    fecha_fin: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<VendedorAgg>, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
@@ -125,7 +120,7 @@ pub fn obtener_ventas_por_vendedor(
     ).map_err(|e| e.to_string())?;
 
     let rows = stmt.query_map(
-        rusqlite::params![rango.fecha_inicio, rango.fecha_fin],
+        rusqlite::params![fecha_inicio, fecha_fin],
         |row| {
             Ok(VendedorAgg {
                 nombre: row.get(0)?,
@@ -141,7 +136,8 @@ pub fn obtener_ventas_por_vendedor(
 /// Totales agrupados por método de pago.
 #[tauri::command]
 pub fn obtener_ventas_por_metodo(
-    rango: RangoReporte,
+    fecha_inicio: String,
+    fecha_fin: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<MetodoAgg>, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
@@ -159,7 +155,7 @@ pub fn obtener_ventas_por_metodo(
     ).map_err(|e| e.to_string())?;
 
     let rows = stmt.query_map(
-        rusqlite::params![rango.fecha_inicio, rango.fecha_fin],
+        rusqlite::params![fecha_inicio, fecha_fin],
         |row| {
             Ok(MetodoAgg {
                 metodo: row.get(0)?,
@@ -175,7 +171,8 @@ pub fn obtener_ventas_por_metodo(
 /// Totales agrupados por día del rango.
 #[tauri::command]
 pub fn obtener_ventas_por_dia(
-    rango: RangoReporte,
+    fecha_inicio: String,
+    fecha_fin: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<DiaAgg>, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
@@ -193,7 +190,7 @@ pub fn obtener_ventas_por_dia(
     ).map_err(|e| e.to_string())?;
 
     let rows = stmt.query_map(
-        rusqlite::params![rango.fecha_inicio, rango.fecha_fin],
+        rusqlite::params![fecha_inicio, fecha_fin],
         |row| {
             Ok(DiaAgg {
                 fecha: row.get(0)?,
