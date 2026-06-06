@@ -72,7 +72,11 @@ pub async fn configurar_sync(
 
     let sucursal_final = input.sucursal_id.unwrap_or(login.sucursal_id);
 
-    // 2. Persistir en sync_state
+    // 2. Persistir en sync_state + resetear el outbox: cualquier fila que
+    //    estaba fallando con 401 ahora puede reintentarse con el token
+    //    fresco. Sin esto, el usuario tendría que ir a "Reintentar
+    //    fallidos" manualmente después de reconfigurar — confuso porque
+    //    intuitivamente "guardar credenciales" debería ser suficiente.
     {
         let conn = state.db.lock().map_err(|e| e.to_string())?;
         sstate::guardar_credenciales(
@@ -81,6 +85,14 @@ pub async fn configurar_sync(
             &login.token,
             sucursal_final,
         ).map_err(|e| e.to_string())?;
+
+        // Resetear intentos/error de todas las pendientes — el token nuevo
+        // probablemente ya no falle por 401.
+        let n = crate::sync::outbox::reintentar_fallidos(&conn)
+            .map_err(|e| e.to_string())?;
+        if n > 0 {
+            log::info!("configurar_sync: {} filas pendientes resetearon su estado de error", n);
+        }
     }
 
     obtener_estado_sync(state)

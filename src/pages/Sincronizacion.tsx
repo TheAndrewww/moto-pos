@@ -55,13 +55,15 @@ export default function Sincronizacion() {
 
   useEffect(() => {
     cargarEstado();
-    const i = setInterval(cargarEstado, 10_000);
+    // Cargar errores también al montar (para detectar token expirado
+    // y mostrar el banner sin necesidad de expandir "Ver detalle").
+    cargarErrores();
+    const i = setInterval(() => {
+      cargarEstado();
+      cargarErrores();
+    }, 10_000);
     return () => clearInterval(i);
   }, []);
-
-  useEffect(() => {
-    if (verErrores) cargarErrores();
-  }, [verErrores]);
 
   const conectar = async () => {
     if (!remoteUrl.trim() || !email.trim() || !password) {
@@ -200,6 +202,13 @@ export default function Sincronizacion() {
 
   const conectado = estado?.activo && estado.remote_url;
 
+  // Detección de "token expirado": si hay errores en el outbox y todos
+  // (o casi todos) son 401, claramente la sesión murió. Mostramos un
+  // banner claro pidiendo reconfigurar — sin esto el usuario solo veía
+  // "X pendientes" sin entender por qué no avanzaban.
+  const tokenMuerto = conectado && errores.length > 0 &&
+    errores.filter(e => (e.ultimo_error || '').includes('401')).length >= errores.length / 2;
+
   return (
     <div style={{ padding: 20, maxWidth: 720, margin: '0 auto', overflow: 'auto' }}>
       <div className="pos-page-header" style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 18 }}>
@@ -211,6 +220,34 @@ export default function Sincronizacion() {
         Conecta este POS al servidor remoto para que las ventas, productos y demás datos se respalden y queden disponibles
         desde la web/celular. Si pierdes internet, el POS sigue trabajando: los cambios se sincronizan cuando vuelva la red.
       </p>
+
+      {/* Banner crítico: token expirado. Aparece arriba del estado para
+          que sea imposible no verlo. Solo se renderiza cuando hay errores
+          y la mayoría son 401. */}
+      {tokenMuerto && (
+        <div style={{
+          padding: 14, borderRadius: 8, marginBottom: 16,
+          background: 'rgba(239,68,68,0.10)',
+          border: '1px solid rgba(239,68,68,0.5)',
+          display: 'flex', gap: 12, alignItems: 'flex-start',
+        }}>
+          <AlertTriangle size={20} style={{ color: 'var(--color-danger)', flexShrink: 0, marginTop: 2 }} />
+          <div style={{ flex: 1 }}>
+            <strong style={{ color: 'var(--color-danger)', fontSize: 14 }}>
+              Tu sesión con el servidor expiró
+            </strong>
+            <p style={{ fontSize: 12, marginTop: 4, marginBottom: 8, lineHeight: 1.5 }}>
+              Por eso los cambios no se están subiendo. Vuelve a ingresar
+              tu <strong>email y contraseña</strong> abajo y pulsa
+              <strong> Guardar cambios</strong>. Después de guardar, el sync
+              se reanudará automáticamente y empezará a procesar el backlog.
+            </p>
+            <p style={{ fontSize: 11, color: 'var(--color-text-muted)', margin: 0 }}>
+              {errores.length} cambios pendientes esperando subirse.
+            </p>
+          </div>
+        </div>
+      )}
 
       {/* ─── Estado actual ─── */}
       <div style={{

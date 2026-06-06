@@ -99,7 +99,14 @@ pub async fn login(
         &row.email,
         "admin",
         sucursal_id,
-        Duration::days(30),
+        // 1 año. El TTL anterior era 30 días, lo que en la práctica hacía
+        // que el sync del POS desktop dejara de funcionar silenciosamente
+        // cada mes: el server respondía 401 y el worker reintentaba sin
+        // saber que el token estaba muerto. El backlog crecía hasta que
+        // alguien lo notaba. Para un dispositivo de confianza que ya pasó
+        // email+password, 1 año es razonable; los admins pueden revocar
+        // manualmente desde la BD si fuera necesario.
+        Duration::days(365),
     )?;
 
     Ok(Json(LoginOutput {
