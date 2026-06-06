@@ -202,12 +202,12 @@ export default function Sincronizacion() {
 
   const conectado = estado?.activo && estado.remote_url;
 
-  // Detección de "token expirado": si hay errores en el outbox y todos
-  // (o casi todos) son 401, claramente la sesión murió. Mostramos un
-  // banner claro pidiendo reconfigurar — sin esto el usuario solo veía
-  // "X pendientes" sin entender por qué no avanzaban.
-  const tokenMuerto = conectado && errores.length > 0 &&
-    errores.filter(e => (e.ultimo_error || '').includes('401')).length >= errores.length / 2;
+  // Detección de "token expirado": basta CUALQUIER error 401 para
+  // alertar. Un solo 401 ya implica que el server rechazó el token —
+  // no es un error transitorio que valga la pena ignorar. Esperar a
+  // que sean "la mayoría" demoraba la alerta sin razón.
+  const errores401 = errores.filter(e => (e.ultimo_error || '').includes('401'));
+  const tokenMuerto = conectado && errores401.length > 0;
 
   return (
     <div style={{ padding: 20, maxWidth: 720, margin: '0 auto', overflow: 'auto' }}>
@@ -243,7 +243,8 @@ export default function Sincronizacion() {
               se reanudará automáticamente y empezará a procesar el backlog.
             </p>
             <p style={{ fontSize: 11, color: 'var(--color-text-muted)', margin: 0 }}>
-              {errores.length} cambios pendientes esperando subirse.
+              {estado?.pendientes ?? 0} cambios pendientes esperando subirse
+              {errores401.length > 0 && ` (${errores401.length} ya con error 401)`}.
             </p>
           </div>
         </div>

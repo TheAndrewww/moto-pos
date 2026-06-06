@@ -99,14 +99,19 @@ pub async fn login(
         &row.email,
         "admin",
         sucursal_id,
-        // 1 año. El TTL anterior era 30 días, lo que en la práctica hacía
-        // que el sync del POS desktop dejara de funcionar silenciosamente
-        // cada mes: el server respondía 401 y el worker reintentaba sin
-        // saber que el token estaba muerto. El backlog crecía hasta que
-        // alguien lo notaba. Para un dispositivo de confianza que ya pasó
-        // email+password, 1 año es razonable; los admins pueden revocar
-        // manualmente desde la BD si fuera necesario.
-        Duration::days(365),
+        // 100 años — efectivamente "no expira" para un POS desktop.
+        // El POS es un dispositivo de confianza que ya pasó email+password
+        // y vive físicamente en el negocio. Para revocarlo basta con
+        // cambiar `JWT_SECRET` en Railway o forzar logout desde la BD.
+        //
+        // TTLs cortos (30 días, 1 año) son ideales para sesiones de
+        // navegador donde el usuario interactivo puede re-loguearse fácil.
+        // Para sync automático no atendido, expirar el token solo causa
+        // que el backlog crezca silenciosamente hasta que alguien nota
+        // datos desactualizados semanas después. Mejor un TTL gigantesco
+        // y mantener la opción manual de reconfigurar para rotar
+        // credenciales bajo demanda.
+        Duration::days(365 * 100),
     )?;
 
     Ok(Json(LoginOutput {
