@@ -18,6 +18,7 @@ const MIGRATIONS: &[MigrationFn] = &[
     migracion_010_limpiar_movimientos_caja_ventas,
     migracion_011_audit_log_sync,
     migracion_012_vendedor_sin_inventario,
+    migracion_013_permisos_recepcion,
 ];
 
 pub fn aplicar_migraciones(conn: &Connection) -> Result<()> {
@@ -849,5 +850,29 @@ fn migracion_012_vendedor_sin_inventario(conn: &Connection) -> Result<()> {
         "UPDATE permisos SET permitido = 0 WHERE rol_id = 2 AND modulo = 'inventario'",
         [],
     )?;
+    Ok(())
+}
+
+
+// ─── Migración 013 ────────────────────────────────────────
+// Agrega el módulo de permisos `recepcion` a los 3 roles seed.
+//
+// Hasta hoy el sidebar mostraba "Recepción" si el usuario tenía
+// `inventario.crear`, lo que excluía al vendedor (la mig 012 le
+// quitó inventario). El negocio pidió que el vendedor SÍ pueda
+// recibir mercancía aunque no edite inventario general. Para
+// modelarlo limpio creamos un permiso propio `recepcion` con
+// acciones ver/crear, y el sidebar pasa a chequear ese.
+//
+// Idempotente: borra cualquier (rol, recepcion, *) previa antes de
+// insertar. Permite re-ejecutarse sin duplicar.
+fn migracion_013_permisos_recepcion(conn: &Connection) -> Result<()> {
+    conn.execute("DELETE FROM permisos WHERE modulo = 'recepcion'", [])?;
+    conn.execute_batch(r#"
+        INSERT INTO permisos (rol_id, modulo, accion, permitido) VALUES
+            (1, 'recepcion', 'ver',   1), (1, 'recepcion', 'crear', 1),
+            (2, 'recepcion', 'ver',   1), (2, 'recepcion', 'crear', 1),
+            (3, 'recepcion', 'ver',   1), (3, 'recepcion', 'crear', 1);
+    "#)?;
     Ok(())
 }

@@ -466,7 +466,8 @@ INSERT OR IGNORE INTO permisos (rol_id, modulo, accion, permitido) VALUES
     (1, 'reportes',   'ver',      1),
     (1, 'usuarios',   'ver',      1), (1, 'usuarios',   'crear',    1),
     (1, 'usuarios',   'editar',   1), (1, 'usuarios',   'eliminar', 1),
-    (1, 'bitacora',   'ver',      1);
+    (1, 'bitacora',   'ver',      1),
+    (1, 'recepcion',  'ver',      1), (1, 'recepcion',  'crear',    1);
 
 -- Permisos del VENDEDOR
 INSERT OR IGNORE INTO permisos (rol_id, modulo, accion, permitido) VALUES
@@ -479,7 +480,9 @@ INSERT OR IGNORE INTO permisos (rol_id, modulo, accion, permitido) VALUES
     (2, 'pedidos',    'ver',      1), (2, 'pedidos',    'crear',    1),
     (2, 'reportes',   'ver',      0),
     (2, 'usuarios',   'ver',      0),
-    (2, 'bitacora',   'ver',      0);
+    (2, 'bitacora',   'ver',      0),
+    -- Vendedor SÍ puede recibir mercancía aunque no tenga inventario general
+    (2, 'recepcion',  'ver',      1), (2, 'recepcion',  'crear',    1);
 
 -- Permisos del ALMACENISTA
 INSERT OR IGNORE INTO permisos (rol_id, modulo, accion, permitido) VALUES
@@ -488,7 +491,8 @@ INSERT OR IGNORE INTO permisos (rol_id, modulo, accion, permitido) VALUES
     (3, 'inventario', 'editar',   1),
     (3, 'pedidos',    'ver',      1), (3, 'pedidos',    'crear',    1),
     (3, 'precios',    'ver',      0), (3, 'reportes',   'ver',      0),
-    (3, 'usuarios',   'ver',      0), (3, 'bitacora',   'ver',      0);
+    (3, 'usuarios',   'ver',      0), (3, 'bitacora',   'ver',      0),
+    (3, 'recepcion',  'ver',      1), (3, 'recepcion',  'crear',    1);
 
 -- Categorías base para moto refaccionaria
 INSERT OR IGNORE INTO categorias (nombre, descripcion) VALUES

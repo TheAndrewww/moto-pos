@@ -141,7 +141,7 @@ export default function Dashboard() {
     { id: 'catalogo', label: 'Inventario', icon: <Package size={18} />, key: 'F4', visible: tienePermiso('inventario', 'ver') },
     { id: 'dashboard', label: 'Dashboard', icon: <BarChart3 size={18} />, key: 'F8', visible: true },
     { id: 'presupuestos', label: 'Presupuestos', icon: <ClipboardList size={18} />, key: 'F2', visible: tienePermiso('ventas', 'crear') },
-    { id: 'recepcion', label: 'Recepción', icon: <TruckIcon size={18} />, key: 'F3', visible: tienePermiso('inventario', 'crear') },
+    { id: 'recepcion', label: 'Recepción', icon: <TruckIcon size={18} />, key: 'F3', visible: tienePermiso('recepcion', 'ver') },
     { id: 'pedidos', label: 'Pedidos', icon: <ScrollText size={18} />, key: '', visible: tienePermiso('pedidos', 'ver') },
     { id: 'etiquetas', label: 'Etiquetas', icon: <Tag size={18} />, key: 'F5', visible: tienePermiso('inventario', 'ver') },
     { id: 'historial', label: 'Historial Ventas', icon: <History size={18} />, key: 'F7', visible: tienePermiso('ventas', 'ver') },
