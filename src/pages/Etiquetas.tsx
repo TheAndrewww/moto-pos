@@ -6,8 +6,12 @@
 import { useState, useEffect, useRef, useMemo } from 'react';
 import { useProductStore, type Producto } from '../store/productStore';
 import { Tag, Search, Printer, X, Trash2 } from 'lucide-react';
-import { printHTMLDialogOverlay, escapeHTML } from '../utils/print';
 import QRCode from 'qrcode';
+import {
+  imprimirEtiquetas,
+  ETIQUETA_ANCHO_DEFAULT_MM,
+  ETIQUETA_ALTO_DEFAULT_MM,
+} from '../lib/imprimirEtiquetas';
 
 const QR_OPTS: QRCode.QRCodeToDataURLOptions = {
   errorCorrectionLevel: 'M',
@@ -16,9 +20,11 @@ const QR_OPTS: QRCode.QRCodeToDataURLOptions = {
   color: { dark: '#000000', light: '#ffffff' },
 };
 
-// Defaults para etiquetadora térmica de rollo continuo
-const ANCHO_DEFAULT_MM = 39;
-const ALTO_DEFAULT_MM = 30;
+// Defaults para etiquetadora térmica de rollo continuo. Re-exportados desde
+// el helper compartido para que Etiquetas y otras pantallas (Catálogo)
+// usen los mismos valores por defecto.
+const ANCHO_DEFAULT_MM = ETIQUETA_ANCHO_DEFAULT_MM;
+const ALTO_DEFAULT_MM = ETIQUETA_ALTO_DEFAULT_MM;
 
 function useQrCache(codigos: string[]) {
   const [cache, setCache] = useState<Record<string, string>>({});
@@ -97,71 +103,11 @@ export default function Etiquetas() {
   const nombrePt = Math.max(6, Math.min(11, altoMm * 0.22));
   const codigoPt = Math.max(5, Math.min(9, altoMm * 0.20));
 
+  // Imprimir usando el helper compartido — mismo motor que el flujo de
+  // "imprimir tras crear producto" del Catálogo. Sin esto duplicaríamos
+  // el HTML/CSS de la etiqueta en dos sitios.
   const handlePrint = async () => {
-    if (etiquetas.length === 0) return;
-    const qrMap: Record<string, string> = {};
-    await Promise.all(
-      codigosUnicos.map(async c => { qrMap[c] = await QRCode.toDataURL(c, QR_OPTS); })
-    );
-
-    const html = `
-      <style>
-        /* Cada etiqueta es una página independiente del tamaño exacto del rollo */
-        @page {
-          size: ${anchoMm}mm ${altoMm}mm;
-          margin: 0;
-        }
-        html, body { margin: 0 !important; padding: 0 !important; background: #fff; }
-        .etiqueta-print-container { font-family: Arial, sans-serif; }
-        .etiqueta {
-          width: ${anchoMm}mm;
-          height: ${altoMm}mm;
-          padding: ${padMm}mm;
-          display: flex;
-          flex-direction: column;
-          align-items: center;
-          justify-content: space-between;
-          gap: ${padMm * 0.5}mm;
-          page-break-after: always;
-          page-break-inside: avoid;
-          break-after: page;
-          break-inside: avoid;
-          box-sizing: border-box;
-          overflow: hidden;
-          color: #000;
-          text-align: center;
-        }
-        .etiqueta:last-child { page-break-after: auto; break-after: auto; }
-        .nombre {
-          width: 100%;
-          font-size: ${nombrePt}pt; font-weight: 800;
-          line-height: 1.05;
-          overflow: hidden;
-          display: -webkit-box;
-          -webkit-line-clamp: 2; -webkit-box-orient: vertical;
-          word-break: break-word;
-        }
-        .qr {
-          width: ${qrMm}mm; height: ${qrMm}mm;
-          flex-shrink: 0; display: block;
-        }
-        .codigo {
-          width: 100%;
-          font-size: ${codigoPt}pt; color: #000; font-family: monospace;
-          font-weight: 700;
-          white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-        }
-      </style>
-      <div class="etiqueta-print-container">
-      ${etiquetas.map(p => `
-        <div class="etiqueta">
-          <div class="nombre">${escapeHTML(p.nombre)}</div>
-          <img class="qr" src="${qrMap[p.codigo]}" alt="${escapeHTML(p.codigo)}" />
-          <div class="codigo">${escapeHTML(p.codigo)}</div>
-        </div>
-      `).join('')}
-      </div>`;
-    printHTMLDialogOverlay(html);
+    await imprimirEtiquetas({ items: seleccionados, anchoMm, altoMm });
   };
 
   // Ajustar entrada numérica con clamp seguro (evita 0 o NaN al borrar)

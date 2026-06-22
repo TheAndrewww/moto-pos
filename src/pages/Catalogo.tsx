@@ -4,9 +4,10 @@
 import { useState, useEffect, useRef } from 'react';
 import { useProductStore, type Producto, type NuevoProducto } from '../store/productStore';
 import { useAuthStore } from '../store/authStore';
-import { Package, Plus, Search, Edit2, X, AlertTriangle, Tag, Hash, LayoutGrid, List, Download, History, Trash2, SlidersHorizontal } from 'lucide-react';
+import { Package, Plus, Search, Edit2, X, AlertTriangle, Tag, Hash, LayoutGrid, List, Download, History, Trash2, SlidersHorizontal, Printer } from 'lucide-react';
 import { invoke } from '../lib/invokeCompat';
 import { useVirtualizer } from '@tanstack/react-virtual';
+import { imprimirEtiquetas } from '../lib/imprimirEtiquetas';
 
 export default function Catalogo() {
   const {
@@ -27,6 +28,10 @@ export default function Catalogo() {
   const [vista, setVista] = useState<'grid' | 'lista'>('grid');
   const [localBusqueda, setLocalBusqueda] = useState(busqueda);
   const [confirmarEliminar, setConfirmarEliminar] = useState<Producto | null>(null);
+  // Tras crear un producto nuevo, ofrecemos imprimir N etiquetas (N = stock
+  // que se agregó). Si el usuario confirma, llamamos al motor de impresión
+  // compartido directamente — no hay que ir a la pantalla de Etiquetas.
+  const [ofertaEtiquetas, setOfertaEtiquetas] = useState<{ producto: Producto; cantidad: number } | null>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // React-virtual state
@@ -156,6 +161,7 @@ export default function Catalogo() {
             await ajustarStock(editando.id, Number(form.stock_actual), "Ajuste directo desde editor", usuario.id);
           }
         } else {
+          const cantidadInicial = Number(form.stock_actual);
           const nuevo: NuevoProducto = {
             nombre: form.nombre,
             descripcion: form.descripcion || undefined,
@@ -164,11 +170,17 @@ export default function Catalogo() {
             codigo_tipo: form.codigo_tipo || undefined,
             precio_costo: Number(form.precio_costo),
             precio_venta: Math.ceil(Number(form.precio_venta) || 0),
-            stock_actual: Number(form.stock_actual),
+            stock_actual: cantidadInicial,
             stock_minimo: Number(form.stock_minimo),
             proveedor_id: form.proveedor_id ? Number(form.proveedor_id) : undefined,
           };
-          await crearProducto(nuevo, usuario.id);
+          const creado = await crearProducto(nuevo, usuario.id);
+          // Oferta de imprimir etiquetas: solo si el usuario agregó stock
+          // inicial. Si crea el producto con 0 stock (caso raro pero válido)
+          // no tiene sentido ofrecer impresión.
+          if (creado && cantidadInicial > 0) {
+            setOfertaEtiquetas({ producto: creado, cantidad: cantidadInicial });
+          }
         }
         setShowForm(false);
         setEditando(null);
@@ -926,6 +938,19 @@ export default function Catalogo() {
         </div>
       )}
 
+      {/* Modal: ofrecer impresión de etiquetas tras crear producto.
+          Se dispara automáticamente cuando setOfertaEtiquetas se setea
+          (al final del handleSubmit de creación). El usuario puede
+          ajustar la cantidad a imprimir (default = stock_actual) por si
+          quiere imprimir menos (ej. solo unas pocas etiquetas de muestra). */}
+      {ofertaEtiquetas && (
+        <ModalOfertaEtiquetas
+          producto={ofertaEtiquetas.producto}
+          cantidadSugerida={ofertaEtiquetas.cantidad}
+          onClose={() => setOfertaEtiquetas(null)}
+        />
+      )}
+
       {/* ─── FAB para Nuevo Producto (Mobile) ─── */}
       {puedeCrear && (
         <button
@@ -1412,4 +1437,110 @@ const labelStyle: React.CSSProperties = {
   textTransform: 'uppercase',
   letterSpacing: '0.3px',
 };
+
+// Modal de oferta tras crear producto: "¿quieres imprimir N etiquetas?"
+// Se reutiliza el motor de impresión compartido (lib/imprimirEtiquetas).
+// La cantidad sugerida = stock que se ingresó al crear, pero el usuario
+// puede ajustarla por si quiere imprimir menos (muestras) o más (extras
+// para reposiciones futuras).
+function ModalOfertaEtiquetas({
+  producto,
+  cantidadSugerida,
+  onClose,
+}: {
+  producto: Producto;
+  cantidadSugerida: number;
+  onClose: () => void;
+}) {
+  const [cantidad, setCantidad] = useState(cantidadSugerida);
+  const [imprimiendo, setImprimiendo] = useState(false);
+
+  const handleImprimir = async () => {
+    if (cantidad < 1) return;
+    setImprimiendo(true);
+    try {
+      await imprimirEtiquetas({
+        items: [{ producto, cantidad }],
+      });
+      onClose();
+    } catch (e: any) {
+      alert('Error al imprimir: ' + (e?.message ?? String(e)));
+    } finally {
+      setImprimiendo(false);
+    }
+  };
+
+  return (
+    <div
+      className="pos-modal-overlay"
+      style={{
+        position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', zIndex: 1100,
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+      }}
+      onClick={onClose}
+    >
+      <div
+        className="card animate-fade-in pos-modal-content"
+        style={{ width: 420, maxWidth: '100%', padding: 24 }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 16 }}>
+          <div style={{
+            width: 44, height: 44, borderRadius: '50%',
+            background: 'rgba(59,130,246,0.12)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            color: 'var(--color-primary)', flexShrink: 0,
+          }}>
+            <Printer size={22} />
+          </div>
+          <div style={{ flex: 1 }}>
+            <h3 style={{ fontSize: 16, fontWeight: 700, margin: 0 }}>
+              ¿Imprimir etiquetas?
+            </h3>
+            <p style={{ fontSize: 12, color: 'var(--color-text-muted)', margin: '2px 0 0' }}>
+              Producto creado: <strong>{producto.nombre}</strong>
+            </p>
+          </div>
+          <button className="btn btn-ghost btn-sm" onClick={onClose} title="No imprimir">
+            <X size={16} />
+          </button>
+        </div>
+
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+          <div>
+            <label style={labelStyle}>CANTIDAD A IMPRIMIR</label>
+            <input
+              type="number"
+              min={1}
+              max={1000}
+              value={cantidad}
+              onChange={(e) => setCantidad(Math.max(1, Math.min(1000, Number(e.target.value) || 1)))}
+              className="input mono"
+              autoFocus
+              style={{ fontSize: 18, fontWeight: 700 }}
+            />
+            <p style={{ fontSize: 11, color: 'var(--color-text-dim)', marginTop: 4 }}>
+              Sugerido: {cantidadSugerida} (stock inicial del producto). Puedes
+              ajustarlo si solo quieres imprimir unas pocas.
+            </p>
+          </div>
+
+          <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+            <button className="btn btn-ghost" style={{ flex: 1 }} onClick={onClose} disabled={imprimiendo}>
+              No imprimir
+            </button>
+            <button
+              className="btn btn-primary"
+              style={{ flex: 1 }}
+              onClick={handleImprimir}
+              disabled={imprimiendo || cantidad < 1}
+            >
+              {imprimiendo ? 'Imprimiendo…' : <><Printer size={14} /> Imprimir {cantidad}</>}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
 
