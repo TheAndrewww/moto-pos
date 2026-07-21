@@ -104,6 +104,52 @@ pub fn desactivar_sync(state: State<AppState>) -> Result<(), String> {
     sstate::desactivar(&conn).map_err(|e| e.to_string())
 }
 
+/// Compara la hora local de la computadora contra la del servidor remoto.
+/// Devuelve el desfase en segundos (positivo = la PC va ADELANTADA,
+/// negativo = la PC va ATRASADA). `None` si no hay sync configurado o el
+/// servidor no responde (sin red no podemos saber — no alarmar).
+///
+/// Contexto: el POS registra ventas con la hora de la PC. Si el reloj se
+/// desconfigura (pila CMOS, cambio manual, zona horaria), las ventas se
+/// guardan con fecha equivocada y "desaparecen" de las vistas del día.
+/// Caso real: PC con 12h28m de atraso → todas las ventas de la mañana
+/// quedaron fechadas el día anterior.
+#[tauri::command]
+pub async fn verificar_hora_sistema(state: State<'_, AppState>) -> Result<Option<i64>, String> {
+    let url = {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        match sstate::leer(&conn).map_err(|e| e.to_string())? {
+            Some(cfg) => cfg.remote_url,
+            None => None,
+        }
+    };
+    let Some(url) = url else { return Ok(None) };
+
+    let http = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return Ok(None),
+    };
+
+    let time_url = format!("{}/time", url.trim_end_matches('/'));
+    let resp = match http.get(&time_url).send().await {
+        Ok(r) if r.status().is_success() => r,
+        _ => return Ok(None), // sin red o server viejo sin /time: no alarmar
+    };
+
+    #[derive(serde::Deserialize)]
+    struct TimeResp { epoch: i64 }
+    let t: TimeResp = match resp.json().await {
+        Ok(t) => t,
+        Err(_) => return Ok(None),
+    };
+
+    let local_epoch = chrono::Utc::now().timestamp();
+    Ok(Some(local_epoch - t.epoch))
+}
+
 #[tauri::command]
 pub async fn probar_conexion_sync(state: State<'_, AppState>) -> Result<bool, String> {
     let (url, token) = {

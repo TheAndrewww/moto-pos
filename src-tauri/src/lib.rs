@@ -60,7 +60,7 @@ use commands::sync_remoto::{
     obtener_estado_sync, configurar_sync, desactivar_sync, probar_conexion_sync,
     backfill_outbox,
     forzar_sync_ahora, listar_errores_outbox, reintentar_errores_outbox,
-    descartar_filas_outbox,
+    descartar_filas_outbox, verificar_hora_sistema,
 };
 use commands::exportar::escribir_archivo;
 use commands::reportes::{
@@ -270,6 +270,7 @@ pub fn run() {
             listar_errores_outbox,
             reintentar_errores_outbox,
             descartar_filas_outbox,
+            verificar_hora_sistema,
             // Reportes (agregaciones)
             obtener_top_productos,
             obtener_ventas_por_vendedor,

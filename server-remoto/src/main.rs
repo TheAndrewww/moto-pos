@@ -55,6 +55,7 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/time", get(server_time))
         .route("/auth/login", post(auth::login))
         // Sync
         .route("/sync/push", post(sync::push))
@@ -88,4 +89,16 @@ async fn main() -> anyhow::Result<()> {
 
 async fn health() -> &'static str {
     "ok"
+}
+
+/// Hora del servidor en epoch seconds (UTC). Sin auth — es información
+/// pública e inocua. El POS desktop la usa para detectar si el reloj de
+/// la computadora está desfasado: si el reloj local difiere mucho, las
+/// ventas se registran con fecha/hora incorrectas y "desaparecen" de las
+/// vistas del día (bug real reportado: PC con 12h de atraso → ventas del
+/// día guardadas con la fecha de ayer).
+async fn server_time() -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({
+        "epoch": chrono::Utc::now().timestamp(),
+    }))
 }

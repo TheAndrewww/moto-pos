@@ -48,6 +48,12 @@ export default function Dashboard() {
   const [stockBajoCount, setStockBajoCount] = useState<number>(0);
   const [stockAlertDismiss, setStockAlertDismiss] = useState<boolean>(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState<boolean>(false);
+  // Desfase del reloj de la PC vs servidor, en segundos. null = no medido
+  // o sin red. Si supera el umbral mostramos banner rojo NO descartable:
+  // con el reloj mal, las ventas se registran con fecha equivocada y
+  // "desaparecen" de las vistas del día (caso real: PC 12h atrasada).
+  const [desfaseReloj, setDesfaseReloj] = useState<number | null>(null);
+  const DESFASE_UMBRAL_SEG = 5 * 60; // 5 minutos de tolerancia
 
   // Modo de caja (solo aplica en web). Si el usuario no ha configurado nunca,
   // mostramos el modal de bienvenida bloqueante. Después puede cambiarlo
@@ -90,6 +96,22 @@ export default function Dashboard() {
   // Auto-respaldo diario (una vez al arrancar si no hay uno de hoy)
   useEffect(() => {
     invoke('respaldo_auto_si_necesario').catch(() => {});
+  }, []);
+
+  // Vigilar el reloj de la PC contra el servidor (solo desktop — la web
+  // registra ventas con la hora del servidor, no le afecta el reloj local).
+  // Chequeo al arrancar y cada 5 min: si alguien mueve la hora a media
+  // jornada, el banner aparece en minutos, no hasta el próximo reinicio.
+  useEffect(() => {
+    if (!isTauri()) return;
+    const medir = () => {
+      invoke<number | null>('verificar_hora_sistema')
+        .then(drift => setDesfaseReloj(drift))
+        .catch(() => {});
+    };
+    medir();
+    const i = setInterval(medir, 5 * 60 * 1000);
+    return () => clearInterval(i);
   }, []);
 
   // Alerta de stock bajo (recuento al iniciar y al cambiar a Dashboard)
@@ -300,6 +322,35 @@ export default function Dashboard() {
       {/* ─── Contenido ─── */}
       <div style={{ overflow: 'hidden', display: 'flex', flexDirection: 'column', minHeight: 0, minWidth: 0 }}>
 
+        {/* ALERTA CRÍTICA: reloj de la PC desfasado vs servidor.
+            NO tiene botón de "ignorar" a propósito — mientras el reloj
+            esté mal, cada venta se registra con fecha/hora incorrecta y
+            desaparece de las vistas del día. El banner solo se quita
+            corrigiendo la hora de Windows (el chequeo corre cada 5 min). */}
+        {desfaseReloj !== null && Math.abs(desfaseReloj) > DESFASE_UMBRAL_SEG && (
+          <div style={{
+            padding: '12px 20px', background: 'rgba(239,68,68,0.15)',
+            borderBottom: '2px solid rgba(239,68,68,0.6)',
+            display: 'flex', alignItems: 'center', gap: 12,
+            flexShrink: 0, flexWrap: 'wrap',
+          }}>
+            <span style={{ fontSize: 18 }}>🕐</span>
+            <div style={{ flex: '1 1 300px' }}>
+              <div style={{ fontSize: 14, fontWeight: 800, color: 'var(--color-danger)' }}>
+                ¡LA HORA DE ESTA COMPUTADORA ESTÁ MAL!
+              </div>
+              <div style={{ fontSize: 12, color: 'var(--color-text)', marginTop: 2 }}>
+                Va {desfaseReloj > 0 ? 'adelantada' : 'atrasada'}{' '}
+                <strong>{formatearDesfase(Math.abs(desfaseReloj))}</strong> respecto
+                al servidor. Las ventas se están guardando con fecha/hora
+                incorrecta y no aparecerán en las vistas de hoy.{' '}
+                <strong>Corrige la hora en Windows</strong> (Configuración →
+                Hora e idioma → activar "Establecer la hora automáticamente").
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* Alerta de cierre de caja pendiente */}
         {cortePendiente && (
           <div style={{
@@ -508,4 +559,14 @@ function PaymentBar({ label, value, total, color, fmt }: {
       <p style={{ fontSize: 11, color: 'var(--color-text-dim)', marginTop: 2 }}>{pct.toFixed(0)}%</p>
     </div>
   );
+}
+
+// Formatea un desfase en segundos a texto legible: "12 h 28 min", "45 min", "2 días".
+function formatearDesfase(seg: number): string {
+  const dias = Math.floor(seg / 86400);
+  const horas = Math.floor((seg % 86400) / 3600);
+  const mins = Math.floor((seg % 3600) / 60);
+  if (dias > 0) return `${dias} día${dias === 1 ? '' : 's'} ${horas} h`;
+  if (horas > 0) return `${horas} h ${mins} min`;
+  return `${mins} min`;
 }
