@@ -16,3 +16,4 @@ pub mod conexion;
 pub mod sync_remoto;
 pub mod exportar;
 pub mod reportes;
+pub mod auditoria_caja;

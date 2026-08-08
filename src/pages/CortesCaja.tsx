@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback } from 'react';
 import { useAuthStore } from '../store/authStore';
+import { invoke, isTauri } from '../lib/invokeCompat';
 import {
   useCortesStore,
   type MovimientoCaja,
@@ -99,7 +100,7 @@ export default function CortesCaja({
     cargarCortes,
   } = useCortesStore();
 
-  const [tab, setTab] = useState<'movimientos' | 'historial'>('movimientos');
+  const [tab, setTab] = useState<'movimientos' | 'historial' | 'auditoria'>('movimientos');
   const [showModalMov, setShowModalMov] = useState(false);
   const [showModalParcial, setShowModalParcial] = useState(false);
   const [showModalDia, setShowModalDia] = useState(false);
@@ -179,7 +180,13 @@ export default function CortesCaja({
         background: 'var(--color-surface)',
         padding: '0 20px',
       }}>
-        {(['movimientos', 'historial'] as const).map(t => (
+        {/* La pestaña de auditoría solo la ve el admin: expone descuadres
+            históricos y detalle de ventas/movimientos, no es información
+            para un vendedor. */}
+        {(esAdmin
+          ? (['movimientos', 'historial', 'auditoria'] as const)
+          : (['movimientos', 'historial'] as const)
+        ).map(t => (
           <button
             key={t}
             onClick={() => setTab(t)}
@@ -192,7 +199,9 @@ export default function CortesCaja({
               transition: 'all 0.1s',
             }}
           >
-            {t === 'movimientos' ? `Movimientos (${movimientosPendientes.length})` : 'Historial'}
+            {t === 'movimientos'
+              ? `Movimientos (${movimientosPendientes.length})`
+              : t === 'historial' ? 'Historial' : '🔍 Auditoría'}
           </button>
         ))}
       </div>
@@ -210,6 +219,8 @@ export default function CortesCaja({
         {tab === 'historial' && (
           <TabHistorial cortes={cortesPrevios} />
         )}
+
+        {tab === 'auditoria' && esAdmin && <TabAuditoria />}
       </div>
 
       {/* ─── Modales ─── */}
@@ -311,6 +322,353 @@ function FilaMovimiento({ m }: { m: MovimientoCaja }) {
         {esEntrada ? '+' : '-'}{fmt(m.monto)}
       </p>
     </div>
+  );
+}
+
+// ─── Tab: Auditoría de caja ───────────────────────────────
+//
+// Diagnóstico de solo lectura. Detecta las fugas conocidas del módulo
+// de cortes y cuantifica cuánto dinero explica cada una. No modifica
+// nada — es para entender antes de corregir.
+
+interface AuditoriaResumen {
+  ventas_sin_corte_count: number;
+  ventas_sin_corte_monto: number;
+  ventas_sin_corte_efectivo: number;
+  movimientos_desalineados_count: number;
+  movimientos_desalineados_monto: number;
+  eslabones_rotos_count: number;
+  eslabones_rotos_monto: number;
+  cortes_inconsistentes_count: number;
+  dias_sin_cierre_count: number;
+  impacto_total_estimado: number;
+}
+interface VentaSinCorte { id: number; folio: string; fecha: string; total: number; metodo_pago: string; }
+interface MovDesalineado {
+  id: number; tipo: string; monto: number; concepto: string; fecha: string;
+  corte_id: number; corte_tipo: string; corte_inicio: string; corte_fin: string;
+}
+interface EslabonFondo {
+  corte_id: number; dia_cerrado: string; fondo_dejado: number;
+  fondo_declarado_siguiente: number | null; fecha_apertura_siguiente: string | null;
+  diferencia: number | null;
+}
+interface CorteInconsistente {
+  id: number; tipo: string; created_at: string; fondo_inicial: number;
+  ventas_efectivo: number; entradas: number; retiros: number;
+  esperado_guardado: number; esperado_recalculado: number; descuadre: number;
+}
+interface DiaSinCierre { dia: string; num_ventas: number; total_ventas: number; total_efectivo: number; }
+interface Auditoria {
+  resumen: AuditoriaResumen;
+  ventas_sin_corte: VentaSinCorte[];
+  movimientos_desalineados: MovDesalineado[];
+  cadena_fondos: EslabonFondo[];
+  cortes_inconsistentes: CorteInconsistente[];
+  dias_sin_cierre: DiaSinCierre[];
+}
+
+function TabAuditoria() {
+  const [data, setData] = useState<Auditoria | null>(null);
+  const [cargando, setCargando] = useState(false);
+  const [error, setError] = useState('');
+  const [dias, setDias] = useState(90);
+  const [expandido, setExpandido] = useState<string | null>(null);
+
+  const correr = async (d: number) => {
+    setCargando(true);
+    setError('');
+    try {
+      const r = await invoke<Auditoria>('auditar_caja', { limiteDias: d });
+      setData(r);
+    } catch (e: any) {
+      setError(e?.message ?? String(e));
+    } finally {
+      setCargando(false);
+    }
+  };
+
+  useEffect(() => { correr(dias); }, []);
+
+  const toggle = (k: string) => setExpandido(prev => (prev === k ? null : k));
+
+  if (cargando && !data) {
+    return <div style={{ padding: 40, textAlign: 'center', color: 'var(--color-text-dim)' }}>
+      Analizando movimientos de caja…
+    </div>;
+  }
+
+  // La auditoría lee la BD local del POS de escritorio (SQLite). El
+  // servidor web todavía no expone este comando, así que ahí mostramos
+  // un mensaje claro en lugar de un error crudo.
+  if (error && !isTauri()) {
+    return <div className="card" style={{ padding: 24, textAlign: 'center' }}>
+      <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 6 }}>
+        Auditoría disponible solo en el POS de escritorio
+      </div>
+      <div style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>
+        Analiza la base de datos local de la caja. Ábrela desde la
+        computadora del punto de venta.
+      </div>
+    </div>;
+  }
+
+  if (error) {
+    return <div className="card" style={{ padding: 20, color: 'var(--color-danger)' }}>
+      Error al auditar: <code style={{ fontSize: 12 }}>{error}</code>
+    </div>;
+  }
+
+  if (!data) return null;
+  const r = data.resumen;
+  const hayProblemas =
+    r.ventas_sin_corte_count > 0 || r.movimientos_desalineados_count > 0 ||
+    r.eslabones_rotos_count > 0 || r.cortes_inconsistentes_count > 0 ||
+    r.dias_sin_cierre_count > 0;
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+      {/* Controles */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+        <span style={{ fontSize: 12, color: 'var(--color-text-muted)', fontWeight: 600 }}>
+          Analizar últimos
+        </span>
+        {[30, 90, 180, 365].map(d => (
+          <button
+            key={d}
+            className={`btn btn-sm ${dias === d ? '' : 'btn-ghost'}`}
+            onClick={() => { setDias(d); correr(d); }}
+            disabled={cargando}
+          >
+            {d} días
+          </button>
+        ))}
+        {cargando && <span style={{ fontSize: 12, color: 'var(--color-text-dim)' }}>Analizando…</span>}
+      </div>
+
+      {/* Veredicto */}
+      <div className="card" style={{
+        padding: 18,
+        background: hayProblemas ? 'rgba(239,68,68,0.08)' : 'rgba(34,197,94,0.08)',
+        border: `1px solid ${hayProblemas ? 'rgba(239,68,68,0.4)' : 'rgba(34,197,94,0.4)'}`,
+      }}>
+        {hayProblemas ? (
+          <>
+            <div style={{ fontSize: 15, fontWeight: 800, color: 'var(--color-danger)', marginBottom: 6 }}>
+              Se detectaron descuadres en el flujo de caja
+            </div>
+            <div style={{ fontSize: 13, marginBottom: 10 }}>
+              Impacto estimado acumulado:{' '}
+              <strong className="mono" style={{ fontSize: 17 }}>
+                {r.impacto_total_estimado >= 0 ? '+' : ''}{fmt(r.impacto_total_estimado)}
+              </strong>
+              <span style={{ color: 'var(--color-text-dim)' }}>
+                {' '}({r.impacto_total_estimado >= 0 ? 'sobrante teórico' : 'faltante teórico'})
+              </span>
+            </div>
+          </>
+        ) : (
+          <div style={{ fontSize: 15, fontWeight: 800, color: 'var(--color-success)' }}>
+            No se detectaron descuadres en este período
+          </div>
+        )}
+      </div>
+
+      {/* Hallazgos */}
+      <SeccionAuditoria
+        clave="dias"
+        titulo="Días con ventas sin cierre de caja"
+        conteo={r.dias_sin_cierre_count}
+        monto={data.dias_sin_cierre.reduce((s, d) => s + d.total_efectivo, 0)}
+        explicacion="Cada día sin cerrar deja sus ventas fuera de toda conciliación. El cierre siguiente arranca después, así que ese dinero nunca se compara contra nada — y el descuadre se arrastra."
+        expandido={expandido === 'dias'}
+        onToggle={() => toggle('dias')}
+      >
+        <TablaAudit
+          columnas={['Día', 'Ventas', 'Total', 'Efectivo']}
+          filas={data.dias_sin_cierre.map(d => [
+            d.dia, String(d.num_ventas), fmt(d.total_ventas), fmt(d.total_efectivo),
+          ])}
+        />
+      </SeccionAuditoria>
+
+      <SeccionAuditoria
+        clave="ventas"
+        titulo="Ventas que no entraron en ningún corte"
+        conteo={r.ventas_sin_corte_count}
+        monto={r.ventas_sin_corte_efectivo}
+        explicacion="Estas ventas ocurrieron fuera del rango de fechas de todos los cortes registrados. El efectivo entró a la caja pero ningún corte lo esperaba."
+        expandido={expandido === 'ventas'}
+        onToggle={() => toggle('ventas')}
+      >
+        <TablaAudit
+          columnas={['Folio', 'Fecha', 'Método', 'Total']}
+          filas={data.ventas_sin_corte.slice(0, 200).map(v => [
+            v.folio, v.fecha.substring(0, 16), v.metodo_pago, fmt(v.total),
+          ])}
+          nota={data.ventas_sin_corte.length > 200
+            ? `Mostrando 200 de ${data.ventas_sin_corte.length}` : undefined}
+        />
+      </SeccionAuditoria>
+
+      <SeccionAuditoria
+        clave="movs"
+        titulo="Movimientos aplicados al corte equivocado"
+        conteo={r.movimientos_desalineados_count}
+        monto={r.movimientos_desalineados_monto}
+        explicacion="La fecha del movimiento cae fuera del período del corte al que quedó asignado. Pasa porque la asignación barre todos los movimientos huérfanos sin importar cuándo ocurrieron: un retiro viejo se resta del corte de hoy (falta dinero), una entrada vieja se suma (sobra)."
+        expandido={expandido === 'movs'}
+        onToggle={() => toggle('movs')}
+      >
+        <TablaAudit
+          columnas={['Tipo', 'Monto', 'Concepto', 'Fecha mov.', 'Corte', 'Período del corte']}
+          filas={data.movimientos_desalineados.slice(0, 200).map(m => [
+            m.tipo, fmt(m.monto), m.concepto, m.fecha.substring(0, 16),
+            `#${m.corte_id} ${m.corte_tipo}`,
+            `${m.corte_inicio.substring(5, 16)} → ${m.corte_fin.substring(5, 16)}`,
+          ])}
+          nota={data.movimientos_desalineados.length > 200
+            ? `Mostrando 200 de ${data.movimientos_desalineados.length}` : undefined}
+        />
+      </SeccionAuditoria>
+
+      <SeccionAuditoria
+        clave="fondos"
+        titulo="Saltos entre el cierre y la apertura siguiente"
+        conteo={r.eslabones_rotos_count}
+        monto={r.eslabones_rotos_monto}
+        explicacion="El monto que declaró el cierre como fondo para el día siguiente no coincide con el que se declaró al abrir. Hoy el sistema acepta cualquier cifra en la apertura sin compararla contra el cierre anterior."
+        expandido={expandido === 'fondos'}
+        onToggle={() => toggle('fondos')}
+      >
+        <TablaAudit
+          columnas={['Día cerrado', 'Dejó en caja', 'Apertura siguiente', 'Declaró', 'Diferencia']}
+          filas={data.cadena_fondos.map(e => [
+            e.dia_cerrado,
+            fmt(e.fondo_dejado),
+            e.fecha_apertura_siguiente?.substring(0, 10) ?? '— sin apertura —',
+            e.fondo_declarado_siguiente !== null ? fmt(e.fondo_declarado_siguiente) : '—',
+            e.diferencia !== null
+              ? `${e.diferencia >= 0 ? '+' : ''}${fmt(e.diferencia)}`
+              : '—',
+          ])}
+        />
+      </SeccionAuditoria>
+
+      <SeccionAuditoria
+        clave="inconsistentes"
+        titulo="Cortes con aritmética inconsistente"
+        conteo={r.cortes_inconsistentes_count}
+        monto={data.cortes_inconsistentes.reduce((s, c) => s + c.descuadre, 0)}
+        explicacion="En estos cortes, (fondo inicial + ventas efectivo + entradas − retiros) no da el efectivo esperado que quedó guardado. Señal de que los totales se calcularon en momentos distintos: hubo ventas o movimientos entre abrir el corte y confirmarlo."
+        expandido={expandido === 'inconsistentes'}
+        onToggle={() => toggle('inconsistentes')}
+      >
+        <TablaAudit
+          columnas={['Corte', 'Fecha', 'Guardado', 'Recalculado', 'Descuadre']}
+          filas={data.cortes_inconsistentes.map(c => [
+            `#${c.id} ${c.tipo}`,
+            c.created_at.substring(0, 16),
+            fmt(c.esperado_guardado),
+            fmt(c.esperado_recalculado),
+            `${c.descuadre >= 0 ? '+' : ''}${fmt(c.descuadre)}`,
+          ])}
+        />
+      </SeccionAuditoria>
+    </div>
+  );
+}
+
+function SeccionAuditoria({
+  titulo, conteo, monto, explicacion, expandido, onToggle, children,
+}: {
+  clave: string;
+  titulo: string;
+  conteo: number;
+  monto: number;
+  explicacion: string;
+  expandido: boolean;
+  onToggle: () => void;
+  children: React.ReactNode;
+}) {
+  const limpio = conteo === 0;
+  return (
+    <div className="card" style={{ padding: 0, overflow: 'hidden', opacity: limpio ? 0.6 : 1 }}>
+      <div
+        onClick={limpio ? undefined : onToggle}
+        style={{
+          padding: '14px 16px', cursor: limpio ? 'default' : 'pointer',
+          display: 'flex', alignItems: 'center', gap: 12,
+          background: expandido ? 'var(--color-surface-2)' : 'transparent',
+        }}
+      >
+        <span style={{ fontSize: 18 }}>{limpio ? '✅' : '⚠️'}</span>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontSize: 14, fontWeight: 700 }}>{titulo}</div>
+          <div style={{ fontSize: 11, color: 'var(--color-text-dim)', marginTop: 2, lineHeight: 1.45 }}>
+            {explicacion}
+          </div>
+        </div>
+        <div style={{ textAlign: 'right', flexShrink: 0 }}>
+          <div className="mono" style={{
+            fontSize: 16, fontWeight: 800,
+            color: limpio ? 'var(--color-success)' : 'var(--color-danger)',
+          }}>
+            {conteo}
+          </div>
+          {!limpio && Math.abs(monto) > 0.005 && (
+            <div className="mono" style={{ fontSize: 11, color: 'var(--color-text-muted)' }}>
+              {monto >= 0 ? '+' : ''}{fmt(monto)}
+            </div>
+          )}
+        </div>
+        {!limpio && (expandido ? <ChevronUp size={16} /> : <ChevronDown size={16} />)}
+      </div>
+      {expandido && !limpio && (
+        <div style={{ padding: '0 16px 16px', maxHeight: 340, overflow: 'auto' }}>
+          {children}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TablaAudit({ columnas, filas, nota }: {
+  columnas: string[];
+  filas: string[][];
+  nota?: string;
+}) {
+  return (
+    <>
+      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+        <thead style={{ position: 'sticky', top: 0, background: 'var(--color-surface)' }}>
+          <tr>
+            {columnas.map(c => (
+              <th key={c} style={{
+                textAlign: 'left', padding: '6px 8px', fontSize: 10,
+                textTransform: 'uppercase', color: 'var(--color-text-muted)',
+                borderBottom: '1px solid var(--color-border)', whiteSpace: 'nowrap',
+              }}>{c}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {filas.map((f, i) => (
+            <tr key={i} style={{ borderBottom: '1px solid var(--color-border)' }}>
+              {f.map((celda, j) => (
+                <td key={j} className={j > 0 ? 'mono' : undefined}
+                  style={{ padding: '6px 8px', whiteSpace: 'nowrap' }}>
+                  {celda}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {nota && (
+        <p style={{ fontSize: 11, color: 'var(--color-text-dim)', marginTop: 8 }}>{nota}</p>
+      )}
+    </>
   );
 }
 

@@ -12,11 +12,12 @@ import QRCode from 'qrcode';
 import { printHTMLDialogOverlay, escapeHTML } from '../utils/print';
 import type { Producto } from '../store/productStore';
 
-// Defaults usados en Etiquetas.tsx — los exponemos para que la UI que
-// quiera invocar la impresora sin pedir tamaño al usuario use los mismos
-// (rollo común mexicano de etiquetas térmicas).
-export const ETIQUETA_ANCHO_DEFAULT_MM = 39;
-export const ETIQUETA_ALTO_DEFAULT_MM = 30;
+// Defaults del rollo que usa el negocio (35x24 mm). El usuario puede
+// cambiarlos en la página de Etiquetas vía sus inputs, pero para flujos
+// rápidos (modal "imprimir tras crear producto") usamos estos sin
+// preguntar.
+export const ETIQUETA_ANCHO_DEFAULT_MM = 35;
+export const ETIQUETA_ALTO_DEFAULT_MM = 24;
 
 const QR_OPTS: QRCode.QRCodeToDataURLOptions = {
   errorCorrectionLevel: 'M',

@@ -67,6 +67,7 @@ use commands::reportes::{
     obtener_top_productos, obtener_ventas_por_vendedor,
     obtener_ventas_por_metodo, obtener_ventas_por_dia,
 };
+use commands::auditoria_caja::auditar_caja;
 use db::connection::init_database;
 use std::sync::{Arc, Mutex};
 use tauri::Manager;
@@ -276,6 +277,8 @@ pub fn run() {
             obtener_ventas_por_vendedor,
             obtener_ventas_por_metodo,
             obtener_ventas_por_dia,
+            // Auditoría de caja (solo lectura)
+            auditar_caja,
         ])
         .run(tauri::generate_context!())
         .expect("Error al iniciar el POS");
