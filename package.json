@@ -7,7 +7,9 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "limpiar": "rm -rf src-tauri/target server-remoto/target && echo 'Cache de compilacion borrado. La proxima compilacion tardara mas de lo normal.'",
+    "peso": "du -sh . && du -sh src-tauri/target server-remoto/target node_modules 2>/dev/null"
   },
   "dependencies": {
     "@fontsource/inter": "^5.2.8",
