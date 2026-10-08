@@ -2,6 +2,7 @@
 
 import { create } from 'zustand';
 import { invoke, setAuthToken, isTauri, getOrCreateDeviceUuid } from '../lib/invokeCompat';
+import { useCortesStore, infoCajaDeRespuesta } from './cortesStore';
 
 // En modo web, persistimos el objeto `usuario` en localStorage junto con el
 // JWT, para que recargar la página no expulse al usuario. En Tauri la sesión
@@ -120,11 +121,16 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       const result = await invoke<{
         ok: boolean; usuario?: UsuarioSesion; error?: string; token?: string;
         modo_caja?: 'espejo' | 'individual'; modo_configurado?: boolean;
+        caja?: string; cortes_en_este_equipo?: boolean; escritorio_recibe_web?: boolean;
       }>('login_pin', { pin, deviceUuid });
       if (result.ok && result.usuario) {
         if (result.token) setAuthToken(result.token);
         if (result.modo_caja !== undefined) {
           guardarModoCaja(result.modo_caja, result.modo_configurado ?? true);
+          // Web: a qué caja pertenece este equipo (espejo → la de la tienda,
+          // individual → la caja web) desde la primera pantalla.
+          const info = infoCajaDeRespuesta(result);
+          if (!isTauri() && info) useCortesStore.getState().setInfoCaja(info);
         }
         guardarUsuarioPersistido(result.usuario);
         set({ usuario: result.usuario, cargando: false, error: null });
@@ -146,11 +152,16 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       const result = await invoke<{
         ok: boolean; usuario?: UsuarioSesion; error?: string; token?: string;
         modo_caja?: 'espejo' | 'individual'; modo_configurado?: boolean;
+        caja?: string; cortes_en_este_equipo?: boolean; escritorio_recibe_web?: boolean;
       }>('login_password', { nombreUsuario: nombre_usuario, password, deviceUuid });
       if (result.ok && result.usuario) {
         if (result.token) setAuthToken(result.token);
         if (result.modo_caja !== undefined) {
           guardarModoCaja(result.modo_caja, result.modo_configurado ?? true);
+          // Web: a qué caja pertenece este equipo (espejo → la de la tienda,
+          // individual → la caja web) desde la primera pantalla.
+          const info = infoCajaDeRespuesta(result);
+          if (!isTauri() && info) useCortesStore.getState().setInfoCaja(info);
         }
         guardarUsuarioPersistido(result.usuario);
         set({ usuario: result.usuario, cargando: false, error: null });

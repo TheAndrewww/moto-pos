@@ -3,7 +3,8 @@
 use serde::{Deserialize, Serialize};
 use tauri::State;
 use crate::commands::auth::AppState;
-use crate::sync::{state as sstate, outbox, client::RemoteClient};
+use crate::sync::{state as sstate, outbox, inbox, tareas, worker, client::RemoteClient};
+use crate::sync::state::TareasSync;
 
 #[derive(Debug, Serialize)]
 pub struct EstadoSync {
@@ -14,6 +15,11 @@ pub struct EstadoSync {
     pub last_push_at: Option<String>,
     pub last_pull_at: Option<String>,
     pub pendientes: i64,
+    /// Cambios recibidos del servidor que esperan en la bandeja (sync_inbox).
+    pub recibidos_pendientes: i64,
+    /// Tareas únicas del sync v2 (mapa de ids, reparación, re-descarga).
+    pub tareas: TareasSync,
+    pub replay_pendiente: bool,
 }
 
 #[tauri::command]
@@ -22,6 +28,8 @@ pub fn obtener_estado_sync(state: State<AppState>) -> Result<EstadoSync, String>
     let cfg = sstate::leer(&conn).map_err(|e| e.to_string())?
         .ok_or_else(|| "sync_state no existe".to_string())?;
     let pendientes = outbox::contar_pendientes(&conn).map_err(|e| e.to_string())?;
+    let recibidos_pendientes = inbox::contar(&conn).unwrap_or(0);
+    let tareas = sstate::leer_tareas(&conn).unwrap_or_default();
     Ok(EstadoSync {
         activo: cfg.activo,
         remote_url: cfg.remote_url,
@@ -30,6 +38,9 @@ pub fn obtener_estado_sync(state: State<AppState>) -> Result<EstadoSync, String>
         last_push_at: cfg.last_push_at,
         last_pull_at: cfg.last_pull_at,
         pendientes,
+        recibidos_pendientes,
+        replay_pendiente: tareas.replay_pendiente(),
+        tareas,
     })
 }
 
@@ -174,9 +185,10 @@ pub fn backfill_outbox(state: State<AppState>) -> Result<i64, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
 
     // Mismas tablas que tienen triggers de outbox (ver migrations.rs::migracion_005_triggers_outbox)
+    // (stock_sucursal salió del sync en v2: nadie la lee.)
     let tablas: &[&str] = &[
         "productos", "proveedores", "clientes", "usuarios", "categorias",
-        "sucursales", "stock_sucursal",
+        "sucursales",
         "ventas", "presupuestos", "ordenes_pedido", "recepciones",
         "cortes", "devoluciones", "transferencias",
         "movimientos_caja", "aperturas_caja",
@@ -215,7 +227,9 @@ pub fn backfill_outbox(state: State<AppState>) -> Result<i64, String> {
 
 /// Fuerza un ciclo de sync (push + pull) inmediatamente, sin esperar al
 /// intervalo de 30s del worker. Útil cuando la cola está atorada o cuando
-/// el usuario quiere ver datos en el servidor de inmediato.
+/// el usuario quiere ver datos en el servidor de inmediato. Nunca corre junto
+/// con el ciclo periódico: espera a que termine el que está en curso (hasta
+/// 30 s) o devuelve "Ya hay una sincronización en curso…".
 #[tauri::command]
 pub async fn forzar_sync_ahora(state: State<'_, AppState>) -> Result<(), String> {
     let db = state.db.clone();
@@ -225,13 +239,15 @@ pub async fn forzar_sync_ahora(state: State<'_, AppState>) -> Result<(), String>
 /// Devuelve hasta `limite` filas del outbox que han fallado al sincronizar
 /// (intentos > 0). Ordenadas por intentos DESC para mostrar primero las
 /// más problemáticas. La UI puede mostrar `ultimo_error` para diagnóstico.
+/// Después vienen los cambios recibidos que esperan en la bandeja de
+/// entrada (`fuente = 'inbox'`, sin payload).
 #[tauri::command]
 pub fn listar_errores_outbox(
     limite: Option<i64>,
     state: State<AppState>,
 ) -> Result<Vec<crate::sync::outbox::OutboxErrorFila>, String> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
-    crate::sync::outbox::errores(&conn, limite.unwrap_or(50))
+    crate::sync::outbox::errores_con_bandeja(&conn, limite.unwrap_or(50))
         .map_err(|e| e.to_string())
 }
 
@@ -262,4 +278,125 @@ pub fn descartar_filas_outbox(
         .map_err(|e| e.to_string())?;
     log::info!("descartar_filas_outbox: {} filas descartadas", n);
     Ok(n as i64)
+}
+
+// ─── Sync v2: reparación de referencias y diagnóstico ─────
+
+fn cliente_y_device(state: &State<'_, AppState>) -> Result<(RemoteClient, String), String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let cfg = sstate::leer(&conn).map_err(|e| e.to_string())?
+        .ok_or("sync_state no existe")?;
+    let (Some(url), Some(token)) = (cfg.remote_url, cfg.remote_token) else {
+        return Err("La sincronización no está configurada.".to_string());
+    };
+    Ok((RemoteClient::new(&url, &token)?, cfg.device_uuid))
+}
+
+/// Sube al servidor el mapa id local → uuid de las tablas con referencias
+/// (en tandas de 5000). El servidor lo usa para traducir los ids de este
+/// equipo. Se puede repetir sin problema.
+#[tauri::command]
+pub async fn subir_mapa_ids(state: State<'_, AppState>) -> Result<tareas::ReporteMapa, String> {
+    let (client, device) = cliente_y_device(&state)?;
+    let db = state.db.clone();
+    // Nunca junto con un ciclo de sync (que también corre las tareas únicas).
+    let _turno = worker::tomar_turno(worker::ESPERA_TURNO).await?;
+    tareas::subir_mapa_ids(&db, &client, &device).await.map_err(|e| e.mensaje())
+}
+
+/// Repara las referencias (usuario, producto, venta…) entre este equipo y el
+/// servidor: sube el mapa de ids, pide al servidor que corrija las filas de
+/// este equipo y corrige aquí las FK de las filas que se hicieron en la web
+/// (solo columnas de referencia; nunca montos ni cortes). Devuelve el
+/// reporte. Después el worker re-descarga las filas web faltantes.
+#[tauri::command]
+pub async fn reparar_referencias(state: State<'_, AppState>) -> Result<tareas::ReporteReparacion, String> {
+    let (client, device) = cliente_y_device(&state)?;
+    let db = state.db.clone();
+    // Nunca junto con un ciclo de sync (que también puede estar reparando).
+    let _turno = worker::tomar_turno(worker::ESPERA_TURNO).await?;
+    tareas::reparar_referencias(&db, &client, &device, true).await.map_err(|e| e.mensaje())
+}
+
+#[derive(Debug, Serialize)]
+pub struct TablaDiagnostico {
+    pub tabla: String,
+    /// "nombre TIPO [NOT NULL] [DEFAULT x]" por columna; vacío si la tabla no existe.
+    pub columnas: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DiagnosticoSync {
+    pub version_bd: i64,
+    /// Filas en sync_suppress_flag (debe ser 0 fuera de un apply).
+    pub bandera_supresion: i64,
+    pub outbox_pendientes: i64,
+    pub outbox_con_error: i64,
+    pub errores_outbox: Vec<outbox::OutboxErrorFila>,
+    pub bandeja: Vec<inbox::ConteoMotivo>,
+    pub tareas: TareasSync,
+    pub tablas: Vec<TablaDiagnostico>,
+}
+
+/// Diagnóstico del sync: esquema local de las tablas sincronizadas, errores
+/// del outbox, conteo de la bandeja de entrada y estado de la bandera de
+/// supresión de triggers. Solo lectura.
+#[tauri::command]
+pub fn diagnostico_sync(state: State<AppState>) -> Result<DiagnosticoSync, String> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    diagnostico(&conn).map_err(|e| e.to_string())
+}
+
+pub(crate) fn diagnostico(conn: &rusqlite::Connection) -> rusqlite::Result<DiagnosticoSync> {
+    let version_bd: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    let bandera_supresion: i64 = conn
+        .query_row("SELECT COUNT(*) FROM sync_suppress_flag", [], |r| r.get(0))
+        .unwrap_or(-1);
+    let outbox_pendientes = outbox::contar_pendientes(conn)?;
+    let outbox_con_error: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sync_outbox WHERE synced_at IS NULL AND intentos > 0",
+        [],
+        |r| r.get(0),
+    )?;
+    let errores_outbox = outbox::errores(conn, 20)?;
+    let bandeja = inbox::contar_por_motivo(conn).unwrap_or_default();
+    let tareas = sstate::leer_tareas(conn).unwrap_or_default();
+
+    let mut nombres: Vec<&str> = crate::sync::fk::FK_MAP.iter().map(|(t, _)| *t).collect();
+    for (_, hijos) in crate::sync::fk::AGGREGATES {
+        for (h, _) in *hijos {
+            if !nombres.contains(h) {
+                nombres.push(h);
+            }
+        }
+    }
+    nombres.extend(["sync_outbox", "sync_inbox", "sync_state"]);
+    let mut tablas = Vec::with_capacity(nombres.len());
+    for t in nombres {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({t})"))?;
+        let columnas: Vec<String> = stmt
+            .query_map([], |r| {
+                let nombre: String = r.get(1)?;
+                let tipo: Option<String> = r.get(2)?;
+                let notnull: i64 = r.get(3)?;
+                let dflt: Option<String> = r.get(4)?;
+                let mut s = format!("{} {}", nombre, tipo.unwrap_or_default());
+                if notnull != 0 { s.push_str(" NOT NULL"); }
+                if let Some(d) = dflt { s.push_str(&format!(" DEFAULT {d}")); }
+                Ok(s.trim().to_string())
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        tablas.push(TablaDiagnostico { tabla: t.to_string(), columnas });
+    }
+
+    Ok(DiagnosticoSync {
+        version_bd,
+        bandera_supresion,
+        outbox_pendientes,
+        outbox_con_error,
+        errores_outbox,
+        bandeja,
+        tareas,
+        tablas,
+    })
 }

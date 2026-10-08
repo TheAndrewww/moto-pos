@@ -15,6 +15,10 @@ export interface VentaResumen {
   anulada: boolean;
   fecha: string;
   num_productos: number;
+  /** 'principal' (cajón de la tienda) | 'web' (caja aparte de la web). */
+  caja?: string;
+  /** Quién creó la venta: 'desktop' | 'web'. */
+  origen?: string;
 }
 
 export interface VentaDetalleItem {
@@ -49,6 +53,8 @@ export interface VentaDetalleCompleto {
   fecha: string;
   items: VentaDetalleItem[];
   total_devuelto: number;
+  caja?: string;
+  origen?: string;
 }
 
 export interface FiltrosBusqueda {

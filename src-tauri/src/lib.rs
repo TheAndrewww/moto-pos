@@ -44,6 +44,7 @@ use commands::cortes::{
     listar_cortes, obtener_detalle_corte,
     verificar_corte_dia_pendiente, obtener_inicio_proximo_cierre,
     crear_apertura_caja, obtener_apertura_hoy, obtener_fondo_sugerido,
+    obtener_esperado_apertura,
 };
 use commands::respaldos::{
     crear_respaldo, listar_respaldos, restaurar_respaldo,
@@ -61,6 +62,7 @@ use commands::sync_remoto::{
     backfill_outbox,
     forzar_sync_ahora, listar_errores_outbox, reintentar_errores_outbox,
     descartar_filas_outbox, verificar_hora_sistema,
+    subir_mapa_ids, reparar_referencias, diagnostico_sync,
 };
 use commands::exportar::escribir_archivo;
 use commands::reportes::{
@@ -238,6 +240,7 @@ pub fn run() {
             obtener_detalle_corte,
             verificar_corte_dia_pendiente,
             obtener_inicio_proximo_cierre,
+            obtener_esperado_apertura,
             // Apertura de caja
             crear_apertura_caja,
             obtener_apertura_hoy,
@@ -272,6 +275,9 @@ pub fn run() {
             reintentar_errores_outbox,
             descartar_filas_outbox,
             verificar_hora_sistema,
+            subir_mapa_ids,
+            reparar_referencias,
+            diagnostico_sync,
             // Reportes (agregaciones)
             obtener_top_productos,
             obtener_ventas_por_vendedor,

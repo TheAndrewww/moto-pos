@@ -50,25 +50,32 @@ pub fn pendientes(conn: &Connection, limite: i64) -> SqlResult<Vec<CambioPendien
     rows.collect()
 }
 
-/// Marca un lote como sincronizado exitosamente.
-pub fn marcar_sincronizados(conn: &Connection, ids: &[i64]) -> SqlResult<usize> {
-    if ids.is_empty() { return Ok(0); }
-    let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-    let sql = format!(
-        "UPDATE sync_outbox SET synced_at = datetime('now') WHERE id IN ({})",
-        placeholders
-    );
-    let params: Vec<&dyn rusqlite::ToSql> = ids.iter().map(|i| i as &dyn rusqlite::ToSql).collect();
-    conn.execute(&sql, rusqlite::params_from_iter(params.iter()))
+/// Marca UNA entrada como sincronizada solo si no cambió desde que se leyó
+/// para el push (`created_at` igual). Si la fila se volvió a modificar
+/// durante la llamada HTTP, el trigger movió `created_at` y el renglón sigue
+/// pendiente (el cambio nuevo se sube en el siguiente ciclo). Devuelve true
+/// si la marcó.
+pub fn marcar_sincronizado_si(conn: &Connection, id: i64, created_at: &str) -> SqlResult<bool> {
+    let n = conn.execute(
+        "UPDATE sync_outbox SET synced_at = datetime('now') \
+          WHERE id = ? AND created_at = ? AND synced_at IS NULL",
+        rusqlite::params![id, created_at],
+    )?;
+    Ok(n > 0)
 }
 
-/// Marca una entrada con error, incrementa intentos. Se reintenta en el siguiente ciclo.
-pub fn marcar_error(conn: &Connection, id: i64, error: &str) -> SqlResult<()> {
-    conn.execute(
-        "UPDATE sync_outbox SET intentos = intentos + 1, ultimo_error = ? WHERE id = ?",
-        rusqlite::params![error, id],
+/// Marca una entrada con error e incrementa intentos (se reintenta en el
+/// siguiente ciclo), solo si el renglón no cambió desde que se leyó: un
+/// cambio nuevo durante la llamada no hereda el error del anterior (con
+/// 'remoto_mas_nuevo' heredado, la guardia del pull lo dejaría pisar).
+/// Devuelve true si lo marcó.
+pub fn marcar_error_si(conn: &Connection, id: i64, created_at: &str, error: &str) -> SqlResult<bool> {
+    let n = conn.execute(
+        "UPDATE sync_outbox SET intentos = intentos + 1, ultimo_error = ? \
+          WHERE id = ? AND created_at = ? AND synced_at IS NULL",
+        rusqlite::params![error, id, created_at],
     )?;
-    Ok(())
+    Ok(n > 0)
 }
 
 /// Limpia entradas sincronizadas de más de N días.
@@ -101,7 +108,16 @@ pub struct OutboxErrorFila {
     pub intentos: i64,
     pub ultimo_error: Option<String>,
     pub created_at: String,
+    /// 'outbox' (cambio local que no sube) | 'inbox' (cambio recibido que
+    /// no se pudo aplicar). Los ids de cada fuente son independientes.
+    #[serde(default = "fuente_outbox")]
+    pub fuente: String,
+    /// Solo inbox: 'error' | 'pendiente_local' | 'sin_fk'.
+    #[serde(default)]
+    pub motivo: Option<String>,
 }
+
+fn fuente_outbox() -> String { "outbox".to_string() }
 
 /// Lee las filas pendientes que han fallado al menos una vez (intentos > 0
 /// y ultimo_error IS NOT NULL). Ordenadas por intentos DESC para mostrar
@@ -123,9 +139,32 @@ pub fn errores(conn: &Connection, limite: i64) -> SqlResult<Vec<OutboxErrorFila>
             intentos: r.get(4)?,
             ultimo_error: r.get(5)?,
             created_at: r.get(6)?,
+            fuente: fuente_outbox(),
+            motivo: None,
         })
     })?;
     rows.collect()
+}
+
+/// Errores del outbox seguidos de los cambios recibidos que esperan en la
+/// bandeja de entrada (sync_inbox, sin payload). Lo usa la página de
+/// Sincronización.
+pub fn errores_con_bandeja(conn: &Connection, limite: i64) -> SqlResult<Vec<OutboxErrorFila>> {
+    let mut lista = errores(conn, limite)?;
+    for f in super::inbox::listar(conn, limite)? {
+        lista.push(OutboxErrorFila {
+            id: f.id,
+            tabla: f.tabla,
+            uuid: f.uuid,
+            operacion: "RECIBIR".to_string(),
+            intentos: f.intentos,
+            ultimo_error: f.error,
+            created_at: f.created_at,
+            fuente: "inbox".to_string(),
+            motivo: Some(f.motivo),
+        });
+    }
+    Ok(lista)
 }
 
 /// Resetea intentos y borra ultimo_error de TODAS las filas pendientes

@@ -1,6 +1,6 @@
 // pages/CortesCaja.tsx — Módulo de Cortes de Caja
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { useAuthStore } from '../store/authStore';
 import { invoke, isTauri } from '../lib/invokeCompat';
 import {
@@ -10,6 +10,8 @@ import {
   type DenominacionInput,
   type CorteResumen,
   type CorteDetalle,
+  type EsperadoApertura,
+  ERR_DATOS_CAMBIARON,
 } from '../store/cortesStore';
 import {
   DollarSign, ArrowDownLeft, ArrowUpRight, Clock,
@@ -20,6 +22,9 @@ import {
 // ─── Utilidades ───────────────────────────────────────────
 
 const fmt = (n: number) => `$${n.toFixed(2)}`;
+
+/** Redondea a centavos (evita diferencias fantasma por sumas de flotantes). */
+const round2 = (n: number) => Math.round(n * 100) / 100;
 
 function fechaHoyInicio() {
   const d = new Date();
@@ -38,14 +43,6 @@ function ahora() {
   const mi = String(d.getMinutes()).padStart(2, '0');
   const s = String(d.getSeconds()).padStart(2, '0');
   return `${y}-${mo}-${day} ${h}:${mi}:${s}`;
-}
-
-function fechaHoyFin() {
-  const d = new Date();
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
-  return `${y}-${m}-${day} 23:59:59`;
 }
 
 function fmtHora(fecha: string) {
@@ -83,6 +80,9 @@ interface Props {
   triggerDia?: number;
   fechaObjetivoDia?: string | null; // YYYY-MM-DD — si está set, el corte DIA cubre ese día
   onCorteDiaHecho?: () => void;
+  /** El Dashboard mantiene este módulo montado (oculto con display:none);
+   *  avisa cuándo está a la vista para refrescar lo que cambia afuera. */
+  visible?: boolean;
 }
 
 export default function CortesCaja({
@@ -91,6 +91,7 @@ export default function CortesCaja({
   triggerDia = 0,
   fechaObjetivoDia = null,
   onCorteDiaHecho,
+  visible = true,
 }: Props) {
   const { usuario } = useAuthStore();
   const {
@@ -98,41 +99,61 @@ export default function CortesCaja({
     cortesPrevios,
     cargarMovimientosPendientes,
     cargarCortes,
+    infoCaja,
+    cargarInfoCaja,
   } = useCortesStore();
 
   const [tab, setTab] = useState<'movimientos' | 'historial' | 'auditoria'>('movimientos');
   const [showModalMov, setShowModalMov] = useState(false);
   const [showModalParcial, setShowModalParcial] = useState(false);
   const [showModalDia, setShowModalDia] = useState(false);
+  // Contador para volver a pedir la vista previa de la caja de la tienda
+  // (web espejo): al volver a esta pantalla y después de recargar().
+  const [refrescoAviso, setRefrescoAviso] = useState(0);
 
   const esAdmin = usuario?.es_admin ?? false;
+
+  // ¿Se hacen cortes en este equipo? Siempre en escritorio. En la web solo con
+  // caja propia (modo individual): la caja de la tienda la corta el escritorio.
+  const cortesAqui = isTauri() || (infoCaja?.cortes_en_este_equipo ?? false);
 
   useEffect(() => {
     cargarMovimientosPendientes();
     cargarCortes(50);
+    if (!isTauri()) cargarInfoCaja();
   }, []);
 
   // Triggers desde el contenedor padre
   useEffect(() => { if (triggerMovimiento > 0) setShowModalMov(true); }, [triggerMovimiento]);
-  useEffect(() => { if (triggerParcial > 0) setShowModalParcial(true); }, [triggerParcial]);
-  useEffect(() => { if (triggerDia > 0 && esAdmin) setShowModalDia(true); }, [triggerDia, esAdmin]);
+  useEffect(() => { if (triggerParcial > 0 && cortesAqui) setShowModalParcial(true); }, [triggerParcial]);
+  useEffect(() => { if (triggerDia > 0 && esAdmin && cortesAqui) setShowModalDia(true); }, [triggerDia, esAdmin]);
 
   // Triggers locales (atajos de teclado dentro de la vista misma)
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (showModalMov || showModalParcial || showModalDia) return;
       if (e.key === 'F6') { e.preventDefault(); setShowModalMov(true); }
-      if (e.key === 'F11') { e.preventDefault(); setShowModalParcial(true); }
-      if (e.key === 'F12' && esAdmin) { e.preventDefault(); setShowModalDia(true); }
+      if (e.key === 'F11' && cortesAqui) { e.preventDefault(); setShowModalParcial(true); }
+      if (e.key === 'F12' && esAdmin && cortesAqui) { e.preventDefault(); setShowModalDia(true); }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [showModalMov, showModalParcial, showModalDia, esAdmin]);
+  }, [showModalMov, showModalParcial, showModalDia, esAdmin, cortesAqui]);
 
   const recargar = useCallback(async () => {
+    setRefrescoAviso(n => n + 1);
     await cargarMovimientosPendientes();
     await cargarCortes(50);
   }, []);
+
+  // El módulo vive montado aunque esté oculto: al volver a mostrarse, el
+  // aviso de la caja de la tienda se recalcula (ventas web, entradas/retiros
+  // o un corte del escritorio pudieron cambiarlo mientras tanto).
+  const visibleAntes = useRef(visible);
+  useEffect(() => {
+    if (visible && !visibleAntes.current) setRefrescoAviso(n => n + 1);
+    visibleAntes.current = visible;
+  }, [visible]);
 
   return (
     <div className="animate-fade-in" style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
@@ -154,14 +175,16 @@ export default function CortesCaja({
         >
           <ArrowDownLeft size={14} /> Movimiento <span style={{ opacity: 0.5, fontSize: 10 }}>F6</span>
         </button>
-        <button
-          className="btn btn-primary btn-sm"
-          onClick={() => setShowModalParcial(true)}
-          title="F11"
-        >
-          <FileText size={14} /> Corte de Turno <span style={{ opacity: 0.5, fontSize: 10 }}>F11</span>
-        </button>
-        {esAdmin && (
+        {cortesAqui && (
+          <button
+            className="btn btn-primary btn-sm"
+            onClick={() => setShowModalParcial(true)}
+            title="F11"
+          >
+            <FileText size={14} /> Corte de Turno <span style={{ opacity: 0.5, fontSize: 10 }}>F11</span>
+          </button>
+        )}
+        {cortesAqui && esAdmin && (
           <button
             className="btn btn-primary btn-sm"
             style={{ background: 'var(--color-danger)', borderColor: 'var(--color-danger)' }}
@@ -172,6 +195,12 @@ export default function CortesCaja({
           </button>
         )}
       </div>
+
+      {/* Web en modo espejo: esta pantalla muestra la caja de la tienda, que
+          se corta y se abre en el POS de escritorio. */}
+      {!isTauri() && infoCaja && !infoCaja.cortes_en_este_equipo && (
+        <AvisoCajaDeLaTienda escritorioRecibeWeb={infoCaja.escritorio_recibe_web} refresco={refrescoAviso} />
+      )}
 
       {/* ─── Tabs ─── */}
       <div style={{
@@ -220,7 +249,7 @@ export default function CortesCaja({
           <TabHistorial cortes={cortesPrevios} />
         )}
 
-        {tab === 'auditoria' && esAdmin && <TabAuditoria />}
+        {tab === 'auditoria' && esAdmin && <TabAuditoria cajaWeb={infoCaja?.caja === 'web'} />}
       </div>
 
       {/* ─── Modales ─── */}
@@ -242,6 +271,55 @@ export default function CortesCaja({
           onSuccess={async () => { await recargar(); onCorteDiaHecho?.(); }}
           fechaObjetivo={fechaObjetivoDia}
         />
+      )}
+    </div>
+  );
+}
+
+// ─── Aviso: caja de la tienda vista desde la web ──────────
+//
+// Un equipo web en modo espejo vende y registra entradas/retiros con el dinero
+// del cajón de la tienda, pero los cortes y la apertura de esa caja los hace
+// SOLO el POS de escritorio (un solo escritor para su cadena). Aquí se muestra
+// la vista previa con lo que ya se sincronizó.
+
+function AvisoCajaDeLaTienda({ escritorioRecibeWeb, refresco }: { escritorioRecibeWeb: boolean; refresco: number }) {
+  const { calcularDatosCorte } = useCortesStore();
+  const [datos, setDatos] = useState<DatosCorte | null>(null);
+
+  // Se recalcula con cada `refresco` (ahora() y el inicio del período cambian).
+  // `vivo` descarta respuestas que llegan fuera de orden: solo cuenta la de la
+  // última petición.
+  useEffect(() => {
+    let vivo = true;
+    calcularDatosCorte(fechaHoyInicio(), ahora())
+      .then(d => { if (vivo) setDatos(d); })
+      .catch(() => { if (vivo) setDatos(null); });
+    return () => { vivo = false; };
+  }, [refresco]);
+
+  return (
+    <div style={{
+      padding: '10px 20px', borderBottom: '1px solid var(--color-border)',
+      background: 'rgba(59,130,246,0.08)', fontSize: 12, lineHeight: 1.5,
+      display: 'flex', flexDirection: 'column', gap: 4,
+    }}>
+      <div style={{ fontWeight: 700, color: 'var(--color-text)' }}>
+        Los cortes de la caja de la tienda se hacen en el POS de escritorio.
+      </div>
+      <div style={{ color: 'var(--color-text-muted)' }}>
+        Las ventas, entradas y retiros que registres en este equipo entran a esa caja y se cuentan
+        en el próximo corte del escritorio.
+        {datos && (
+          <> Según lo sincronizado, desde el último corte ({fmtFecha(datos.fecha_inicio)} {fmtHora(datos.fecha_inicio)})
+            debería haber <strong className="mono">{fmt(datos.efectivo_esperado)}</strong> en el cajón.</>
+        )}
+      </div>
+      {!escritorioRecibeWeb && (
+        <div style={{ color: 'var(--color-warning)', fontWeight: 600 }}>
+          ⚠️ Ningún POS de escritorio actualizado se ha conectado en los últimos 2 días: lo que registres
+          aquí no aparecerá en su corte hasta que lo actualicen.
+        </div>
       )}
     </div>
   );
@@ -333,10 +411,11 @@ function FilaMovimiento({ m }: { m: MovimientoCaja }) {
 
 interface AuditoriaResumen {
   ventas_sin_corte_count: number;
-  ventas_sin_corte_monto: number;
   ventas_sin_corte_efectivo: number;
   movimientos_desalineados_count: number;
   movimientos_desalineados_monto: number;
+  movimientos_huerfanos_count: number;
+  movimientos_huerfanos_monto: number;
   eslabones_rotos_count: number;
   eslabones_rotos_monto: number;
   cortes_inconsistentes_count: number;
@@ -348,14 +427,13 @@ interface MovDesalineado {
   id: number; tipo: string; monto: number; concepto: string; fecha: string;
   corte_id: number; corte_tipo: string; corte_inicio: string; corte_fin: string;
 }
-interface EslabonFondo {
-  corte_id: number; dia_cerrado: string; fondo_dejado: number;
-  fondo_declarado_siguiente: number | null; fecha_apertura_siguiente: string | null;
-  diferencia: number | null;
+interface MovHuerfano { id: number; tipo: string; monto: number; concepto: string; fecha: string; }
+interface EslabonRoto {
+  corte_id: number; tipo: string; fecha: string;
+  fondo_anterior: number; fondo_inicial: number; diferencia: number;
 }
 interface CorteInconsistente {
-  id: number; tipo: string; created_at: string; fondo_inicial: number;
-  ventas_efectivo: number; entradas: number; retiros: number;
+  id: number; tipo: string; created_at: string;
   esperado_guardado: number; esperado_recalculado: number; descuadre: number;
 }
 interface DiaSinCierre { dia: string; num_ventas: number; total_ventas: number; total_efectivo: number; }
@@ -363,12 +441,13 @@ interface Auditoria {
   resumen: AuditoriaResumen;
   ventas_sin_corte: VentaSinCorte[];
   movimientos_desalineados: MovDesalineado[];
-  cadena_fondos: EslabonFondo[];
+  movimientos_huerfanos: MovHuerfano[];
+  cadena_rota: EslabonRoto[];
   cortes_inconsistentes: CorteInconsistente[];
   dias_sin_cierre: DiaSinCierre[];
 }
 
-function TabAuditoria() {
+function TabAuditoria({ cajaWeb }: { cajaWeb: boolean }) {
   const [data, setData] = useState<Auditoria | null>(null);
   const [cargando, setCargando] = useState(false);
   const [error, setError] = useState('');
@@ -398,21 +477,6 @@ function TabAuditoria() {
     </div>;
   }
 
-  // La auditoría lee la BD local del POS de escritorio (SQLite). El
-  // servidor web todavía no expone este comando, así que ahí mostramos
-  // un mensaje claro en lugar de un error crudo.
-  if (error && !isTauri()) {
-    return <div className="card" style={{ padding: 24, textAlign: 'center' }}>
-      <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 6 }}>
-        Auditoría disponible solo en el POS de escritorio
-      </div>
-      <div style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>
-        Analiza la base de datos local de la caja. Ábrela desde la
-        computadora del punto de venta.
-      </div>
-    </div>;
-  }
-
   if (error) {
     return <div className="card" style={{ padding: 20, color: 'var(--color-danger)' }}>
       Error al auditar: <code style={{ fontSize: 12 }}>{error}</code>
@@ -421,10 +485,12 @@ function TabAuditoria() {
 
   if (!data) return null;
   const r = data.resumen;
+  // Los días sin cierre ya no son una fuga (el siguiente corte los incluye),
+  // así que no cuentan para el veredicto.
   const hayProblemas =
     r.ventas_sin_corte_count > 0 || r.movimientos_desalineados_count > 0 ||
-    r.eslabones_rotos_count > 0 || r.cortes_inconsistentes_count > 0 ||
-    r.dias_sin_cierre_count > 0;
+    r.movimientos_huerfanos_count > 0 || r.eslabones_rotos_count > 0 ||
+    r.cortes_inconsistentes_count > 0;
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
@@ -446,6 +512,15 @@ function TabAuditoria() {
         {cargando && <span style={{ fontSize: 12, color: 'var(--color-text-dim)' }}>Analizando…</span>}
       </div>
 
+      {/* En la web se audita la caja con la que trabaja este equipo. */}
+      {!isTauri() && (
+        <div style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>
+          {cajaWeb
+            ? 'Caja auditada: la caja web (la de los equipos con caja propia).'
+            : 'Caja auditada: la caja de la tienda, según lo que ya se sincronizó con el POS de escritorio.'}
+        </div>
+      )}
+
       {/* Veredicto */}
       <div className="card" style={{
         padding: 18,
@@ -455,7 +530,11 @@ function TabAuditoria() {
         {hayProblemas ? (
           <>
             <div style={{ fontSize: 15, fontWeight: 800, color: 'var(--color-danger)', marginBottom: 6 }}>
-              Se detectaron descuadres en el flujo de caja
+              Se detectaron descuadres históricos en el flujo de caja
+            </div>
+            <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 8 }}>
+              Los generó el cálculo anterior de cortes. Desde la versión 0.1.39 los cortes forman una
+              cadena continua y estas fugas ya no se producen.
             </div>
             <div style={{ fontSize: 13, marginBottom: 10 }}>
               Impacto estimado acumulado:{' '}
@@ -477,10 +556,10 @@ function TabAuditoria() {
       {/* Hallazgos */}
       <SeccionAuditoria
         clave="dias"
-        titulo="Días con ventas sin cierre de caja"
+        titulo="Días con ventas sin cierre de caja (informativo)"
         conteo={r.dias_sin_cierre_count}
         monto={data.dias_sin_cierre.reduce((s, d) => s + d.total_efectivo, 0)}
-        explicacion="Cada día sin cerrar deja sus ventas fuera de toda conciliación. El cierre siguiente arranca después, así que ese dinero nunca se compara contra nada — y el descuadre se arrastra."
+        explicacion="Días en que no se hizo cierre. Con el cálculo nuevo no se pierde nada: el siguiente corte incluye esas ventas, y si al abrir faltaba dinero queda registrado como ajuste de apertura."
         expandido={expandido === 'dias'}
         onToggle={() => toggle('dias')}
       >
@@ -533,24 +612,39 @@ function TabAuditoria() {
       </SeccionAuditoria>
 
       <SeccionAuditoria
-        clave="fondos"
-        titulo="Saltos entre el cierre y la apertura siguiente"
-        conteo={r.eslabones_rotos_count}
-        monto={r.eslabones_rotos_monto}
-        explicacion="El monto que declaró el cierre como fondo para el día siguiente no coincide con el que se declaró al abrir. Hoy el sistema acepta cualquier cifra en la apertura sin compararla contra el cierre anterior."
-        expandido={expandido === 'fondos'}
-        onToggle={() => toggle('fondos')}
+        clave="huerfanos"
+        titulo="Movimientos que ningún corte contó"
+        conteo={r.movimientos_huerfanos_count}
+        monto={r.movimientos_huerfanos_monto}
+        explicacion="Retiros o entradas sin corte asignado y anteriores al último corte: el dinero se movió, pero ningún corte lo esperaba y ya ninguno lo contará."
+        expandido={expandido === 'huerfanos'}
+        onToggle={() => toggle('huerfanos')}
       >
         <TablaAudit
-          columnas={['Día cerrado', 'Dejó en caja', 'Apertura siguiente', 'Declaró', 'Diferencia']}
-          filas={data.cadena_fondos.map(e => [
-            e.dia_cerrado,
-            fmt(e.fondo_dejado),
-            e.fecha_apertura_siguiente?.substring(0, 10) ?? '— sin apertura —',
-            e.fondo_declarado_siguiente !== null ? fmt(e.fondo_declarado_siguiente) : '—',
-            e.diferencia !== null
-              ? `${e.diferencia >= 0 ? '+' : ''}${fmt(e.diferencia)}`
-              : '—',
+          columnas={['Tipo', 'Monto', 'Concepto', 'Fecha']}
+          filas={data.movimientos_huerfanos.map(m => [
+            m.tipo, fmt(m.monto), m.concepto, m.fecha.substring(0, 16),
+          ])}
+        />
+      </SeccionAuditoria>
+
+      <SeccionAuditoria
+        clave="cadena"
+        titulo="Cortes que no arrancaron con lo que dejó el anterior"
+        conteo={r.eslabones_rotos_count}
+        monto={r.eslabones_rotos_monto}
+        explicacion="El fondo inicial de estos cortes no es el que dejó el corte anterior. Es el síntoma de 'al día siguiente no cuadra con lo que se dejó': antes la apertura reemplazaba el fondo sin compararlo."
+        expandido={expandido === 'cadena'}
+        onToggle={() => toggle('cadena')}
+      >
+        <TablaAudit
+          columnas={['Corte', 'Fecha', 'Dejó el anterior', 'Arrancó con', 'Diferencia']}
+          filas={data.cadena_rota.map(e => [
+            `#${e.corte_id} ${e.tipo}`,
+            e.fecha.substring(0, 16),
+            fmt(e.fondo_anterior),
+            fmt(e.fondo_inicial),
+            `${e.diferencia >= 0 ? '+' : ''}${fmt(e.diferencia)}`,
           ])}
         />
       </SeccionAuditoria>
@@ -1090,7 +1184,7 @@ function ModalMovimiento({ onClose, onSuccess }: { onClose: () => void; onSucces
 
 function ModalCorteTurno({ onClose, onSuccess }: { onClose: () => void; onSuccess: () => void }) {
   const { usuario } = useAuthStore();
-  const { calcularDatosCorte, crearCorte, crearMovimiento } = useCortesStore();
+  const { calcularDatosCorte, crearCorte } = useCortesStore();
 
   const [datos, setDatos] = useState<DatosCorte | null>(null);
   const [cargandoDatos, setCargandoDatos] = useState(true);
@@ -1103,14 +1197,18 @@ function ModalCorteTurno({ onClose, onSuccess }: { onClose: () => void; onSucces
   const [notaDiferencia, setNotaDiferencia] = useState('');
   const [pinDueno, setPinDueno] = useState('');
   const [error, setError] = useState('');
+  const [aviso, setAviso] = useState('');
   const [guardando, setGuardando] = useState(false);
-  const [fechaInicio] = useState(fechaHoyInicio);
-  const [fechaFin] = useState(ahora);
 
   const esAdmin = usuario?.es_admin ?? false;
 
+  // El período lo define el servidor (desde el último corte hasta ahora), en
+  // escritorio y en la web; los parámetros se mandan por compatibilidad y se
+  // ignoran.
+  const recalcular = () => calcularDatosCorte(fechaHoyInicio(), ahora());
+
   useEffect(() => {
-    calcularDatosCorte(fechaInicio, fechaFin)
+    recalcular()
       .then(setDatos)
       .catch(e => setError(String(e)))
       .finally(() => setCargandoDatos(false));
@@ -1123,16 +1221,18 @@ function ModalCorteTurno({ onClose, onSuccess }: { onClose: () => void; onSucces
 
   const efectivoEsperado = datos?.efectivo_esperado ?? 0;
   const efectivoContado = usarDenominaciones ? totalDenominaciones : (parseFloat(efectivoContadoDirecto) || 0);
-  const diferencia = datos ? efectivoContado - datos.efectivo_esperado : 0;
+  // Redondeado a centavos: sin esto una suma de flotantes daba 0.0000001 de
+  // diferencia y exigía nota sin razón.
+  const diferencia = datos ? round2(efectivoContado - datos.efectivo_esperado) : 0;
   
   const huboConteo = usarDenominaciones ? totalDenominaciones > 0 : efectivoContadoDirecto !== '';
   const requiereNota = huboConteo && diferencia !== 0;
 
-  const numRetiro = parseFloat(montoRetiro) || 0;
+  const numRetiro = round2(parseFloat(montoRetiro) || 0);
   const requierePin = numRetiro > 500 && !esAdmin;
   const excedeRetiro = numRetiro > efectivoContado;
   
-  const fondoSiguiente = efectivoContado - numRetiro;
+  const fondoSiguiente = round2(efectivoContado - numRetiro);
 
   const handleConfirmar = async () => {
     if (!datos) return;
@@ -1154,37 +1254,44 @@ function ModalCorteTurno({ onClose, onSuccess }: { onClose: () => void; onSucces
 
     setGuardando(true);
     setError('');
+    setAviso('');
+    const retiro = numRetiro > 0
+      ? { monto: numRetiro, concepto: conceptoRetiro.trim(), pin_autorizacion: requierePin ? pinDueno : null }
+      : null;
     try {
-      // 1. Si hay retiro, lo creamos PRIMERO para que quede como un Movimiento y afecte saldos futuros cleanly.
-      // Pero, dado que el Corte evalúa la ventana temporal hasta `fechaFin`, no queremos que este 
-      // retiro descuadre este corte en curso. Afortunadamente el corte ya tiene datos `datos` fijados.
-      if (numRetiro > 0) {
-        await crearMovimiento({
-          tipo: 'RETIRO',
-          usuario_id: usuario!.id,
-          monto: numRetiro,
-          concepto: conceptoRetiro.trim(),
-          pin_autorizacion: requierePin ? pinDueno : null,
-        });
-      }
-
-      // 2. Crear el Corte Parcial
+      // El retiro va DENTRO del corte (escritorio y web): se calcula el
+      // esperado, se guarda el corte y se registra el retiro en una sola
+      // transacción, así el retiro no descuadra el corte que lo origina ni
+      // se duplica si hay que reintentar por DATOS_CAMBIARON.
       await crearCorte({
         tipo: 'PARCIAL',
         usuario_id: usuario!.id,
-        fecha_inicio: fechaInicio,
-        fecha_fin: fechaFin,
+        fecha_inicio: datos.fecha_inicio,
+        fecha_fin: datos.fecha_fin,
         datos,
         efectivo_contado: efectivoContado,
         nota_diferencia: notaDiferencia.trim() || null,
         fondo_siguiente: fondoSiguiente,
         denominaciones,
+        retiro,
       });
 
       await onSuccess();
       onClose();
     } catch (e: any) {
-      setError(String(e));
+      const msg = String(e);
+      if (msg.includes(ERR_DATOS_CAMBIARON)) {
+        // Entraron ventas o movimientos mientras se contaba. Recargamos el
+        // esperado y conservamos el conteo para que solo haya que revisar.
+        try {
+          setDatos(await recalcular());
+          setAviso('Se registraron ventas o movimientos mientras contabas. El efectivo esperado se actualizó: revisa la diferencia y confirma de nuevo.');
+        } catch (e2) {
+          setError(String(e2));
+        }
+      } else {
+        setError(msg);
+      }
       setGuardando(false);
     }
   };
@@ -1435,6 +1542,7 @@ function ModalCorteTurno({ onClose, onSuccess }: { onClose: () => void; onSucces
             </>
           )}
 
+          {aviso && <AvisoRecalculo texto={aviso} />}
           {error && <p style={{ fontSize: 13, fontWeight: 600, color: 'var(--color-danger)', textAlign: 'center' }}>{error}</p>}
 
           <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
@@ -1473,29 +1581,31 @@ function ModalCorteDelDia({ onClose, onSuccess, fechaObjetivo }: {
   const [nota, setNota] = useState('');
   const [fondoSiguiente, setFondoSiguiente] = useState('2000');
   const [error, setError] = useState('');
+  const [aviso, setAviso] = useState('');
 
+  // Hay ventas de días anteriores que todavía no entran en ningún corte.
+  // Ya NO se cierra "el día de ayer" por separado (no se puede contar el
+  // pasado): este cierre las incluye todas, desde el último corte.
   const esExtemporaneo = !!fechaObjetivo;
+  // Un cierre cuenta para el día en que se confirma (uno por día). Si lo
+  // pendiente es de un día anterior, este cierre ocupa el cierre de HOY.
+  const cuentaComoCierreDeHoy = !!fechaObjetivo && fechaObjetivo.slice(0, 10) < fechaHoyInicio().slice(0, 10);
+
+  // El cierre cubre desde el último corte hasta AHORA. Antes terminaba a
+  // las 23:59:59 del día, y las ventas hechas después de cerrar quedaban
+  // dentro de un rango ya cerrado sin contarse nunca.
+  const recalcular = async () => {
+    const fInicio = await obtenerInicioProximoCierre().catch(() => fechaHoyInicio());
+    const fFin = ahora();
+    setRangoFechas({ inicio: fInicio, fin: fFin });
+    return calcularDatosCorte(fInicio, fFin);
+  };
 
   useEffect(() => {
-    async function init() {
-      try {
-        setCargandoDatos(true);
-        // Siempre usamos el inicio de los tiempos pendientes para no dejar baches
-        const fInicio = await obtenerInicioProximoCierre();
-        // Si hay una fecha objetivo explícita (ej. "ayer"), el cierre llega hasta el final de ese día
-        const fFin = fechaObjetivo ? `${fechaObjetivo} 23:59:59` : fechaHoyFin();
-        
-        setRangoFechas({ inicio: fInicio, fin: fFin });
-        
-        const d = await calcularDatosCorte(fInicio, fFin);
-        setDatos(d);
-      } catch (e: any) {
-        setError(String(e));
-      } finally {
-        setCargandoDatos(false);
-      }
-    }
-    init();
+    recalcular()
+      .then(setDatos)
+      .catch(e => setError(String(e)))
+      .finally(() => setCargandoDatos(false));
   }, []);
 
   const totalDenominaciones = DENOMINACIONES.reduce((sum, d) => {
@@ -1507,15 +1617,19 @@ function ModalCorteDelDia({ onClose, onSuccess, fechaObjetivo }: {
     ? totalDenominaciones
     : parseFloat(efectivoContadoDirecto) || 0;
 
-  const diferencia = datos ? efectivoContado - datos.efectivo_esperado : 0;
+  const diferencia = datos ? round2(efectivoContado - datos.efectivo_esperado) : 0;
   const requiereNota = efectivoContado > 0 && diferencia !== 0;
 
   const handleConfirmar = async () => {
     if (!datos || !rangoFechas) return;
     if (efectivoContado < 0) { setError('El efectivo contado no puede ser negativo'); return; }
-    if (requiereNota && !nota.trim()) { setError('La nota es obligatoria cuando hay diferencia'); return; }
+    if (diferencia !== 0 && !nota.trim()) { setError('La nota es obligatoria cuando hay diferencia'); return; }
 
-    const fondoNum = parseFloat(fondoSiguiente) || 0;
+    const fondoNum = round2(parseFloat(fondoSiguiente) || 0);
+    if (fondoNum > efectivoContado) {
+      setError(`No puedes dejar ${fmt(fondoNum)} de fondo si solo contaste ${fmt(efectivoContado)}`);
+      return;
+    }
 
     const denominaciones: DenominacionInput[] | undefined = usarDenominaciones
       ? DENOMINACIONES
@@ -1528,6 +1642,7 @@ function ModalCorteDelDia({ onClose, onSuccess, fechaObjetivo }: {
       : undefined;
 
     setError('');
+    setAviso('');
     try {
       await crearCorte({
         tipo: 'DIA',
@@ -1543,7 +1658,17 @@ function ModalCorteDelDia({ onClose, onSuccess, fechaObjetivo }: {
       await onSuccess();
       onClose();
     } catch (e: any) {
-      setError(String(e));
+      const msg = String(e);
+      if (msg.includes(ERR_DATOS_CAMBIARON)) {
+        try {
+          setDatos(await recalcular());
+          setAviso('Se registraron ventas o movimientos mientras contabas. El efectivo esperado se actualizó: revisa la diferencia y confirma de nuevo.');
+        } catch (e2) {
+          setError(String(e2));
+        }
+      } else {
+        setError(msg);
+      }
     }
   };
 
@@ -1564,14 +1689,20 @@ function ModalCorteDelDia({ onClose, onSuccess, fechaObjetivo }: {
         }}>
           <CheckCircle size={18} style={{ color: 'var(--color-success)' }} />
           <div style={{ flex: 1 }}>
-            <h3 style={{ fontSize: 15, fontWeight: 700 }}>
-              {esExtemporaneo ? 'cierre de caja — Extemporáneo' : 'cierre de caja — Cierre'}
-            </h3>
+            <h3 style={{ fontSize: 15, fontWeight: 700 }}>Cierre de caja</h3>
             <p style={{ fontSize: 11, color: 'var(--color-text-dim)' }}>
-              {esExtemporaneo
-                ? `Cerrando: ${fechaObjetivo} · ${usuario?.nombre_completo}`
-                : `${new Date().toLocaleDateString('es-MX', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })} · ${usuario?.nombre_completo}`}
+              {`${new Date().toLocaleDateString('es-MX', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })} · ${usuario?.nombre_completo}`}
             </p>
+            {esExtemporaneo && (
+              <p style={{ fontSize: 11, color: 'var(--color-warning)', marginTop: 2, fontWeight: 600 }}>
+                Incluye las ventas pendientes desde el {fechaObjetivo} (días sin cerrar).
+              </p>
+            )}
+            {cuentaComoCierreDeHoy && (
+              <p style={{ fontSize: 11, color: 'var(--color-danger)', marginTop: 2, fontWeight: 600 }}>
+                ⚠️ Este cierre contará como el cierre de HOY; ya no podrás hacer otro cierre hoy. Si solo quieres contar el dinero ahora, usa Corte de turno.
+              </p>
+            )}
           </div>
           <button className="btn btn-ghost btn-sm" onClick={onClose}><X size={16} /></button>
         </div>
@@ -1794,6 +1925,7 @@ function ModalCorteDelDia({ onClose, onSuccess, fechaObjetivo }: {
             </>
           )}
 
+          {aviso && <AvisoRecalculo texto={aviso} />}
           {error && <p style={{ fontSize: 12, color: 'var(--color-danger)' }}>{error}</p>}
 
           <div style={{ display: 'flex', gap: 8 }}>
@@ -1890,25 +2022,37 @@ interface ModalAperturaProps {
 
 export function ModalAperturaCaja({ onSuccess, onClose, bloqueante = true }: ModalAperturaProps) {
   const { usuario } = useAuthStore();
-  const { crearApertura, obtenerFondoSugerido } = useCortesStore();
+  const { crearApertura, obtenerEsperadoApertura } = useCortesStore();
 
   const [fondo, setFondo] = useState('');
   const [nota, setNota] = useState('');
   const [error, setError] = useState('');
   const [guardando, setGuardando] = useState(false);
   const [cargando, setCargando] = useState(true);
+  // Lo que DEBERÍA haber (fondo del último corte + lo que pasó desde
+  // entonces), en escritorio y en la caja web. El campo arranca vacío a
+  // propósito: antes venía lleno con la sugerencia y se confirmaba sin
+  // contar, así que un faltante de la noche nunca se detectaba al abrir.
+  const [esperado, setEsperado] = useState<EsperadoApertura | null>(null);
 
   useEffect(() => {
-    obtenerFondoSugerido()
-      .then(s => setFondo(String(s)))
-      .catch(() => setFondo('2000'))
+    obtenerEsperadoApertura()
+      .then(setEsperado)
+      .catch(() => setEsperado(null))
       .finally(() => setCargando(false));
   }, []);
 
-  const fondoNum = parseFloat(fondo) || 0;
+  const fondoNum = round2(parseFloat(fondo) || 0);
+  const comparar = !!esperado?.hay_referencia && fondo !== '';
+  const diferencia = comparar ? round2(fondoNum - esperado!.esperado) : 0;
 
   const handleConfirmar = async () => {
+    if (fondo === '') { setError('Cuenta el efectivo de la caja y escribe el total'); return; }
     if (fondoNum < 0) { setError('El fondo no puede ser negativo'); return; }
+    if (diferencia !== 0 && !nota.trim()) {
+      setError('Lo contado no coincide con lo esperado: escribe una nota explicando la diferencia');
+      return;
+    }
     setGuardando(true);
     setError('');
     try {
@@ -1957,17 +2101,43 @@ export function ModalAperturaCaja({ onSuccess, onClose, bloqueante = true }: Mod
 
         <div style={{ padding: 22, display: 'flex', flexDirection: 'column', gap: 16 }}>
           <p style={{ fontSize: 13, color: 'var(--color-text-muted)', lineHeight: 1.5 }}>
-            Antes de empezar las operaciones del día, declara el efectivo con el que abres la caja.
-            Este será el <strong>fondo inicial</strong> contra el que se cuadrará el corte de hoy.
+            {esperado
+              ? <>Antes de empezar, <strong>cuenta el efectivo que hay en la caja</strong>. Se compara contra lo que dejó el último corte para detectar faltantes o sobrantes desde entonces.</>
+              : <>Antes de empezar las operaciones del día, declara el efectivo con el que abres la caja. Este será el <strong>fondo inicial</strong> contra el que se cuadrará el corte de hoy.</>}
           </p>
 
           {cargando ? (
             <p style={{ textAlign: 'center', color: 'var(--color-text-dim)', padding: 20 }}>Cargando sugerencia...</p>
           ) : (
             <>
+              {esperado?.hay_referencia && (
+                <div style={{
+                  padding: 12, borderRadius: 8, background: 'var(--color-surface-2)',
+                  display: 'flex', alignItems: 'center', gap: 12,
+                }}>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--color-text-muted)' }}>DEBERÍA HABER</div>
+                    <div className="mono" style={{ fontSize: 22, fontWeight: 800 }}>{fmt(esperado.esperado)}</div>
+                    <div style={{ fontSize: 11, color: 'var(--color-text-dim)' }}>
+                      Fondo del último corte {fmt(esperado.fondo_ultimo_corte)}
+                      {esperado.flujo_desde_corte !== 0 && (
+                        <> {esperado.flujo_desde_corte > 0 ? '+' : '−'} {fmt(Math.abs(esperado.flujo_desde_corte))} de movimientos desde entonces</>
+                      )}
+                    </div>
+                  </div>
+                  <button
+                    className="btn btn-sm"
+                    onClick={() => { setFondo(String(esperado.esperado)); setError(''); }}
+                    title="Usar si contaste y coincide exactamente"
+                  >
+                    Coincide
+                  </button>
+                </div>
+              )}
+
               <div>
                 <label style={{ fontSize: 11, fontWeight: 700, color: 'var(--color-text-muted)', display: 'block', marginBottom: 6 }}>
-                  FONDO DECLARADO
+                  {esperado ? 'EFECTIVO CONTADO EN CAJA' : 'FONDO DECLARADO'}
                 </label>
                 <input
                   className="input mono"
@@ -1980,14 +2150,25 @@ export function ModalAperturaCaja({ onSuccess, onClose, bloqueante = true }: Mod
                   autoFocus
                   style={{ width: '100%', fontSize: 28, textAlign: 'center', fontWeight: 700 }}
                 />
-                <p style={{ fontSize: 11, color: 'var(--color-text-dim)', marginTop: 4, textAlign: 'center' }}>
-                  Sugerencia basada en el último cierre del día
-                </p>
+                {!esperado && (
+                  <p style={{ fontSize: 11, color: 'var(--color-text-dim)', marginTop: 4, textAlign: 'center' }}>
+                    Sugerencia basada en el último cierre del día
+                  </p>
+                )}
+                {comparar && diferencia !== 0 && (
+                  <p style={{
+                    fontSize: 13, fontWeight: 700, marginTop: 6, textAlign: 'center',
+                    color: diferencia < 0 ? 'var(--color-danger)' : 'var(--color-warning)',
+                  }}>
+                    {diferencia < 0 ? 'Faltan' : 'Sobran'} {fmt(Math.abs(diferencia))} respecto a lo esperado.
+                    Se registrará como ajuste a tu nombre.
+                  </p>
+                )}
               </div>
 
               <div>
                 <label style={{ fontSize: 11, fontWeight: 700, color: 'var(--color-text-muted)', display: 'block', marginBottom: 6 }}>
-                  NOTA (opcional)
+                  {diferencia !== 0 ? 'NOTA (obligatoria: explica la diferencia)' : 'NOTA (opcional)'}
                 </label>
                 <input
                   className="input"
@@ -2019,6 +2200,20 @@ export function ModalAperturaCaja({ onSuccess, onClose, bloqueante = true }: Mod
           )}
         </div>
       </div>
+    </div>
+  );
+}
+
+// Aviso cuando el servidor rechazó el corte porque el esperado cambió
+// mientras el cajero contaba (entraron ventas o movimientos).
+function AvisoRecalculo({ texto }: { texto: string }) {
+  return (
+    <div style={{
+      padding: 10, borderRadius: 8, fontSize: 12, fontWeight: 600,
+      background: 'rgba(245,158,11,0.12)', border: '1px solid rgba(245,158,11,0.45)',
+      color: 'var(--color-warning)',
+    }}>
+      {texto}
     </div>
   );
 }

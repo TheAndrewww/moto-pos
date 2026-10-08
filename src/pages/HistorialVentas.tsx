@@ -1,8 +1,9 @@
 // pages/HistorialVentas.tsx — Historial de ventas + anulación + devoluciones parciales
 
 import React, { useState, useEffect } from 'react';
-import { invoke } from '../lib/invokeCompat';
+import { invoke, isTauri } from '../lib/invokeCompat';
 import { useAuthStore } from '../store/authStore';
+import { useCortesStore } from '../store/cortesStore';
 import {
   useHistorialStore,
   VentaDetalleCompleto,
@@ -15,6 +16,42 @@ import {
 import { imprimirTicket, type ConfigNegocio } from '../utils/ticket';
 
 type Tab = 'ventas' | 'devoluciones';
+
+/** Caja y origen de una venta (escritorio y servidor los mandan en el
+ *  historial y en el detalle). Ventas viejas sin el dato = caja de la tienda.
+ *   - caja 'principal' = cajón de la tienda; 'web' = caja propia de la web.
+ *   - origen 'desktop' | 'web' = quién la registró. */
+type ConCaja = { caja?: string; origen?: string };
+
+function cajaDe(v: ConCaja): 'principal' | 'web' {
+  return v.caja === 'web' ? 'web' : 'principal';
+}
+
+/** ¿Se puede anular aquí? Cada caja se anula donde vive su cadena de cortes:
+ *  la de la tienda en el escritorio, la caja web en la web. */
+function anulableEnEsteEquipo(v: ConCaja): boolean {
+  return isTauri() ? cajaDe(v) === 'principal' : cajaDe(v) === 'web';
+}
+
+function EtiquetaCaja({ v }: { v: ConCaja }) {
+  const web = cajaDe(v) === 'web';
+  if (!web && v.origen !== 'web') return null;
+  return (
+    <span
+      title={web
+        ? 'Venta de la caja web (equipo con caja propia): no entra al corte del escritorio'
+        : 'Venta registrada en la web con el dinero de la caja de la tienda'}
+      style={{
+        marginLeft: 6, fontSize: 9, fontWeight: 800, padding: '1px 5px', borderRadius: 4,
+        letterSpacing: 0.4, verticalAlign: 'middle',
+        background: web ? 'rgba(16,185,129,0.14)' : 'rgba(59,130,246,0.14)',
+        color: web ? '#10b981' : '#3b82f6',
+      }}
+    >
+      {web ? 'CAJA WEB' : 'WEB'}
+    </span>
+  );
+}
 
 function fmt(n: number): string {
   return `$${n.toFixed(2)}`;
@@ -249,7 +286,10 @@ export default function HistorialVentas() {
                       }}
                       onClick={() => toggleRow(v.id)}
                     >
-                      <td data-label="Folio" style={tdStyle}><code style={{ fontSize: 12 }}>{v.folio}</code></td>
+                      <td data-label="Folio" style={tdStyle}>
+                        <code style={{ fontSize: 12 }}>{v.folio}</code>
+                        <EtiquetaCaja v={v as ConCaja} />
+                      </td>
                       <td data-label="Fecha" style={tdStyle}>{formatFecha(v.fecha)}</td>
                       <td data-label="Cajero" style={tdStyle}>{v.usuario_nombre}</td>
                       <td data-label="Cliente" style={tdStyle}>{v.cliente_nombre || '—'}</td>
@@ -426,6 +466,7 @@ function DetalleVentaInline({
   onDevolver: (v: VentaDetalleCompleto) => void;
 }) {
   const { obtenerDetalleCached } = useHistorialStore();
+  const infoCaja = useCortesStore(s => s.infoCaja);
   const [venta, setVenta] = useState<VentaDetalleCompleto | null>(null);
 
   useEffect(() => {
@@ -442,8 +483,16 @@ function DetalleVentaInline({
   const fechaVenta = venta.fecha.slice(0, 10);
   const esHoy = fechaVenta === hoy;
   const totalDisponibleADevolver = venta.items.reduce((s, i) => s + i.cantidad_disponible, 0);
-  const puedeDevolver = !venta.anulada && totalDisponibleADevolver > 0;
-  const puedeAnular = !venta.anulada && esHoy && venta.total_devuelto === 0;
+  const devolvible = !venta.anulada && totalDisponibleADevolver > 0;
+  // Web con caja propia (caja 'web'): el servidor solo acepta devoluciones de
+  // ventas de la caja web; las de la tienda se devuelven en el escritorio o en
+  // un equipo en modo espejo. Mientras la web no sabe su caja, decide el servidor.
+  const devolucionEnOtraCaja = !isTauri() && infoCaja?.caja === 'web'
+    && cajaDe(venta as ConCaja) !== 'web';
+  const puedeDevolver = devolvible && !devolucionEnOtraCaja;
+  const anulableHoy = !venta.anulada && esHoy && venta.total_devuelto === 0;
+  // Web: solo ventas de la caja web. Escritorio: solo las de la tienda.
+  const puedeAnular = anulableHoy && anulableEnEsteEquipo(venta as ConCaja);
 
   // Función para verificar si un item coincide con el término de búsqueda
   const itemCoincide = (it: VentaDetalleItem): boolean => {
@@ -543,6 +592,15 @@ function DetalleVentaInline({
               <Ban size={14} /> Anular venta
             </button>
           )}
+          {((anulableHoy && !puedeAnular) || (devolvible && devolucionEnOtraCaja)) && (
+            <span style={{ fontSize: 11, color: 'var(--color-text-muted)', alignSelf: 'center', maxWidth: 320 }}>
+              {isTauri()
+                ? 'Venta de la caja web: se anula desde la web. Aquí puedes registrar una devolución.'
+                : devolucionEnOtraCaja
+                  ? 'Venta de la caja de la tienda: se anula y se devuelve en el POS de escritorio (o en un equipo en modo espejo).'
+                  : 'Venta de la caja de la tienda: se anula en el POS de escritorio. Desde aquí registra una devolución.'}
+            </span>
+          )}
         </div>
 
         <div style={{
@@ -606,7 +664,12 @@ function ModalAnularVenta({
           return;
         }
       }
-      await invoke('anular_venta', { ventaId: venta.id, usuarioId, motivo });
+      // Web: el servidor vuelve a verificar el PIN del dueño (no confía en
+      // la verificación de arriba). El escritorio ignora `pinAutorizacion`.
+      await invoke('anular_venta', {
+        ventaId: venta.id, usuarioId, motivo,
+        pinAutorizacion: esAdmin ? null : pin,
+      });
       onSuccess();
     } catch (e: any) {
       alert('Error al anular: ' + e);
@@ -630,7 +693,8 @@ function ModalAnularVenta({
           border: '1px solid rgba(216,56,77,0.25)', fontSize: 12,
         }}>
           Se restaurará el stock de {venta.items.length} producto(s) y se marcará la venta como anulada.
-          El total <strong>{fmt(venta.total)}</strong> se descontará del ingreso del día en el corte.
+          El total <strong>{fmt(venta.total)}</strong> deja de contar como ingreso; si la venta fue en efectivo
+          y ya entró en un corte, se registrará un retiro de caja por el reembolso.
         </div>
 
         <div>
@@ -695,6 +759,10 @@ function ModalDevolverVenta({
   const [motivo, setMotivo] = useState('');
   const [pin, setPin] = useState('');
   const [procesando, setProcesando] = useState(false);
+  // Si la venta se cobró con tarjeta/transferencia, normalmente el reembolso
+  // va por el mismo medio y NO sale dinero de la caja. Escritorio y web
+  // respetan la opción (el servidor registra el RETIRO solo si es efectivo).
+  const [reembolsoEfectivo, setReembolsoEfectivo] = useState(venta.metodo_pago === 'efectivo');
 
   const itemsDisponibles = venta.items.filter(i => i.cantidad_disponible > 0);
 
@@ -738,16 +806,23 @@ function ModalDevolverVenta({
           cantidad: Number(cantidad),
         }));
 
-      await invoke('crear_devolucion', {
+      const creada = await invoke<{ total_devuelto: number }>('crear_devolucion', {
         datos: {
           venta_id: venta.id,
           usuario_id: usuarioId,
           autorizado_por: autorizadoPor,
+          // Web: el servidor vuelve a verificar el PIN (no confía en
+          // autorizado_por). El desktop ignora este campo.
+          pin_autorizacion: esAdmin ? null : pin,
           motivo,
           items,
+          reembolso_efectivo: reembolsoEfectivo,
         },
       });
-      alert('Devolución registrada. Se generó un RETIRO de caja por ' + fmt(total));
+      const monto = fmt(creada?.total_devuelto ?? total);
+      alert(reembolsoEfectivo
+        ? `Devolución registrada. Se generó un RETIRO de caja por ${monto}.`
+        : `Devolución registrada por ${monto}. No se movió dinero de la caja.`);
       onSuccess();
     } catch (e: any) {
       alert('Error al devolver: ' + e);
@@ -770,7 +845,7 @@ function ModalDevolverVenta({
           padding: 10, borderRadius: 6, background: 'rgba(245,158,11,0.08)',
           border: '1px solid rgba(245,158,11,0.25)', fontSize: 12, marginBottom: 12,
         }}>
-          Indica la cantidad a devolver por cada producto. Se restaurará el stock y se registrará un RETIRO automático de caja por el monto devuelto.
+          Indica la cantidad a devolver por cada producto. Se restaurará el stock y, si el reembolso es en efectivo, se registrará un RETIRO automático de caja por el monto devuelto.
         </div>
 
         <div style={{ maxHeight: 280, overflow: 'auto' }}>
@@ -833,6 +908,26 @@ function ModalDevolverVenta({
             rows={2}
             style={{ width: '100%', resize: 'vertical' }}
           />
+        </div>
+
+        <div>
+          <label style={labelStyle}>¿Cómo se le regresa el dinero? (venta cobrada en {venta.metodo_pago})</label>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button
+              type="button"
+              className={`btn btn-sm ${reembolsoEfectivo ? '' : 'btn-ghost'}`}
+              onClick={() => setReembolsoEfectivo(true)}
+            >
+              Efectivo de la caja
+            </button>
+            <button
+              type="button"
+              className={`btn btn-sm ${!reembolsoEfectivo ? '' : 'btn-ghost'}`}
+              onClick={() => setReembolsoEfectivo(false)}
+            >
+              Mismo medio (no sale de la caja)
+            </button>
+          </div>
         </div>
 
         {!esAdmin && (

@@ -25,6 +25,11 @@ pub fn init_database(db_path: &Path) -> Result<Connection> {
     // updated_at). Si el esquema todavía no está reparado, el seed truena.
     aplicar_migraciones(&conn)?;
 
+    // La bandera de supresión del sync solo es válida DENTRO de la
+    // transacción que aplica un lote recibido; al arrancar siempre es basura
+    // de un cierre a medias y dejaría apagados los triggers del outbox.
+    limpiar_bandera_supresion(&conn);
+
     // Insertar datos iniciales (después de migraciones)
     conn.execute_batch(SEED_DATA)?;
 
@@ -52,6 +57,15 @@ pub fn init_database(db_path: &Path) -> Result<Connection> {
 
     log::info!("Base de datos inicializada en: {:?}", db_path);
     Ok(conn)
+}
+
+/// Borra `sync_suppress_flag` (si existe). Ver `init_database`.
+pub(crate) fn limpiar_bandera_supresion(conn: &Connection) {
+    match conn.execute("DELETE FROM sync_suppress_flag", []) {
+        Ok(n) if n > 0 => log::warn!("sync_suppress_flag estaba pegada; se limpió al arrancar"),
+        Ok(_) => {}
+        Err(e) => log::warn!("No se pudo limpiar sync_suppress_flag: {}", e),
+    }
 }
 
 /// Ejecuta VACUUM si han pasado >= VACUUM_INTERVAL_DAYS desde el último.

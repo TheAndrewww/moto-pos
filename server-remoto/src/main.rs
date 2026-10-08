@@ -7,6 +7,11 @@ mod auth;
 mod sync;
 mod api;
 mod rpc;
+mod sync_fk_map;
+mod sync_fk;
+mod caja;
+mod venta_calc;
+mod autorizacion;
 
 use axum::{
     routing::{get, post, put},
@@ -60,6 +65,10 @@ async fn main() -> anyhow::Result<()> {
         // Sync
         .route("/sync/push", post(sync::push))
         .route("/sync/pull", get(sync::pull))
+        .route("/sync/id-map", post(sync::id_map))
+        .route("/sync/reparar", post(sync::reparar))
+        .route("/sync/refs", post(sync::refs))
+        .route("/sync/fila", get(sync::fila))
         // Panel web — catálogo
         .route("/api/dashboard", get(api::dashboard_resumen))
         .route("/api/sucursales", get(api::sucursales_list))

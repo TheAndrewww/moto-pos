@@ -1,6 +1,6 @@
 // commands/recepcion.rs — Recepción de mercancía (entrada de stock)
 
-use chrono::Utc;
+
 use serde::{Deserialize, Serialize};
 use tauri::State;
 use crate::commands::auth::AppState;
@@ -53,7 +53,11 @@ pub fn crear_recepcion(
     state: State<'_, AppState>,
 ) -> Result<Recepcion, String> {
     let db = state.db.lock().unwrap();
-    let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    // Fecha de la recepción, de la orden y updated_at de productos: hora local
+    // de la tienda, como las ventas (antes era UTC y una recepción después de
+    // las 6 pm aparecía con fecha del día siguiente).
+    let now = super::cortes::ahora_local();
+    let actualizado = super::cortes::ahora_local();
 
     // Insertar cabecera
     db.execute(
@@ -88,7 +92,7 @@ pub fn crear_recepcion(
                     precio_venta = ?,
                     updated_at = ?
                    WHERE id = ?"#,
-                rusqlite::params![item.cantidad, item.precio_costo, pv, now, item.producto_id],
+                rusqlite::params![item.cantidad, item.precio_costo, pv, actualizado, item.producto_id],
             ).map_err(|e| e.to_string())?;
         } else {
             db.execute(
@@ -97,7 +101,7 @@ pub fn crear_recepcion(
                     precio_costo = ?,
                     updated_at = ?
                    WHERE id = ?"#,
-                rusqlite::params![item.cantidad, item.precio_costo, now, item.producto_id],
+                rusqlite::params![item.cantidad, item.precio_costo, actualizado, item.producto_id],
             ).map_err(|e| e.to_string())?;
         }
 

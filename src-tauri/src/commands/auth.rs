@@ -85,7 +85,8 @@ pub fn login_pin(
     for (id, nombre_completo, nombre_usuario, pin_hash, rol_id, rol_nombre, es_admin) in usuarios {
         let pin_valido = bcrypt::verify(&pin, &pin_hash).unwrap_or(false);
         if pin_valido {
-            // Actualizar último login
+            // Actualizar último login. updated_at no se toca aquí: lo pone el
+            // trigger trg_usuarios_bump_updated, en hora local (migración 015).
             let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
             let _ = db.execute(
                 "UPDATE usuarios SET ultimo_login = ? WHERE id = ?",

@@ -2,11 +2,16 @@
 // Formato esperado: codigo | nombre | precio_venta | stock | proveedor
 // Modo `reemplazar`: borra ventas de prueba + productos + proveedores antes de importar.
 // Modo upsert: mantiene datos existentes; actualiza por código o inserta si no existe.
+//   Si el código es de un producto eliminado (soft delete), lo reactiva
+//   (activo = 1 y deleted_at = NULL).
+// Una línea con stock negativo o no numérico se rechaza y se reporta como error.
 
 use serde::Serialize;
 use tauri::State;
 use super::auth::AppState;
-use chrono::Utc;
+use super::cortes::ahora_local;
+
+use rusqlite::Connection;
 use std::collections::HashMap;
 use std::fs;
 
@@ -43,7 +48,25 @@ pub fn importar_catalogo_csv(
 
     let mut db = state.db.lock().unwrap();
     let tx = db.transaction().map_err(|e| e.to_string())?;
+    let res = importar_catalogo_texto(&tx, &contenido, reemplazar, &ahora_local())?;
+    tx.commit().map_err(|e| e.to_string())?;
 
+    log::info!(
+        "Importación catálogo: {} insertados, {} actualizados, {} omitidos, {} proveedores creados (de {} líneas)",
+        res.insertados, res.actualizados, res.omitidos, res.proveedores_creados, res.total_lineas
+    );
+
+    Ok(res)
+}
+
+/// Núcleo del importador (dentro de la transacción del llamador).
+/// `now` (hora local) se usa para updated_at.
+pub(crate) fn importar_catalogo_texto(
+    tx: &Connection,
+    contenido: &str,
+    reemplazar: bool,
+    now: &str,
+) -> Result<ResultadoImportacion, String> {
     // ─── Modo reemplazo: limpieza en orden FK inverso ───────
     if reemplazar {
         // Orden: hijos → padres. Cada tabla referencia productos/ventas/proveedores.
@@ -89,7 +112,8 @@ pub fn importar_catalogo_csv(
         proveedores_creados: 0,
         errores: Vec::new(),
     };
-    let now = Utc::now().to_rfc3339();
+    // created_at y updated_at en hora local de la tienda.
+    let creado = super::cortes::ahora_local();
 
     // Cache de proveedores: nombre → id
     let mut proveedores_cache: HashMap<String, i64> = HashMap::new();
@@ -122,6 +146,16 @@ pub fn importar_catalogo_csv(
         let proveedor_raw = cols[4].trim();
 
         if codigo.is_empty() || nombre.is_empty() {
+            res.omitidos += 1;
+            continue;
+        }
+
+        // Stock negativo o no numérico ("NaN", "inf"): la línea se rechaza.
+        if !stock.is_finite() || stock < 0.0 {
+            res.errores.push(format!(
+                "Línea {} ({}): stock inválido ({}); el stock no puede ser negativo",
+                idx + 1, codigo, cols[3].trim()
+            ));
             res.omitidos += 1;
             continue;
         }
@@ -164,7 +198,7 @@ pub fn importar_catalogo_csv(
         if let Some(id) = existe {
             let r = tx.execute(
                 "UPDATE productos SET nombre = ?, precio_venta = ?, stock_actual = ?,
-                 proveedor_id = ?, search_text = ?, activo = 1, updated_at = ?
+                 proveedor_id = ?, search_text = ?, activo = 1, deleted_at = NULL, updated_at = ?
                  WHERE id = ?",
                 rusqlite::params![nombre, precio, stock, proveedor_id, search_text, now, id],
             );
@@ -180,7 +214,7 @@ pub fn importar_catalogo_csv(
                 "INSERT INTO productos (codigo, codigo_tipo, nombre, precio_costo, precio_venta,
                  stock_actual, stock_minimo, proveedor_id, search_text, activo, created_at, updated_at)
                  VALUES (?, 'INTERNO', ?, 0, ?, ?, 0, ?, ?, 1, ?, ?)",
-                rusqlite::params![codigo, nombre, precio, stock, proveedor_id, search_text, now, now],
+                rusqlite::params![codigo, nombre, precio, stock, proveedor_id, search_text, creado, now],
             );
             match r {
                 Ok(_) => res.insertados += 1,
@@ -192,17 +226,10 @@ pub fn importar_catalogo_csv(
         }
     }
 
-    tx.commit().map_err(|e| e.to_string())?;
-
     if res.errores.len() > 50 {
         res.errores.truncate(50);
         res.errores.push("... (truncado)".to_string());
     }
-
-    log::info!(
-        "Importación catálogo: {} insertados, {} actualizados, {} omitidos, {} proveedores creados (de {} líneas)",
-        res.insertados, res.actualizados, res.omitidos, res.proveedores_creados, res.total_lineas
-    );
 
     Ok(res)
 }

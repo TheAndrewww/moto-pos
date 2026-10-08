@@ -526,7 +526,9 @@ pub async fn recepcion_crear(
     let usuario_id = ctx.usuario_id;
     let res = tokio::task::spawn_blocking(move || -> Result<RecepcionResp, String> {
         let db = db.lock().unwrap();
-        let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        // Hora local de la tienda: es la fecha de la recepción y el updated_at
+        // de productos (el sync compara contra la hora local del servidor).
+        let now = crate::commands::cortes::ahora_local();
 
         db.execute(
             r#"INSERT INTO recepciones (orden_id, usuario_id, proveedor_id, fecha, notas)

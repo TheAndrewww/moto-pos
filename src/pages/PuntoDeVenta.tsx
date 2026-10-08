@@ -6,7 +6,7 @@ import { useProductStore } from '../store/productStore';
 import { useVentaStore, useVentaActiva, type MetodoPago } from '../store/ventaStore';
 import { useAuthStore } from '../store/authStore';
 import { Search, X, Minus, Plus, Trash2, CreditCard, Banknote, ArrowRightLeft, CheckCircle2, User, Percent, Lock, Plus as PlusIcon, Printer, FileText, Save, ShoppingCart } from 'lucide-react';
-import { invoke } from '../lib/invokeCompat';
+import { invoke, isTauri } from '../lib/invokeCompat';
 import { imprimirTicket, type ConfigNegocio, type TicketData } from '../utils/ticket';
 
 export default function PuntoDeVenta() {
@@ -31,7 +31,11 @@ export default function PuntoDeVenta() {
   const [descPorcentaje, setDescPorcentaje] = useState('');
   const [showPinAuth, setShowPinAuth] = useState(false);
   const [pinAuth, setPinAuth] = useState('');
+  const pinAuthEnCurso = useRef(false);
   const [pinError, setPinError] = useState(false);
+  // Falla al verificar (red/servidor), distinta de un PIN incorrecto: el PIN
+  // se conserva y Enter reintenta.
+  const [pinFalla, setPinFalla] = useState<string | null>(null);
   const [confirmCerrarTab, setConfirmCerrarTab] = useState<string | null>(null);
   const [presupGuardado, setPresupGuardado] = useState<{ folio: string } | null>(null);
   const [mobileCartOpen, setMobileCartOpen] = useState(false);
@@ -167,7 +171,16 @@ export default function PuntoDeVenta() {
       setUltimoTicket(ticket);
       // Auto-impresión deshabilitada por petición del usuario
     } catch (err: any) {
-      alert(err.message);
+      const msg: string = err?.message || String(err);
+      // Web: el servidor rechaza si el precio cambió desde que se cargó el
+      // catálogo. Recargamos precios y re-preciamos el carrito para que el
+      // cajero vea el total correcto antes de volver a cobrar.
+      if (msg.includes('PRECIO_CAMBIO')) {
+        await cargarTodo();
+        useVentaStore.getState().refrescarPrecios(useProductStore.getState().productos);
+        setShowCobro(false);
+      }
+      alert(msg);
     }
   };
 
@@ -196,7 +209,9 @@ export default function PuntoDeVenta() {
   // Descuento: aplicar
   const handleAplicarDescuento = async () => {
     if (showDescuento === null) return;
-    const pct = parseFloat(descPorcentaje) || 0;
+    // A 2 decimales: el servidor web rechaza % con más decimales (se guardan
+    // en numeric(6,2)); así un 33.333 tecleado queda en 33.33.
+    const pct = Math.round((parseFloat(descPorcentaje) || 0) * 100) / 100;
     if (pct <= 0 || pct > 100) return;
 
     // Si excede el límite del vendedor y no es admin, pedir PIN
@@ -204,28 +219,52 @@ export default function PuntoDeVenta() {
       setShowPinAuth(true);
       setPinAuth('');
       setPinError(false);
+      setPinFalla(null);
       return;
     }
 
+    // Dentro del límite (o cajero admin): sin autorización. Arriba del
+    // límite siempre pasa por handlePinAuth.
     const { aplicarDescuento } = useVentaStore.getState();
-    aplicarDescuento(showDescuento, pct, showPinAuth ? usuario?.id ?? null : null);
+    aplicarDescuento(showDescuento, pct, null, null);
     setShowDescuento(null);
     setDescPorcentaje('');
     setShowPinAuth(false);
     setPinAuth('');
   };
 
-  const handlePinAuth = async () => {
-    if (pinAuth.length !== 4) return;
+  // El PIN llega como argumento: el onChange llama a esta función con el valor
+  // recién tecleado. Antes leía `pinAuth` del closure del render anterior (con
+  // 3 dígitos), el guard salía y el descuento nunca se aplicaba.
+  // showDescuento / descPorcentaje / items no cambian mientras el modal de PIN
+  // está abierto, así que leerlos del closure es seguro.
+  const handlePinAuth = async (pin: string) => {
+    if (pin.length !== 4 || showDescuento === null) return;
+    if (pinAuthEnCurso.current) return; // evita doble envío (auto + Enter)
+    pinAuthEnCurso.current = true;
+    setPinFalla(null);
+    const pct = Math.round((parseFloat(descPorcentaje) || 0) * 100) / 100;
     try {
-      const ok = await invoke<boolean>('verificar_pin_dueno', { pin: pinAuth });
-      if (ok) {
-        // PIN válido — aplicar descuento
-        const pct = parseFloat(descPorcentaje) || 0;
-        if (showDescuento !== null) {
-          const { aplicarDescuento } = useVentaStore.getState();
-          aplicarDescuento(showDescuento, pct, usuario?.id ?? null);
+      // autorizado_por = el DUEÑO que puso su PIN (antes se guardaba el id
+      // del propio cajero). En web, además, el servidor firma un token que
+      // crear_venta exige para aceptar el descuento.
+      let autorizadoPor: number | null = null;
+      let token: string | null = null;
+      if (isTauri()) {
+        autorizadoPor = await invoke<number | null>('resolver_dueno_por_pin', { pin });
+      } else {
+        const r = await invoke<{ ok: boolean; autorizado_por?: number; token?: string }>(
+          'autorizar_descuento',
+          { pin, productoId: items[showDescuento].producto.id, porcentaje: pct },
+        );
+        if (r.ok) {
+          autorizadoPor = r.autorizado_por ?? null;
+          token = r.token ?? null;
         }
+      }
+      if (autorizadoPor != null) {
+        const { aplicarDescuento } = useVentaStore.getState();
+        aplicarDescuento(showDescuento, pct, autorizadoPor, token);
         setShowDescuento(null);
         setDescPorcentaje('');
         setShowPinAuth(false);
@@ -235,10 +274,12 @@ export default function PuntoDeVenta() {
         setPinAuth('');
         setTimeout(() => setPinError(false), 600);
       }
-    } catch {
-      setPinError(true);
-      setPinAuth('');
-      setTimeout(() => setPinError(false), 600);
+    } catch (e: any) {
+      // No se pudo verificar (sin red, error del servidor): no es un PIN
+      // incorrecto. Se deja el PIN tecleado para reintentar con Enter.
+      setPinFalla(typeof e === 'string' ? e : (e?.message ?? String(e)));
+    } finally {
+      pinAuthEnCurso.current = false;
     }
   };
 
@@ -864,10 +905,10 @@ export default function PuntoDeVenta() {
                   onChange={e => {
                     const v = e.target.value.replace(/\D/g, '');
                     setPinAuth(v);
-                    if (v.length === 4) {
-                      setTimeout(() => handlePinAuth(), 50);
-                    }
+                    setPinFalla(null);
+                    if (v.length === 4) handlePinAuth(v);
                   }}
+                  onKeyDown={e => { if (e.key === 'Enter') handlePinAuth(pinAuth); }}
                   autoFocus
                   placeholder="••••"
                   style={{ textAlign: 'center', fontSize: 28, letterSpacing: 8, width: '100%' }}
@@ -877,8 +918,13 @@ export default function PuntoDeVenta() {
                     PIN incorrecto
                   </p>
                 )}
+                {pinFalla && !pinError && (
+                  <p style={{ color: 'var(--color-danger)', fontSize: 12, textAlign: 'center', marginTop: 6 }}>
+                    No se pudo verificar el PIN: {pinFalla}. Presiona Enter para reintentar.
+                  </p>
+                )}
                 <button className="btn btn-ghost btn-sm" style={{ marginTop: 12, width: '100%' }}
-                  onClick={() => { setShowPinAuth(false); setPinAuth(''); }}>
+                  onClick={() => { setShowPinAuth(false); setPinAuth(''); setPinFalla(null); }}>
                   Cancelar
                 </button>
               </>

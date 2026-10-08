@@ -17,3 +17,8 @@ pub mod sync_remoto;
 pub mod exportar;
 pub mod reportes;
 pub mod auditoria_caja;
+
+#[cfg(test)]
+mod caja_tests;
+#[cfg(test)]
+mod stock_tests;

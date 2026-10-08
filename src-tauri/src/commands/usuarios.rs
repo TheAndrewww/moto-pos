@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use tauri::State;
 use super::auth::AppState;
-use chrono::Utc;
+
 
 // ─── Structs ──────────────────────────────────────────────
 
@@ -124,7 +124,7 @@ pub fn crear_usuario(
     let password_hash = bcrypt::hash(&usuario.password, 10)
         .map_err(|e| format!("Error al hashear contraseña: {}", e))?;
 
-    let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let now = super::cortes::ahora_local();
 
     db.execute(
         r#"INSERT INTO usuarios (nombre_completo, nombre_usuario, pin, password_hash, rol_id, activo, created_at)
@@ -175,7 +175,7 @@ pub fn actualizar_usuario(
     state: State<'_, AppState>,
 ) -> Result<bool, String> {
     let db = state.db.lock().unwrap();
-    let _now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    // updated_at lo pone el trigger trg_usuarios_bump_updated (hora local).
 
     // Verificar que el nombre de usuario no esté duplicado
     let existe: bool = db.query_row(

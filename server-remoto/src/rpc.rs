@@ -20,19 +20,132 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::Row;
 
-use crate::api::row_to_json;
 use crate::auth::{autenticar, emitir_token_con_device, Claims};
+use crate::caja::{self, Caja};
 use crate::error::{ApiError, ApiResult};
 use crate::AppState;
 
 const WEB_ORIGIN: &str = "web-pos";
 
-/// Etiqueta de `origen` para registros creados desde el POS web.
-/// Las filas con `origen='desktop'` provienen del cliente Tauri (vía sync).
-const ORIGEN_WEB: &str = "web";
-
 /// Expresión SQL para timestamp TEXT igual al POS.
 const NOW_TEXT: &str = "to_char(now() AT TIME ZONE 'America/Mexico_City', 'YYYY-MM-DD HH24:MI:SS')";
+
+/// RPC que mueven dinero de la caja: exigen el header `x-pos-cliente` >= 2.
+const RPC_QUE_MUEVEN_CAJA: &[&str] = &[
+    "crear_corte",
+    "crear_apertura_caja",
+    "crear_movimiento_caja",
+    "crear_devolucion",
+    "anular_venta",
+];
+
+/// Versión mínima del bundle web (invokeCompat la manda en cada RPC).
+const VERSION_MINIMA_CLIENTE_WEB: i64 = 2;
+
+/// ¿El navegador corre un bundle web actual (header `x-pos-cliente` >= 2)?
+fn es_cliente_actual(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-pos-cliente")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .is_some_and(|v| v >= VERSION_MINIMA_CLIENTE_WEB)
+}
+
+fn exigir_cliente_actual(headers: &HeaderMap) -> Result<(), ApiError> {
+    if es_cliente_actual(headers) {
+        Ok(())
+    } else {
+        Err(ApiError::BadRequest(
+            "Hay una versión nueva del POS web. Recarga la página (F5) antes de continuar.".into(),
+        ))
+    }
+}
+
+/// Aviso para una pestaña vieja cuya venta se rechazó por algo que solo el
+/// bundle nuevo sabe resolver: no refresca precios tras PRECIO_CAMBIO ni pide
+/// el token de `autorizar_descuento`, así que reintentar no serviría.
+const AVISO_RECARGAR_VENTA: &str = " Hay una versión nueva del POS web. Recarga la página (F5).";
+
+/// A un error de `crear_venta` de un cliente viejo le agrega cómo salir de él.
+fn aviso_cliente_viejo_venta(e: ApiError, headers: &HeaderMap) -> ApiError {
+    match e {
+        ApiError::BadRequest(m)
+            if !es_cliente_actual(headers)
+                && (m.starts_with("DESCUENTO_NO_AUTORIZADO") || m.starts_with("PRECIO_CAMBIO")) =>
+        {
+            ApiError::BadRequest(format!("{m}{AVISO_RECARGAR_VENTA}"))
+        }
+        otro => otro,
+    }
+}
+
+/// Serializa una respuesta (structs de caja.rs con la forma del escritorio).
+fn a_json<T: serde::Serialize>(v: T) -> Result<Value, ApiError> {
+    serde_json::to_value(v).map_err(|e| ApiError::Other(e.into()))
+}
+
+// -----------------------------------------------------------------------------
+// Identidad del cajero
+// -----------------------------------------------------------------------------
+//
+// Las RPC que mueven dinero NO usan el `usuario_id` del body: lo toman del
+// JWT. Los tokens de `login_pin`/`login_password` llevan sub = usuarios.id y
+// email = nombre_usuario (ver `usuario_sesion_response`). Exigir que ambos
+// coincidan con una fila activa descarta tokens de otros flujos (p. ej. el
+// token de sync de `/auth/login`, cuyo `sub` es un admin_users.id que puede
+// chocar con un usuarios.id) y usuarios desactivados después del login.
+
+struct SesionUsuario {
+    id: i64,
+    es_admin: bool,
+}
+
+async fn usuario_de_sesion(state: &AppState, claims: &Claims) -> Result<SesionUsuario, ApiError> {
+    let row = sqlx::query(
+        "SELECT u.id, COALESCE(r.es_admin, 0) AS es_admin \
+         FROM usuarios u LEFT JOIN roles r ON r.id = u.rol_id \
+         WHERE u.id = $1 AND lower(u.nombre_usuario) = lower($2) \
+           AND u.activo = 1 AND u.deleted_at IS NULL",
+    )
+    .bind(claims.sub)
+    .bind(&claims.email)
+    .fetch_optional(&state.pool)
+    .await?
+    // 401 → invokeCompat borra la sesión y manda a login.
+    .ok_or(ApiError::Unauthorized)?;
+    Ok(SesionUsuario {
+        id: row.get("id"),
+        es_admin: row.get::<i32, _>("es_admin") != 0,
+    })
+}
+
+/// Avisa (sin fallar) si el navegador mandó un usuario_id distinto al de la
+/// sesión. Pasa con pestañas viejas tras cambiar de usuario.
+fn avisar_usuario_distinto(rpc: &str, body_usuario_id: i64, sesion: &SesionUsuario) {
+    if body_usuario_id != sesion.id {
+        tracing::warn!(
+            "{}: usuario_id del body ({}) != usuario de la sesión ({}); se usa el de la sesión",
+            rpc, body_usuario_id, sesion.id
+        );
+    }
+}
+
+/// Límite de descuento sin PIN para vendedores (config_descuentos id=1).
+async fn max_descuento_vendedor(state: &AppState) -> Result<f64, ApiError> {
+    use rust_decimal::prelude::ToPrimitive;
+    let v: Option<rust_decimal::Decimal> = sqlx::query_scalar(
+        "SELECT descuento_max_vendedor_pct FROM config_descuentos WHERE id = 1",
+    )
+    .fetch_optional(&state.pool)
+    .await?;
+    // Mismo default que obtener_config_descuentos y el SEED del desktop.
+    Ok(v.and_then(|d| d.to_f64()).unwrap_or(15.0))
+}
+
+fn dec_f64(d: rust_decimal::Decimal) -> f64 {
+    use rust_decimal::prelude::ToPrimitive;
+    d.to_f64().unwrap_or(0.0)
+}
 
 // -----------------------------------------------------------------------------
 // Dispatcher principal
@@ -59,6 +172,14 @@ pub async fn dispatch(
     // Toda RPC restante requiere Bearer token válido.
     let claims = autenticar(&headers, &state.jwt_secret)?;
 
+    // Las RPC que mueven dinero de la caja exigen un bundle web actual. Una
+    // pestaña vieja (sin el header) mandaba el retiro de turno ANTES del
+    // corte: con el corte que ahora se recalcula aquí, cada reintento tras
+    // DATOS_CAMBIARON dejaba otro retiro. Se rechaza antes de tocar la BD.
+    if RPC_QUE_MUEVEN_CAJA.contains(&cmd.as_str()) {
+        exigir_cliente_actual(&headers)?;
+    }
+
     let result = match cmd.as_str() {
         // ─── Catálogos (read) ────────────────────────────────
         "listar_productos"              => listar_productos(&state).await?,
@@ -67,8 +188,8 @@ pub async fn dispatch(
         "listar_categorias"             => listar_categorias(&state).await?,
         "listar_proveedores"            => listar_proveedores(&state).await?,
         "listar_clientes"               => listar_clientes(&state).await?,
-        "crear_cliente"                 => crear_cliente(&state, args).await?,
-        "actualizar_cliente"            => actualizar_cliente(&state, args).await?,
+        "crear_cliente"                 => crear_cliente(&state, &claims, args).await?,
+        "actualizar_cliente"            => actualizar_cliente(&state, &claims, args).await?,
         "toggle_cliente_activo"         => toggle_cliente_activo(&state, &args).await?,
         "listar_usuarios"               => listar_usuarios(&state).await?,
         "crear_usuario"                 => crear_usuario(&state, &claims, args).await?,
@@ -126,33 +247,41 @@ pub async fn dispatch(
         "configurar_modo_caja"          => configurar_modo_caja(&state, &claims, &args).await?,
 
         // ─── Cortes / caja ───────────────────────────────────
-        // Reciben &claims para resolver el modo (espejo vs individual) y
-        // aplicar/omitir el filtro origen='web' acorde.
+        // Reciben &claims para resolver la caja del dispositivo (caja.rs):
+        // modo individual → caja 'web'; espejo o sin dispositivo → caja de
+        // la tienda (solo lectura aquí; sus cortes los hace el escritorio).
         "obtener_apertura_hoy"          => obtener_apertura_hoy(&state, &claims).await?,
         "crear_apertura_caja"           => crear_apertura_caja(&state, &claims, &args).await?,
+        "obtener_esperado_apertura"     => obtener_esperado_apertura(&state, &claims).await?,
         "verificar_corte_dia_pendiente" => verificar_corte_dia_pendiente(&state, &claims).await?,
+        "obtener_inicio_proximo_cierre" => obtener_inicio_proximo_cierre(&state, &claims).await?,
         "listar_movimientos_sin_corte"  => listar_movimientos_sin_corte(&state, &claims).await?,
         "listar_cortes"                 => listar_cortes(&state, &claims, &args).await?,
         "obtener_detalle_corte"         => obtener_detalle_corte(&state, &args).await?,
         "obtener_fondo_sugerido"        => obtener_fondo_sugerido(&state, &claims).await?,
-        "crear_movimiento_caja"         => crear_movimiento_caja(&state, args).await?,
-        "calcular_datos_corte"          => calcular_datos_corte(&state, &claims, &args).await?,
-        "obtener_top_productos"         => obtener_top_productos(&state, &claims, &args).await?,
-        "obtener_ventas_por_vendedor"   => obtener_ventas_por_vendedor(&state, &claims, &args).await?,
-        "obtener_ventas_por_metodo"     => obtener_ventas_por_metodo(&state, &claims, &args).await?,
-        "obtener_ventas_por_dia"        => obtener_ventas_por_dia(&state, &claims, &args).await?,
+        "crear_movimiento_caja"         => crear_movimiento_caja(&state, &claims, args).await?,
+        "calcular_datos_corte"          => calcular_datos_corte(&state, &claims).await?,
         "crear_corte"                   => crear_corte(&state, &claims, args).await?,
+        "auditar_caja"                  => auditar_caja(&state, &claims, &args).await?,
+
+        // ─── Reportes (solo lectura: todas las ventas, sin filtro de caja) ──
+        "obtener_top_productos"         => obtener_top_productos(&state, &args).await?,
+        "obtener_ventas_por_vendedor"   => obtener_ventas_por_vendedor(&state, &args).await?,
+        "obtener_ventas_por_metodo"     => obtener_ventas_por_metodo(&state, &args).await?,
+        "obtener_ventas_por_dia"        => obtener_ventas_por_dia(&state, &args).await?,
 
         // ─── Ventas ──────────────────────────────────────────
-        "buscar_ventas"                 => buscar_ventas(&state, &claims, &args).await?,
-        "contar_ventas"                 => contar_ventas(&state, &claims, &args).await?,
+        "buscar_ventas"                 => buscar_ventas(&state, &args).await?,
+        "contar_ventas"                 => contar_ventas(&state, &args).await?,
         "obtener_detalle_venta"         => obtener_detalle_venta(&state, &args).await?,
-        "crear_venta"                   => crear_venta(&state, &claims, args).await?,
-        "listar_ventas_dia"             => listar_ventas_dia(&state, &claims).await?,
+        "crear_venta"                   => crear_venta(&state, &claims, args)
+                                               .await
+                                               .map_err(|e| aviso_cliente_viejo_venta(e, &headers))?,
+        "listar_ventas_dia"             => listar_ventas_dia(&state).await?,
         "anular_venta"                  => anular_venta(&state, &claims, &args).await?,
 
         // ─── Estadísticas ────────────────────────────────────
-        "obtener_estadisticas_dia"      => obtener_estadisticas_dia(&state, &claims, &args).await?,
+        "obtener_estadisticas_dia"      => obtener_estadisticas_dia(&state, &args).await?,
 
         // ─── Bitácora (read) ─────────────────────────────────
         "listar_bitacora"               => listar_bitacora(&state, &args).await?,
@@ -168,7 +297,7 @@ pub async fn dispatch(
         // ─── Recepciones ─────────────────────────────────────
         "listar_recepciones"            => listar_recepciones(&state).await?,
         "obtener_detalle_recepcion"     => obtener_detalle_recepcion(&state, &args).await?,
-        "crear_recepcion"               => crear_recepcion(&state, args).await?,
+        "crear_recepcion"               => crear_recepcion(&state, &claims, args).await?,
 
         // ─── Pedidos a proveedor ─────────────────────────────
         "listar_ordenes_pedido"         => listar_ordenes_pedido(&state, &args).await?,
@@ -179,6 +308,9 @@ pub async fn dispatch(
         // ─── PIN dueño (autorizaciones) ──────────────────────
         "verificar_pin_dueno"           => verificar_pin_dueno(&state, &args).await?,
         "resolver_dueno_por_pin"        => resolver_dueno_por_pin(&state, &args).await?,
+        // Solo web: verifica el PIN y devuelve un token firmado que
+        // `crear_venta` exige para descuentos arriba del límite del vendedor.
+        "autorizar_descuento"           => autorizar_descuento(&state, &claims, &args).await?,
 
         // ─── No soportado ────────────────────────────────────
         _ => {
@@ -334,20 +466,37 @@ async fn crear_producto(state: &AppState, args: Value) -> Result<Value, ApiError
     let a: NuevoProductoArgs = serde_json::from_value(args)
         .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
     let p = a.producto;
+    validar_numeros_producto(p.precio_costo, p.precio_venta, p.stock_minimo)?;
+    validar_stock(p.stock_actual)?;
 
     let mut tx = state.pool.begin().await?;
 
-    // Generar código si no se proporcionó (atómico vía codigo_secuencia)
+    // Generar código si no se proporcionó (atómico vía codigo_secuencia).
+    // La secuencia del servidor y la del escritorio avanzan por separado, así
+    // que un MR-xxxxx puede estar ya tomado: se salta a la siguiente libre.
     let codigo = match p.codigo.filter(|c| !c.is_empty()) {
-        Some(c) => c,
+        Some(c) => {
+            verificar_codigo_libre(&mut tx, &c, None).await?;
+            c
+        }
         None => {
-            let nuevo: i64 = sqlx::query_scalar(
-                "UPDATE codigo_secuencia SET ultimo_valor = ultimo_valor + 1 \
-                 WHERE id = 1 RETURNING ultimo_valor",
-            )
-            .fetch_one(&mut *tx)
-            .await?;
-            format!("MR-{:05}", nuevo)
+            let mut libre: Option<String> = None;
+            for _ in 0..1000 {
+                let nuevo: i64 = sqlx::query_scalar(
+                    "UPDATE codigo_secuencia SET ultimo_valor = ultimo_valor + 1 \
+                     WHERE id = 1 RETURNING ultimo_valor",
+                )
+                .fetch_one(&mut *tx)
+                .await?;
+                let candidato = format!("MR-{:05}", nuevo);
+                if producto_con_codigo(&mut tx, &candidato, None).await?.is_none() {
+                    libre = Some(candidato);
+                    break;
+                }
+            }
+            libre.ok_or_else(|| ApiError::BadRequest(
+                "No se encontró un código interno libre; captura el código a mano".into(),
+            ))?
         }
     };
 
@@ -409,12 +558,12 @@ async fn crear_producto(state: &AppState, args: Value) -> Result<Value, ApiError
             descripcion_legible, origen, fecha)
            VALUES ($1, 'PRODUCTO_CREADO', 'productos', $2, $3, 'WEB', {NOW_TEXT})"#
     );
-    let _ = sqlx::query(&audit_sql)
+    sqlx::query(&audit_sql)
         .bind(a.usuario_id)
         .bind(id)
         .bind(format!("Producto creado: {} ({})", p.nombre, codigo))
         .execute(&mut *tx)
-        .await;
+        .await?;
 
     tx.commit().await?;
 
@@ -449,13 +598,17 @@ async fn actualizar_producto(state: &AppState, args: Value) -> Result<Value, Api
     let a: ActualizarProductoArgs = serde_json::from_value(args)
         .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
     let p = a.producto;
+    validar_numeros_producto(p.precio_costo, p.precio_venta, p.stock_minimo)?;
+    if p.codigo.trim().is_empty() {
+        return Err(ApiError::BadRequest("El código es obligatorio".into()));
+    }
 
     let mut tx = state.pool.begin().await?;
 
     // Capturar precio anterior + datos para bitácora antes del UPDATE
     let prev = sqlx::query(
-        "SELECT uuid, nombre, precio_costo, precio_venta \
-         FROM productos WHERE id = $1 AND deleted_at IS NULL",
+        "SELECT uuid, codigo, nombre, precio_costo, precio_venta, categoria_id, proveedor_id \
+         FROM productos WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
     )
     .bind(p.id)
     .fetch_optional(&mut *tx)
@@ -463,7 +616,19 @@ async fn actualizar_producto(state: &AppState, args: Value) -> Result<Value, Api
     .ok_or_else(|| ApiError::NotFound)?;
 
     let uuid: String = prev.get("uuid");
+    let codigo_ant: String = prev.get("codigo");
     let nombre_ant: String = prev.get("nombre");
+    let fks_cambiadas = fks_producto_cambiadas(
+        prev.get("categoria_id"),
+        prev.get("proveedor_id"),
+        p.categoria_id,
+        p.proveedor_id,
+    );
+    // Solo se valida si el código cambia: hay duplicados viejos en el
+    // servidor y no queremos impedir que se editen sus precios.
+    if p.codigo != codigo_ant {
+        verificar_codigo_libre(&mut tx, &p.codigo, Some(p.id)).await?;
+    }
     let precio_costo_ant = prev
         .try_get::<rust_decimal::Decimal, _>("precio_costo")
         .ok()
@@ -506,6 +671,7 @@ async fn actualizar_producto(state: &AppState, args: Value) -> Result<Value, Api
         .bind(p.id)
         .execute(&mut *tx)
         .await?;
+    anotar_celdas_fk_web(&mut tx, "productos", &uuid, &fks_cambiadas).await?;
 
     sqlx::query(
         "INSERT INTO sync_cursor (tabla, uuid, sucursal_id, origen_device) \
@@ -526,13 +692,13 @@ async fn actualizar_producto(state: &AppState, args: Value) -> Result<Value, Api
             datos_anteriores, descripcion_legible, origen, fecha)
            VALUES ($1, 'PRODUCTO_EDITADO', 'productos', $2, $3, $4, 'WEB', {NOW_TEXT})"#
     );
-    let _ = sqlx::query(&audit_sql)
+    sqlx::query(&audit_sql)
         .bind(a.usuario_id)
         .bind(p.id)
         .bind(&datos_ant_str)
         .bind(format!("Producto editado: {}", p.nombre))
         .execute(&mut *tx)
-        .await;
+        .await?;
 
     // Si cambió el precio de venta, dejar registro dedicado para historial_precios
     if (p.precio_venta - precio_venta_ant).abs() > 0.001 {
@@ -548,14 +714,14 @@ async fn actualizar_producto(state: &AppState, args: Value) -> Result<Value, Api
                 datos_anteriores, datos_nuevos, descripcion_legible, origen, fecha)
                VALUES ($1, 'PRECIO_ACTUALIZADO', 'productos', $2, $3, $4, $5, 'WEB', {NOW_TEXT})"#
         );
-        let _ = sqlx::query(&pa_sql)
+        sqlx::query(&pa_sql)
             .bind(a.usuario_id)
             .bind(p.id)
             .bind(&json_ant)
             .bind(&json_new)
             .bind(&descr)
             .execute(&mut *tx)
-            .await;
+            .await?;
     }
 
     tx.commit().await?;
@@ -613,12 +779,12 @@ async fn eliminar_producto(state: &AppState, args: &Value) -> Result<Value, ApiE
             descripcion_legible, origen, fecha)
            VALUES ($1, 'PRODUCTO_ELIMINADO', 'productos', $2, $3, 'WEB', {NOW_TEXT})"#
     );
-    let _ = sqlx::query(&audit_sql)
+    sqlx::query(&audit_sql)
         .bind(a.usuario_id)
         .bind(a.producto_id)
         .bind(format!("Producto eliminado: {}", nombre))
         .execute(&mut *tx)
-        .await;
+        .await?;
 
     tx.commit().await?;
     Ok(json!(true))
@@ -643,12 +809,13 @@ async fn ajustar_stock(state: &AppState, args: &Value) -> Result<Value, ApiError
     if a.motivo.trim().is_empty() {
         return Err(ApiError::BadRequest("El motivo es obligatorio".into()));
     }
+    validar_stock(a.nuevo_stock)?;
 
     let mut tx = state.pool.begin().await?;
 
     let prev = sqlx::query(
         "SELECT uuid, nombre, stock_actual FROM productos \
-         WHERE id = $1 AND deleted_at IS NULL",
+         WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
     )
     .bind(a.producto_id)
     .fetch_optional(&mut *tx)
@@ -671,15 +838,17 @@ async fn ajustar_stock(state: &AppState, args: &Value) -> Result<Value, ApiError
         .execute(&mut *tx)
         .await?;
 
+    // stock_sucursal ya no se sincroniza (no lo lee nadie): se mantiene al
+    // día localmente pero NO se escribe sync_cursor para esa tabla.
     let upd_suc_sql = format!(
         "UPDATE stock_sucursal SET stock_actual = $1, updated_at = {NOW_TEXT} \
          WHERE producto_id = $2 AND sucursal_id = 1"
     );
-    let _ = sqlx::query(&upd_suc_sql)
+    sqlx::query(&upd_suc_sql)
         .bind(a.nuevo_stock)
         .bind(a.producto_id)
         .execute(&mut *tx)
-        .await;
+        .await?;
 
     sqlx::query(
         "INSERT INTO sync_cursor (tabla, uuid, sucursal_id, origen_device) \
@@ -708,17 +877,160 @@ async fn ajustar_stock(state: &AppState, args: &Value) -> Result<Value, ApiError
             datos_anteriores, datos_nuevos, descripcion_legible, origen, fecha)
            VALUES ($1, 'STOCK_AJUSTADO', 'productos', $2, $3, $4, $5, 'WEB', {NOW_TEXT})"#
     );
-    let _ = sqlx::query(&audit_sql)
+    sqlx::query(&audit_sql)
         .bind(a.usuario_id)
         .bind(a.producto_id)
         .bind(&json_ant)
         .bind(&json_new)
         .bind(&descr)
         .execute(&mut *tx)
-        .await;
+        .await?;
 
     tx.commit().await?;
     Ok(json!(true))
+}
+
+/// Tope de cordura para existencias (numeric(12,2) desborda arriba de
+/// 9,999,999,999.99 y Postgres respondería 500).
+pub(crate) const MAX_STOCK: f64 = 100_000_000.0;
+
+/// Existencias: número finito, no negativo (regla de la tienda: el stock nunca
+/// queda bajo cero; una venta lo frena en 0).
+fn validar_stock(stock: f64) -> Result<(), ApiError> {
+    if !stock.is_finite() || stock < 0.0 {
+        return Err(ApiError::BadRequest("El stock no puede ser negativo".into()));
+    }
+    if stock > MAX_STOCK {
+        return Err(ApiError::BadRequest("El stock capturado es demasiado grande".into()));
+    }
+    Ok(())
+}
+
+/// Precios y stock mínimo del formulario de producto.
+pub(crate) fn validar_numeros_producto(
+    precio_costo: f64,
+    precio_venta: f64,
+    stock_minimo: f64,
+) -> Result<(), ApiError> {
+    use crate::venta_calc::MAX_IMPORTE;
+    for (nombre, v) in [("costo", precio_costo), ("precio de venta", precio_venta)] {
+        if !v.is_finite() || v < 0.0 || v > MAX_IMPORTE {
+            return Err(ApiError::BadRequest(format!("El {} no es válido", nombre)));
+        }
+    }
+    if !stock_minimo.is_finite() || stock_minimo < 0.0 || stock_minimo > MAX_STOCK {
+        return Err(ApiError::BadRequest("El stock mínimo no puede ser negativo".into()));
+    }
+    Ok(())
+}
+
+/// La web acaba de CAMBIAR celdas FK de una fila que ya existía (dentro de la
+/// transacción del UPDATE). Si la fila la hizo el escritorio (uuid de 32 hex)
+/// y todavía no se repara (sin sync_fk_estado), sus FKs siguen siendo ids del
+/// escritorio, pero lo que escribió la web ya es un id de ESTE servidor: se
+/// anota en sync_fk_celda_web para que la reparación (sync_fk) no lo traduzca
+/// otra vez como si fuera del escritorio (p. ej. 'Frenos' → 'Suspensión').
+///
+/// Solo cuentan las columnas de tipo Tabla del mapa compartido (las Paso,
+/// como usuarios.rol_id, significan lo mismo en los dos lados). Filas hechas
+/// en la web o ya traducidas/reparadas no necesitan nada.
+pub(crate) async fn anotar_celdas_fk_web(
+    conn: &mut sqlx::PgConnection,
+    tabla: &str,
+    uuid: &str,
+    cambiadas: &[&str],
+) -> Result<(), ApiError> {
+    use crate::sync_fk_map::{es_uuid_escritorio, fks_de, RefKind};
+    if !es_uuid_escritorio(uuid) {
+        return Ok(());
+    }
+    let columnas: Vec<String> = cambiadas
+        .iter()
+        .filter(|c| {
+            fks_de(tabla)
+                .iter()
+                .any(|(col, k)| col == *c && matches!(k, RefKind::Tabla(_)))
+        })
+        .map(|c| c.to_string())
+        .collect();
+    if columnas.is_empty() {
+        return Ok(());
+    }
+    sqlx::query(
+        "INSERT INTO sync_fk_celda_web (tabla, uuid, columna) \
+         SELECT $1, $2, c FROM unnest($3::text[]) AS c \
+         WHERE NOT EXISTS (SELECT 1 FROM sync_fk_estado e WHERE e.tabla = $1 AND e.uuid = $2) \
+         ON CONFLICT (tabla, uuid, columna) DO NOTHING",
+    )
+    .bind(tabla)
+    .bind(uuid)
+    .bind(&columnas)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Columnas FK de catálogo de un producto que cambian entre lo guardado y lo
+/// que manda el formulario.
+pub(crate) fn fks_producto_cambiadas(
+    categoria_ant: Option<i64>,
+    proveedor_ant: Option<i64>,
+    categoria_nueva: Option<i64>,
+    proveedor_nuevo: Option<i64>,
+) -> Vec<&'static str> {
+    let mut v = Vec::new();
+    if categoria_ant != categoria_nueva {
+        v.push("categoria_id");
+    }
+    if proveedor_ant != proveedor_nuevo {
+        v.push("proveedor_id");
+    }
+    v
+}
+
+/// Producto (incluidos los eliminados) que ya usa `codigo`, distinto de
+/// `excepto_id`. Devuelve (nombre, eliminado).
+async fn producto_con_codigo(
+    conn: &mut sqlx::PgConnection,
+    codigo: &str,
+    excepto_id: Option<i64>,
+) -> Result<Option<(String, bool)>, ApiError> {
+    let row = sqlx::query(
+        "SELECT nombre, (deleted_at IS NOT NULL) AS eliminado FROM productos \
+         WHERE codigo = $1 AND ($2::bigint IS NULL OR id <> $2) \
+         ORDER BY deleted_at NULLS FIRST, id LIMIT 1",
+    )
+    .bind(codigo)
+    .bind(excepto_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(row.map(|r| (r.get::<String, _>("nombre"), r.get::<bool, _>("eliminado"))))
+}
+
+/// Rechaza un código que ya usa OTRO producto, incluso eliminado: en el POS de
+/// escritorio `productos.codigo` es UNIQUE también para filas borradas, así
+/// que un duplicado creado aquí nunca podría bajar a la caja. El candado
+/// asesor (por código) evita que dos altas simultáneas pasen la revisión.
+pub(crate) async fn verificar_codigo_libre(
+    conn: &mut sqlx::PgConnection,
+    codigo: &str,
+    excepto_id: Option<i64>,
+) -> Result<(), ApiError> {
+    sqlx::query("SELECT pg_advisory_xact_lock(7301102, hashtext($1))")
+        .bind(codigo)
+        .execute(&mut *conn)
+        .await?;
+    if let Some((nombre, eliminado)) = producto_con_codigo(conn, codigo, excepto_id).await? {
+        return Err(ApiError::BadRequest(if eliminado {
+            format!(
+                "El código '{}' ya lo usa el producto eliminado '{}'. Usa otro código.",
+                codigo, nombre
+            )
+        } else {
+            format!("El código '{}' ya lo usa el producto '{}'", codigo, nombre)
+        }));
+    }
+    Ok(())
 }
 
 async fn generar_codigo_interno(state: &AppState) -> Result<Value, ApiError> {
@@ -1103,7 +1415,6 @@ struct BuscarVentasArgs {
 
 async fn buscar_ventas(
     state: &AppState,
-    claims: &Claims,
     args: &Value,
 ) -> Result<Value, ApiError> {
     use rust_decimal::prelude::ToPrimitive;
@@ -1121,11 +1432,9 @@ async fn buscar_ventas(
     let fecha_inicio  = a.fecha_inicio.as_ref().filter(|s| !s.trim().is_empty()).cloned();
     let fecha_fin     = a.fecha_fin.as_ref().filter(|s| !s.trim().is_empty()).cloned();
 
-    // En modo individual el historial muestra solo ventas web (la caja del
-    // dispositivo). En modo espejo, todas — el web ve la historia compartida.
-    let modo = modo_caja_de(state, claims).await?;
-    let f_origen = if modo == "espejo" { "" } else { "AND v.origen = 'web'" };
-
+    // El historial es de solo lectura: muestra TODAS las ventas (escritorio y
+    // web, de cualquier caja). Cada fila trae `caja` y `origen` para que la
+    // pantalla ponga la etiqueta y decida si ofrece "Anular".
     // Subquery para filtrar por nombre/código de producto vendido. Solo se
     // aplica si vino articuloTexto. Mantener `$5::text IS NULL` evita
     // ejecutar la subquery cuando no hay filtro.
@@ -1143,6 +1452,7 @@ async fn buscar_ventas(
     let sql = format!(
         r#"
         SELECT v.id, v.folio, v.total, v.metodo_pago, v.anulada, v.fecha,
+               v.caja, v.origen,
                u.nombre_completo AS usuario_nombre,
                c.nombre AS cliente_nombre,
                COALESCE((SELECT COUNT(*) FROM venta_detalle vd
@@ -1152,7 +1462,6 @@ async fn buscar_ventas(
         LEFT JOIN usuarios u ON u.id = v.usuario_id
         LEFT JOIN clientes c ON c.id = v.cliente_id
         WHERE v.deleted_at IS NULL
-          {f_origen}
           AND ($1::text IS NULL OR lower(v.folio) LIKE $1)
           AND ($2::text IS NULL OR lower(COALESCE(c.nombre, '')) LIKE $2)
           AND ($3::text IS NULL OR substr(v.fecha, 1, 10) >= substr($3, 1, 10))
@@ -1189,6 +1498,8 @@ async fn buscar_ventas(
         "anulada":         r.get::<i32, _>("anulada") != 0,
         "fecha":           r.get::<String, _>("fecha"),
         "num_productos":   r.get::<i64, _>("num_productos"),
+        "caja":            r.get::<String, _>("caja"),
+        "origen":          r.get::<String, _>("origen"),
     })).collect::<Vec<_>>()))
 }
 
@@ -1209,7 +1520,6 @@ struct VentaIdArg {
 /// artículo) pero ignora `limite` y `offset` — siempre devuelve el total.
 async fn contar_ventas(
     state: &AppState,
-    claims: &Claims,
     args: &Value,
 ) -> Result<Value, ApiError> {
     let a: BuscarVentasArgs = serde_json::from_value(args.clone()).unwrap_or_default();
@@ -1222,16 +1532,12 @@ async fn contar_ventas(
     let fecha_inicio  = a.fecha_inicio.as_ref().filter(|s| !s.trim().is_empty()).cloned();
     let fecha_fin     = a.fecha_fin.as_ref().filter(|s| !s.trim().is_empty()).cloned();
 
-    let modo = modo_caja_de(state, claims).await?;
-    let f_origen = if modo == "espejo" { "" } else { "AND v.origen = 'web'" };
-
     let sql = format!(
         r#"
         SELECT COUNT(*)::bigint AS total
         FROM ventas v
         LEFT JOIN clientes c ON c.id = v.cliente_id
         WHERE v.deleted_at IS NULL
-          {f_origen}
           AND ($1::text IS NULL OR lower(v.folio) LIKE $1)
           AND ($2::text IS NULL OR lower(COALESCE(c.nombre, '')) LIKE $2)
           AND ($3::text IS NULL OR substr(v.fecha, 1, 10) >= substr($3, 1, 10))
@@ -1266,9 +1572,19 @@ async fn obtener_detalle_venta(state: &AppState, args: &Value) -> Result<Value, 
         SELECT v.id, v.folio, v.usuario_id, u.nombre_completo AS usuario_nombre,
                v.cliente_id, c.nombre AS cliente_nombre,
                v.subtotal, v.descuento, v.total, v.metodo_pago,
-               v.monto_recibido, v.cambio, v.anulada, v.motivo_anulacion, v.fecha
+               v.monto_recibido, v.cambio, v.anulada, v.motivo_anulacion, v.fecha,
+               ua.nombre_completo AS anulada_por_nombre, v.caja, v.origen,
+               -- Mismo criterio que crear_devolucion: solo devoluciones cuya
+               -- venta coincide con la de sus partidas.
+               (SELECT COALESCE(SUM(dv.total_devuelto), 0)::float8 FROM devoluciones dv
+                 WHERE dv.venta_id = v.id AND dv.deleted_at IS NULL
+                   AND EXISTS (SELECT 1 FROM devolucion_detalle dd
+                               JOIN venta_detalle vdd ON vdd.id = dd.venta_detalle_id
+                               WHERE dd.devolucion_id = dv.id AND vdd.venta_id = dv.venta_id))
+                 AS total_devuelto
         FROM ventas v
         LEFT JOIN usuarios u ON u.id = v.usuario_id
+        LEFT JOIN usuarios ua ON ua.id = v.anulada_por
         LEFT JOIN clientes c ON c.id = v.cliente_id
         WHERE v.id = $1 AND v.deleted_at IS NULL
         "#,
@@ -1288,9 +1604,16 @@ async fn obtener_detalle_venta(state: &AppState, args: &Value) -> Result<Value, 
         SELECT vd.id, vd.producto_id, p.codigo, p.nombre,
                vd.cantidad, vd.precio_original, vd.descuento_porcentaje,
                vd.descuento_monto, vd.precio_final, vd.subtotal,
+               -- Mismo filtro que crear_devolucion: solo devoluciones cuya
+               -- venta coincide con la de la partida (las del escritorio
+               -- todavía traen ids crudos que pueden apuntar a otra venta).
                COALESCE((SELECT SUM(dd.cantidad)
                          FROM devolucion_detalle dd
-                         WHERE dd.venta_detalle_id = vd.id), 0) AS cantidad_devuelta
+                         JOIN devoluciones dv ON dv.id = dd.devolucion_id
+                         WHERE dd.venta_detalle_id = vd.id
+                           AND dv.venta_id = vd.venta_id
+                           AND dd.deleted_at IS NULL
+                           AND dv.deleted_at IS NULL), 0) AS cantidad_devuelta
         FROM venta_detalle vd
         LEFT JOIN productos p ON p.id = vd.producto_id
         WHERE vd.venta_id = $1 AND vd.deleted_at IS NULL
@@ -1336,14 +1659,67 @@ async fn obtener_detalle_venta(state: &AppState, args: &Value) -> Result<Value, 
         "cambio":           dec(&v, "cambio"),
         "anulada":          v.get::<i32, _>("anulada") != 0,
         "motivo_anulacion": v.try_get::<Option<String>, _>("motivo_anulacion").ok().flatten(),
+        "anulada_por_nombre": v.try_get::<Option<String>, _>("anulada_por_nombre").ok().flatten(),
         "fecha":            v.get::<String, _>("fecha"),
         "items":            items_json,
+        "total_devuelto":   v.get::<f64, _>("total_devuelto"),
+        "caja":             v.get::<String, _>("caja"),
+        "origen":           v.get::<String, _>("origen"),
     }))
 }
 
 // =============================================================================
 // VENTAS — crear (write crítico)
 // =============================================================================
+
+/// Llaves de pg_advisory_xact_lock para los folios web (una por tabla).
+const LOCK_FOLIO_VENTAS: i64 = 7_301_100;
+const LOCK_FOLIO_DEVOLUCIONES: i64 = 7_301_101;
+
+/// Siguiente folio web `X-YYYYMMDD-NNNN` del día (hora de la tienda).
+///
+/// Antes era COUNT(*)+1: dos ventas simultáneas sacaban el mismo folio y el
+/// escritorio (folio UNIQUE) rechazaba la segunda para siempre. Ahora se
+/// serializa con un candado asesor de la transacción (se libera en el
+/// COMMIT/ROLLBACK) y se toma MAX(consecutivo)+1, contando también filas
+/// eliminadas (en el escritorio el UNIQUE las incluye).
+///
+/// Devuelve (folio, fecha). `fecha` es la de la fila: la que se pasa (caja
+/// 'web': `ahora_caja`, tomada bajo el candado de la caja) o, si no, el reloj
+/// real leído YA con el candado del folio (no now(), que es el inicio de la
+/// transacción). El día del folio sale de esa misma fecha.
+async fn siguiente_folio_web(
+    conn: &mut sqlx::PgConnection,
+    tabla: &str,
+    prefijo: char,
+    llave_candado: i64,
+    fecha: Option<&str>,
+) -> Result<(String, String), ApiError> {
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(llave_candado)
+        .execute(&mut *conn)
+        .await?;
+    let fecha = match fecha {
+        Some(f) => f.to_string(),
+        None => caja::reloj(&mut *conn).await?,
+    };
+    let hoy: String = fecha.get(..10).unwrap_or("").replace('-', "");
+    if hoy.len() != 8 {
+        return Err(ApiError::Other(anyhow::anyhow!("fecha inválida para folio: {fecha}")));
+    }
+    let base = format!("{}-{}-", prefijo, hoy);
+    // `tabla` es una constante del código (ventas/devoluciones), nunca input.
+    let sql = format!(
+        "SELECT COALESCE(MAX(substr(folio, $2)::bigint), 0)::bigint FROM {tabla} \
+         WHERE folio LIKE $1 AND substr(folio, $2) ~ '^[0-9]+$'"
+    );
+    let ultimo: i64 = sqlx::query_scalar(&sql)
+        .bind(format!("{}%", base))
+        .bind(base.chars().count() as i32 + 1)
+        .fetch_one(&mut *conn)
+        .await?;
+    Ok((format!("{}{:04}", base, ultimo + 1), fecha))
+}
 
 #[derive(Deserialize)]
 struct CrearVentaArgs {
@@ -1376,14 +1752,27 @@ struct ItemVentaWeb {
     descuento_monto: f64,
     precio_final: f64,
     subtotal: f64,
-    #[serde(default)] autorizado_por: Option<i64>,
+    /// Se IGNORA: quién autorizó lo decide el servidor (sesión admin o token
+    /// de `autorizar_descuento`). Se sigue aceptando para no romper bundles
+    /// viejos que lo mandan.
+    #[serde(default)]
+    #[allow(dead_code)]
+    autorizado_por: Option<i64>,
+    /// Token de `autorizar_descuento` cuando el descuento excede el límite
+    /// del vendedor. El desktop no lo conoce y lo ignora (serde no rechaza
+    /// campos desconocidos).
+    #[serde(default)]
+    autorizacion_token: Option<String>,
 }
 
 async fn crear_venta(
     state: &AppState,
-    _claims: &Claims,
+    claims: &Claims,
     args: Value,
 ) -> Result<Value, ApiError> {
+    use crate::venta_calc::{self, LineaCliente, MetodoPago, ReglaLinea, TotalesCliente};
+    use std::collections::HashMap;
+
     let a: CrearVentaArgs = serde_json::from_value(args)
         .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
     let d = a.venta;
@@ -1391,6 +1780,29 @@ async fn crear_venta(
     if d.items.is_empty() {
         return Err(ApiError::BadRequest("La venta no tiene items".into()));
     }
+    if d.items.len() > venta_calc::MAX_PARTIDAS {
+        return Err(ApiError::BadRequest(format!(
+            "La venta tiene demasiadas partidas (máximo {})", venta_calc::MAX_PARTIDAS)));
+    }
+    let metodo = MetodoPago::parse(&d.metodo_pago).ok_or_else(|| {
+        ApiError::BadRequest(format!("Método de pago inválido: '{}'", d.metodo_pago))
+    })?;
+    // El POS web no tiene presupuestos (listar_presupuestos es un stub y no
+    // existe obtener_detalle_presupuesto), así que ningún flujo legítimo del
+    // web manda esto. Además presupuesto_detalle.presupuesto_id de los
+    // presupuestos del desktop trae ids crudos de SQLite (no sirven aquí).
+    if d.presupuesto_origen_id.is_some() {
+        return Err(ApiError::BadRequest(
+            "Convertir presupuestos en venta solo está disponible en el POS de escritorio".into(),
+        ));
+    }
+
+    // Cajero = el de la sesión, no el del body.
+    let sesion = usuario_de_sesion(state, claims).await?;
+    avisar_usuario_distinto("crear_venta", d.usuario_id, &sesion);
+
+    let max_vendedor = max_descuento_vendedor(state).await?;
+    let caja_venta = caja::caja_de(&state.pool, claims).await?;
 
     // Sucursal: por ahora, web POS usa sucursal 1 (principal). Cuando haya
     // multi-sucursal per-user, se toma del claims del JWT.
@@ -1398,58 +1810,171 @@ async fn crear_venta(
 
     let mut tx = state.pool.begin().await?;
 
-    // Validación de stock (lock FOR UPDATE)
-    for it in &d.items {
-        let stock: Option<rust_decimal::Decimal> = sqlx::query_scalar(
-            "SELECT stock_actual FROM productos \
-             WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
-        )
-        .bind(it.producto_id)
-        .fetch_optional(&mut *tx)
-        .await?;
+    // Caja 'web': su candado va PRIMERO (antes que los de producto y el del
+    // folio) y la fecha sale de `ahora_caja`: ningún corte de esa caja puede
+    // quedar entre la fecha de la venta y su COMMIT. Caja de la tienda: la
+    // fecha es el reloj real al tomar el folio (si llega tarde al
+    // escritorio, él la re-fecha al siguiente corte).
+    let fecha_caja_web = if caja_venta == Caja::Web {
+        caja::bloquear(&mut tx, Caja::Web).await?;
+        Some(caja::ahora_caja(&mut tx, Caja::Web).await?)
+    } else {
+        None
+    };
 
-        let disponible = match stock {
-            Some(d) => {
-                use rust_decimal::prelude::ToPrimitive;
-                d.to_f64().unwrap_or(0.0)
-            }
-            None => return Err(ApiError::BadRequest(format!(
-                "Producto {} no existe", it.producto_id))),
-        };
-        if disponible < it.cantidad {
-            return Err(ApiError::BadRequest(format!(
-                "Stock insuficiente para producto {} (disponible: {}, pedido: {})",
-                it.producto_id, disponible, it.cantidad)));
+    // Cliente (si hay): debe existir (no eliminado); su descuento configurado
+    // por el dueño se acepta sin PIN (así funciona el carrito: al elegir el
+    // cliente se aplica su % a todas las partidas — ventaStore.seleccionarCliente).
+    // No se exige `activo`: el selector del POS lista también clientes
+    // inactivos y el escritorio les vende igual.
+    let pct_cliente: f64 = match d.cliente_id {
+        Some(cid) => {
+            let v: Option<rust_decimal::Decimal> = sqlx::query_scalar(
+                "SELECT descuento_porcentaje FROM clientes \
+                 WHERE id = $1 AND deleted_at IS NULL",
+            )
+            .bind(cid)
+            .fetch_optional(&mut *tx)
+            .await?;
+            dec_f64(v.ok_or_else(|| {
+                ApiError::BadRequest("El cliente de la venta no existe".into())
+            })?)
         }
+        None => 0.0,
+    };
+    let limite_normal = max_vendedor.max(pct_cliente);
+    let pct_libre = if sesion.es_admin { 100.0 } else { limite_normal };
+
+    // Productos: lock FOR UPDATE en orden de id (evita deadlocks entre dos
+    // ventas concurrentes con los mismos productos en distinto orden) y de
+    // paso leemos el precio vigente.
+    //
+    // NO se valida que haya stock suficiente: el POS permite vender sin
+    // existencias a propósito (el cajero tiene la pieza en mostrador aunque el
+    // sistema diga 0), igual que el desktop — ver `crear_venta` en
+    // src-tauri/src/commands/ventas.rs. Si aquí se rechazara, un producto
+    // sobrevendido en caja quedaría invendible desde la web para siempre.
+    let mut ids: Vec<i64> = d.items.iter().map(|i| i.producto_id).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let prod_rows = sqlx::query(
+        "SELECT id, nombre, precio_venta FROM productos \
+         WHERE id = ANY($1) AND deleted_at IS NULL \
+         ORDER BY id FOR UPDATE",
+    )
+    .bind(&ids)
+    .fetch_all(&mut *tx)
+    .await?;
+    let productos: HashMap<i64, (String, f64)> = prod_rows
+        .iter()
+        .map(|r| {
+            let precio = r
+                .try_get::<rust_decimal::Decimal, _>("precio_venta")
+                .map(dec_f64)
+                .unwrap_or(0.0);
+            (r.get::<i64, _>("id"), (r.get::<String, _>("nombre"), precio))
+        })
+        .collect();
+
+    // Reglas por partida + autorizaciones firmadas.
+    let mut lineas = Vec::with_capacity(d.items.len());
+    let mut reglas = Vec::with_capacity(d.items.len());
+    let mut duenos: Vec<Option<i64>> = Vec::with_capacity(d.items.len());
+    for it in &d.items {
+        let (nombre, precio_vigente) = productos
+            .get(&it.producto_id)
+            .cloned()
+            .ok_or_else(|| ApiError::BadRequest(format!("Producto {} no existe", it.producto_id)))?;
+
+        let aut = it
+            .autorizacion_token
+            .as_deref()
+            .filter(|t| !t.trim().is_empty())
+            .and_then(|t| {
+                crate::autorizacion::verificar(
+                    &state.jwt_secret, t, "descuento", sesion.id, Some(it.producto_id),
+                )
+            });
+
+        reglas.push(ReglaLinea {
+            nombre,
+            precios_validos: vec![precio_vigente],
+            pct_max_sin_autorizacion: pct_libre,
+            pct_autorizado: aut.as_ref().and_then(|c| c.max_pct),
+        });
+        duenos.push(aut.map(|c| c.dueno));
+        lineas.push(LineaCliente {
+            cantidad: it.cantidad,
+            precio_original: it.precio_original,
+            descuento_porcentaje: it.descuento_porcentaje,
+            descuento_monto: it.descuento_monto,
+            precio_final: it.precio_final,
+            subtotal: it.subtotal,
+        });
     }
 
-    // Generar folio consecutivo: V-YYYYMMDD-NNNN
-    let hoy: String = sqlx::query_scalar(
-        "SELECT to_char(now() AT TIME ZONE 'America/Mexico_City', 'YYYYMMDD')",
+    let calc = venta_calc::calcular(
+        &lineas,
+        &reglas,
+        &TotalesCliente {
+            subtotal: d.subtotal,
+            descuento: d.descuento,
+            total: d.total,
+            monto_recibido: d.monto_recibido,
+            cambio: d.cambio,
+        },
+        metodo,
     )
-    .fetch_one(&mut *tx)
-    .await?;
-    let count_hoy: i64 = sqlx::query_scalar(
-        r#"SELECT COUNT(*)::bigint FROM ventas
-           WHERE folio LIKE $1 AND deleted_at IS NULL"#,
+    .map_err(|e| ApiError::BadRequest(e.mensaje()))?;
+
+    // autorizado_por de cada partida:
+    //   - descuento aceptado por token → el dueño del token (si sigue activo
+    //     y sigue siendo admin al momento de cobrar);
+    //   - cajero admin con descuento arriba del límite normal → él mismo;
+    //   - en otro caso → NULL.
+    let mut autorizados: Vec<Option<i64>> = Vec::with_capacity(calc.lineas.len());
+    for (i, l) in calc.lineas.iter().enumerate() {
+        let quien = if l.uso_autorizacion {
+            let dueno = duenos[i].expect("uso_autorizacion implica token válido");
+            let sigue_admin: Option<i32> = sqlx::query_scalar(
+                "SELECT r.es_admin FROM usuarios u JOIN roles r ON r.id = u.rol_id \
+                 WHERE u.id = $1 AND u.activo = 1 AND u.deleted_at IS NULL",
+            )
+            .bind(dueno)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if sigue_admin != Some(1) {
+                return Err(ApiError::BadRequest(
+                    "DESCUENTO_NO_AUTORIZADO: quien autorizó el descuento ya no es dueño activo".into(),
+                ));
+            }
+            Some(dueno)
+        } else if sesion.es_admin && l.descuento_porcentaje > limite_normal + 1e-9 {
+            Some(sesion.id)
+        } else {
+            None
+        };
+        autorizados.push(quien);
+    }
+
+    // Generar folio consecutivo: V-YYYYMMDD-NNNN (y la fecha de la venta).
+    let (folio, fecha_venta) = siguiente_folio_web(
+        &mut tx, "ventas", 'V', LOCK_FOLIO_VENTAS, fecha_caja_web.as_deref(),
     )
-    .bind(format!("V-{}-%", hoy))
-    .fetch_one(&mut *tx)
     .await?;
-    let folio = format!("V-{}-{:04}", hoy, count_hoy + 1);
 
     let venta_uuid = uuid::Uuid::now_v7().to_string();
 
-    // Insertar venta. `origen='web'` deja claro que la creó el POS web; el
-    // corte la cuenta o la ignora según el modo de caja del dispositivo
-    // (espejo cuenta todas, individual filtra origen='web').
+    // Insertar venta con los importes RECALCULADOS. `origen='web'` = la creó
+    // el POS web; `caja` = el cajón donde entró el dinero (espejo → la tienda,
+    // cuenta en el corte del escritorio; individual → la caja web).
     let insert_sql = format!(
         r#"
         INSERT INTO ventas
           (uuid, sucursal_id, folio, usuario_id, cliente_id,
            subtotal, descuento, total, metodo_pago,
-           monto_recibido, cambio, anulada, origen, fecha, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 0, 'web', {NOW_TEXT}, {NOW_TEXT})
+           monto_recibido, cambio, anulada, origen, caja, fecha, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 0, 'web', $12, $13, {NOW_TEXT})
         RETURNING id, fecha
         "#
     );
@@ -1457,21 +1982,23 @@ async fn crear_venta(
         .bind(&venta_uuid)
         .bind(sucursal_id)
         .bind(&folio)
-        .bind(d.usuario_id)
+        .bind(sesion.id)
         .bind(d.cliente_id)
-        .bind(d.subtotal)
-        .bind(d.descuento)
-        .bind(d.total)
-        .bind(&d.metodo_pago)
-        .bind(d.monto_recibido)
-        .bind(d.cambio)
+        .bind(calc.subtotal)
+        .bind(calc.descuento)
+        .bind(calc.total)
+        .bind(metodo.as_str())
+        .bind(calc.monto_recibido)
+        .bind(calc.cambio)
+        .bind(caja_venta.as_str())
+        .bind(&fecha_venta)
         .fetch_one(&mut *tx)
         .await?;
     let venta_id: i64 = vrow.get("id");
     let fecha: String = vrow.get("fecha");
 
     // Insertar detalle + descontar stock
-    for it in &d.items {
+    for ((it, l), autorizado_por) in d.items.iter().zip(&calc.lineas).zip(&autorizados) {
         let det_uuid = uuid::Uuid::now_v7().to_string();
         let det_sql = format!(
             r#"
@@ -1486,22 +2013,26 @@ async fn crear_venta(
             .bind(&det_uuid)
             .bind(venta_id)
             .bind(it.producto_id)
-            .bind(it.cantidad)
-            .bind(it.precio_original)
-            .bind(it.descuento_porcentaje)
-            .bind(it.descuento_monto)
-            .bind(it.precio_final)
-            .bind(it.subtotal)
-            .bind(it.autorizado_por)
+            .bind(l.cantidad)
+            .bind(l.precio_original)
+            .bind(l.descuento_porcentaje)
+            .bind(l.descuento_monto)
+            .bind(l.precio_final)
+            .bind(l.subtotal)
+            .bind(*autorizado_por)
             .execute(&mut *tx)
             .await?;
 
+        // GREATEST(0, ...) replica el MAX(0, ...) del desktop: el stock se frena
+        // en cero en lugar de quedar negativo. Sin este clamp los dos backends
+        // dejarían valores distintos para la misma sobreventa y el sync LWW de
+        // `productos` (fila completa) los haría pelearse.
         let upd_sql = format!(
-            "UPDATE productos SET stock_actual = stock_actual - $1, \
+            "UPDATE productos SET stock_actual = GREATEST(0, stock_actual - $1), \
              updated_at = {NOW_TEXT} WHERE id = $2"
         );
         sqlx::query(&upd_sql)
-            .bind(it.cantidad)
+            .bind(l.cantidad)
             .bind(it.producto_id)
             .execute(&mut *tx)
             .await?;
@@ -1518,18 +2049,10 @@ async fn crear_venta(
         .await?;
     }
 
-    // Marcar presupuesto como convertido si aplica
-    if let Some(pid) = d.presupuesto_origen_id {
-        let upd_pres = format!(
-            "UPDATE presupuestos SET estado = 'convertido', venta_id = $1, \
-             updated_at = {NOW_TEXT} WHERE id = $2"
-        );
-        let _ = sqlx::query(&upd_pres)
-            .bind(venta_id)
-            .bind(pid)
-            .execute(&mut *tx)
-            .await;
-    }
+    // Sin fila 'VENTA' en audit_log por ahora: audit_log baja al escritorio
+    // con usuario_id/registro_id crudos (ids del servidor) y la bitácora de la
+    // caja mostraría otro usuario y otra venta. Se agrega cuando el sync
+    // traduzca esas columnas por uuid.
 
     // sync_cursor para la venta
     sqlx::query(
@@ -1548,8 +2071,8 @@ async fn crear_venta(
     Ok(json!({
         "id":     venta_id,
         "folio":  folio,
-        "total":  d.total,
-        "cambio": d.cambio,
+        "total":  calc.total,
+        "cambio": calc.cambio,
         "fecha":  fecha,
     }))
 }
@@ -1560,7 +2083,6 @@ async fn crear_venta(
 
 async fn obtener_estadisticas_dia(
     state: &AppState,
-    claims: &Claims,
     _args: &Value,
 ) -> Result<Value, ApiError> {
     use rust_decimal::prelude::ToPrimitive;
@@ -1570,11 +2092,8 @@ async fn obtener_estadisticas_dia(
     // El frontend hace `stats.total_ventas.toFixed(2)` etc., así que
     // CUALQUIER campo faltante revienta el render del Dashboard.
     //
-    // Modo individual: solo cuenta ventas web (la caja del usuario).
-    // Modo espejo:     cuenta todas las ventas (web + desktop unificados).
-    let modo = modo_caja_de(state, claims).await?;
-    let f_v = if modo == "espejo" { "" } else { "AND origen = 'web'" };
-    let f_v_alias = if modo == "espejo" { "" } else { "AND v.origen = 'web'" };
+    // Solo lectura: cuenta todas las ventas del día (escritorio y web, de
+    // cualquier caja), igual que el escritorio.
     let dec = |row: &sqlx::postgres::PgRow, name: &str| -> f64 {
         row.try_get::<rust_decimal::Decimal, _>(name).ok()
             .and_then(|d| d.to_f64()).unwrap_or(0.0)
@@ -1592,7 +2111,6 @@ async fn obtener_estadisticas_dia(
         WHERE deleted_at IS NULL AND anulada = 0
           AND substr(fecha, 1, 10)
               = to_char(now() AT TIME ZONE 'America/Mexico_City', 'YYYY-MM-DD')
-          {f_v}
         "#),
     )
     .fetch_one(&state.pool)
@@ -1610,7 +2128,6 @@ async fn obtener_estadisticas_dia(
          WHERE v.deleted_at IS NULL AND v.anulada = 0
            AND substr(v.fecha, 1, 10)
                = to_char(now() AT TIME ZONE 'America/Mexico_City', 'YYYY-MM-DD')
-           {f_v_alias}
          GROUP BY vd.producto_id, p.nombre
          ORDER BY qty DESC
          LIMIT 1
@@ -1728,8 +2245,10 @@ async fn login_password(state: &AppState, args: &Value) -> Result<Value, ApiErro
 /// Devuelve `(modo_caja, configurado)` donde `configurado=true` significa
 /// que el device ya había sido visto antes (no es la primera vez que entra).
 ///
-/// La primera vez se inserta con `modo_caja='individual'` por default y
-/// `configurado=false`, lo que dispara el modal de bienvenida en el frontend.
+/// La primera vez se inserta con `modo_caja='espejo'` (la web se usa como
+/// respaldo del mismo cajón de la tienda) y `configurado=false`, lo que
+/// dispara el modal de bienvenida en el frontend. Los equipos que ya
+/// existían conservan su modo.
 async fn upsert_pos_device(
     state: &AppState,
     device_uuid: &str,
@@ -1748,21 +2267,67 @@ async fn upsert_pos_device(
 
     sqlx::query(
         "INSERT INTO pos_devices (device_uuid, sucursal_id, nombre, modo_caja) \
-         VALUES ($1, 1, $2, 'individual') \
+         VALUES ($1, 1, $2, 'espejo') \
          ON CONFLICT (device_uuid) DO NOTHING",
     )
     .bind(device_uuid)
-    .bind(format!("Web {}", &device_uuid[..8.min(device_uuid.len())]))
+    .bind(format!("Web {}", prefijo_dispositivo(device_uuid)))
     .execute(&state.pool)
     .await?;
 
-    Ok(("individual".to_string(), false))
+    // Si otra pestaña lo creó al mismo tiempo, vale lo que quedó guardado.
+    let modo: Option<String> =
+        sqlx::query_scalar("SELECT modo_caja FROM pos_devices WHERE device_uuid = $1")
+            .bind(device_uuid)
+            .fetch_optional(&state.pool)
+            .await?;
+    Ok((modo.unwrap_or_else(|| "espejo".to_string()), false))
+}
+
+/// Primeros 8 caracteres del device_uuid (sin partir un carácter UTF-8).
+fn prefijo_dispositivo(uuid: &str) -> String {
+    uuid.chars().take(8).collect()
+}
+
+/// ¿Algún POS de escritorio con sync v2 (que sí aplica las filas web de la
+/// caja de la tienda) se reportó en los últimos 2 días? Informativo: si no,
+/// la web avisa que sus ventas no se verán en el corte del escritorio
+/// hasta que lo actualicen.
+async fn escritorio_recibe_web(state: &AppState) -> bool {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM pos_devices \
+                         WHERE protocolo >= 2 AND last_push_at > now() - interval '2 days')",
+    )
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!("escritorio_recibe_web: {e}");
+        false
+    })
+}
+
+/// Datos de caja que acompañan al modo del dispositivo (login y
+/// obtener_modo_caja): con qué caja trabaja y si en este equipo se hacen
+/// cortes y aperturas.
+async fn info_caja_de_modo(state: &AppState, modo: &str) -> Value {
+    let caja = if modo == "individual" { Caja::Web } else { Caja::Principal };
+    json!({
+        "caja": caja.as_str(),
+        "cortes_en_este_equipo": caja == Caja::Web,
+        "escritorio_recibe_web": escritorio_recibe_web(state).await,
+    })
 }
 
 /// Construye la respuesta `{ ok: true, usuario, token }` a partir de un row de usuarios.
 /// Si `device_uuid` viene del frontend, lo registra en `pos_devices` y lo
 /// embebe en los claims del JWT para que los handlers siguientes sepan
 /// qué modo de caja respetar.
+///
+/// El claim `device` de un token de sesión web NUNCA va vacío: sin
+/// dispositivo lleva el centinela `caja::DISPOSITIVO_SIN_EQUIPO`. /sync/*
+/// solo acepta tokens sin dispositivo (los de /auth/login del escritorio),
+/// así que un PIN de dueño ya no abre el sync (push de filas crudas, mapa de
+/// ids, reparación).
 async fn usuario_sesion_response(
     state: &AppState,
     r: &sqlx::postgres::PgRow,
@@ -1779,11 +2344,16 @@ async fn usuario_sesion_response(
     let rol_nombre = rol_nombre_por_id(state, rol_id).await;
     let permisos = permisos_de_rol(state, rol_id).await;
 
+    // Dispositivo real que mandó el frontend (vacío o el centinela = ninguno).
+    let dispositivo = device_uuid.filter(|u| caja::es_dispositivo_real(u));
+
     // Si vino device_uuid, asegurar fila en pos_devices y obtener su modo.
-    let (modo_caja, modo_configurado) = match device_uuid {
-        Some(uuid) if !uuid.trim().is_empty() => upsert_pos_device(state, uuid).await?,
-        _ => ("individual".to_string(), false),
+    // Sin dispositivo: caja de la tienda (espejo), igual que `caja_de`.
+    let (modo_caja, modo_configurado) = match dispositivo {
+        Some(uuid) => upsert_pos_device(state, uuid).await?,
+        None => ("espejo".to_string(), false),
     };
+    let info = info_caja_de_modo(state, &modo_caja).await;
 
     // JWT que el frontend usa para todas las RPC siguientes.
     let token = emitir_token_con_device(
@@ -1792,7 +2362,7 @@ async fn usuario_sesion_response(
         &nombre_usuario,
         if es_admin { "admin" } else { "device" },
         1,
-        device_uuid.map(|s| s.to_string()),
+        Some(dispositivo.unwrap_or(caja::DISPOSITIVO_SIN_EQUIPO).to_string()),
         chrono::Duration::days(7),
     )?;
 
@@ -1811,10 +2381,12 @@ async fn usuario_sesion_response(
         },
         // El frontend usa esta info para decidir si abrir el modal de bienvenida
         // y qué chip mostrar en el topbar. Si no hay device_uuid, queda
-        // 'individual' + configurado=true (no se muestra modal — comportamiento
-        // legado).
+        // 'espejo' + configurado=true (no se muestra modal).
         "modo_caja": modo_caja,
-        "modo_configurado": modo_configurado || device_uuid.is_none(),
+        "modo_configurado": modo_configurado || dispositivo.is_none(),
+        "caja": info["caja"],
+        "cortes_en_este_equipo": info["cortes_en_este_equipo"],
+        "escritorio_recibe_web": info["escritorio_recibe_web"],
     }))
 }
 
@@ -1825,6 +2397,45 @@ async fn resolver_dueno_por_pin(state: &AppState, args: &Value) -> Result<Value,
         Some(id) => json!(id),
         None     => Value::Null,
     })
+}
+
+/// Autoriza un descuento arriba del límite del vendedor (solo POS web).
+///
+/// Args (camelCase): `{ pin, productoId, porcentaje }`.
+/// Respuesta: `{ ok: true, autorizado_por, token }` o `{ ok: false, error }`.
+/// El token (ver `autorizacion.rs`) vale TTL_SEGUNDOS para ESTE cajero,
+/// ESTE producto y hasta ESTE porcentaje; `crear_venta` lo exige.
+async fn autorizar_descuento(
+    state: &AppState,
+    claims: &Claims,
+    args: &Value,
+) -> Result<Value, ApiError> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct A {
+        pin: String,
+        producto_id: i64,
+        porcentaje: f64,
+    }
+    let a: A = serde_json::from_value(args.clone())
+        .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
+    if !a.porcentaje.is_finite() || a.porcentaje <= 0.0 || a.porcentaje > 100.0 {
+        return Err(ApiError::BadRequest("Porcentaje de descuento inválido".into()));
+    }
+    let sesion = usuario_de_sesion(state, claims).await?;
+    let Some(dueno) = buscar_dueno_por_pin(state, a.pin.trim()).await? else {
+        return Ok(json!({ "ok": false, "error": "PIN del dueño incorrecto" }));
+    };
+    let token = crate::autorizacion::emitir(
+        &state.jwt_secret,
+        "descuento",
+        dueno,
+        sesion.id,
+        Some(a.producto_id),
+        Some(a.porcentaje),
+        chrono::Utc::now().timestamp(),
+    )?;
+    Ok(json!({ "ok": true, "autorizado_por": dueno, "token": token }))
 }
 
 // =============================================================================
@@ -1896,7 +2507,7 @@ async fn obtener_detalle_recepcion(state: &AppState, args: &Value) -> Result<Val
     })).collect::<Vec<_>>()))
 }
 
-async fn crear_recepcion(state: &AppState, args: Value) -> Result<Value, ApiError> {
+async fn crear_recepcion(state: &AppState, claims: &Claims, args: Value) -> Result<Value, ApiError> {
     #[derive(Deserialize)]
     struct A { recepcion: DatosRecepcionWeb }
     #[derive(Deserialize)]
@@ -1925,9 +2536,59 @@ async fn crear_recepcion(state: &AppState, args: Value) -> Result<Value, ApiErro
     if r.items.is_empty() {
         return Err(ApiError::BadRequest("La recepción no tiene items".into()));
     }
+    // Cordura de importes: la UI manda cantidad >= 1, costo >= 0 y
+    // precio_venta entero > 0 o null (Recepcion.tsx). Una cantidad negativa
+    // restaba stock y un costo negativo quedaba como costo del producto.
+    use crate::venta_calc::{round2, MAX_CANTIDAD, MAX_IMPORTE};
+    for it in &r.items {
+        if !it.cantidad.is_finite() || it.cantidad <= 0.0 || it.cantidad > MAX_CANTIDAD {
+            return Err(ApiError::BadRequest(format!(
+                "Cantidad inválida para el producto {}", it.producto_id)));
+        }
+        if !it.precio_costo.is_finite() || it.precio_costo < 0.0 || it.precio_costo > MAX_IMPORTE {
+            return Err(ApiError::BadRequest(format!(
+                "Costo inválido para el producto {}", it.producto_id)));
+        }
+        if let Some(pv) = it.precio_venta {
+            if !pv.is_finite() || pv < 0.0 || pv > MAX_IMPORTE {
+                return Err(ApiError::BadRequest(format!(
+                    "Precio de venta inválido para el producto {}", it.producto_id)));
+            }
+        }
+    }
+    let sesion = usuario_de_sesion(state, claims).await?;
+    avisar_usuario_distinto("crear_recepcion", r.usuario_id, &sesion);
 
     let sucursal_id: i64 = 1;
     let mut tx = state.pool.begin().await?;
+
+    // Todos los productos deben existir (antes un id inexistente dejaba una
+    // partida huérfana y el UPDATE de stock no hacía nada).
+    let mut ids: Vec<i64> = r.items.iter().map(|i| i.producto_id).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    // De paso se lee nombre y precio de venta vigentes para dejar en la
+    // bitácora los cambios de precio que haga esta recepción.
+    let prod_rows = sqlx::query(
+        "SELECT id, nombre, precio_venta FROM productos \
+         WHERE id = ANY($1) AND deleted_at IS NULL ORDER BY id FOR UPDATE",
+    )
+    .bind(&ids)
+    .fetch_all(&mut *tx)
+    .await?;
+    let mut precios: std::collections::HashMap<i64, (String, f64)> = prod_rows
+        .iter()
+        .map(|row| {
+            let pv = row
+                .try_get::<rust_decimal::Decimal, _>("precio_venta")
+                .map(dec_f64)
+                .unwrap_or(0.0);
+            (row.get::<i64, _>("id"), (row.get::<String, _>("nombre"), pv))
+        })
+        .collect();
+    if let Some(falta) = ids.iter().find(|id| !precios.contains_key(id)) {
+        return Err(ApiError::BadRequest(format!("Producto {} no existe", falta)));
+    }
 
     // Cabecera
     let recep_uuid = uuid::Uuid::now_v7().to_string();
@@ -1943,7 +2604,7 @@ async fn crear_recepcion(state: &AppState, args: Value) -> Result<Value, ApiErro
         .bind(&recep_uuid)
         .bind(sucursal_id)
         .bind(r.orden_id)
-        .bind(r.usuario_id)
+        .bind(sesion.id)
         .bind(r.proveedor_id)
         .bind(r.notas.as_deref())
         .fetch_one(&mut *tx)
@@ -1967,7 +2628,7 @@ async fn crear_recepcion(state: &AppState, args: Value) -> Result<Value, ApiErro
             .bind(recep_id)
             .bind(it.producto_id)
             .bind(it.cantidad)
-            .bind(it.precio_costo)
+            .bind(round2(it.precio_costo))
             .execute(&mut *tx)
             .await?;
 
@@ -1975,17 +2636,43 @@ async fn crear_recepcion(state: &AppState, args: Value) -> Result<Value, ApiErro
         // Si precio_venta viene None / 0, dejamos el existente intacto.
         let nuevo_pv = it.precio_venta.filter(|v| *v > 0.0);
         if let Some(pv) = nuevo_pv {
+            let pv = round2(pv);
             let upd_sql = format!(
                 "UPDATE productos SET stock_actual = stock_actual + $1, \
                  precio_costo = $2, precio_venta = $3, updated_at = {NOW_TEXT} WHERE id = $4"
             );
             sqlx::query(&upd_sql)
                 .bind(it.cantidad)
-                .bind(it.precio_costo)
+                .bind(round2(it.precio_costo))
                 .bind(pv)
                 .bind(it.producto_id)
                 .execute(&mut *tx)
                 .await?;
+
+            // Cambio de precio de venta → bitácora (historial_precios_producto
+            // la lee). Antes la recepción web cambiaba precios sin rastro.
+            if let Some((nombre, pv_ant)) = precios.get_mut(&it.producto_id) {
+                if (pv - *pv_ant).abs() > crate::venta_calc::EPS {
+                    let pa_sql = format!(
+                        r#"INSERT INTO audit_log
+                           (usuario_id, accion, tabla_afectada, registro_id,
+                            datos_anteriores, datos_nuevos, descripcion_legible, origen, fecha)
+                           VALUES ($1, 'PRECIO_ACTUALIZADO', 'productos', $2, $3, $4, $5, 'WEB', {NOW_TEXT})"#
+                    );
+                    sqlx::query(&pa_sql)
+                        .bind(sesion.id)
+                        .bind(it.producto_id)
+                        .bind(format!("{{\"precio_venta\":{:.2}}}", *pv_ant))
+                        .bind(format!("{{\"precio_venta\":{:.2}}}", pv))
+                        .bind(format!(
+                            "Precio de '{}' cambió de ${:.2} a ${:.2} (recepción)",
+                            nombre, *pv_ant, pv
+                        ))
+                        .execute(&mut *tx)
+                        .await?;
+                    *pv_ant = pv;
+                }
+            }
         } else {
             let upd_sql = format!(
                 "UPDATE productos SET stock_actual = stock_actual + $1, \
@@ -1993,7 +2680,7 @@ async fn crear_recepcion(state: &AppState, args: Value) -> Result<Value, ApiErro
             );
             sqlx::query(&upd_sql)
                 .bind(it.cantidad)
-                .bind(it.precio_costo)
+                .bind(round2(it.precio_costo))
                 .bind(it.producto_id)
                 .execute(&mut *tx)
                 .await?;
@@ -2017,12 +2704,12 @@ async fn crear_recepcion(state: &AppState, args: Value) -> Result<Value, ApiErro
                  SET cantidad_recibida = cantidad_recibida + $1, updated_at = {NOW_TEXT} \
                  WHERE orden_id = $2 AND producto_id = $3"
             );
-            let _ = sqlx::query(&upd_pd_sql)
+            sqlx::query(&upd_pd_sql)
                 .bind(it.cantidad)
                 .bind(oid)
                 .bind(it.producto_id)
                 .execute(&mut *tx)
-                .await;
+                .await?;
         }
     }
 
@@ -2036,19 +2723,30 @@ async fn crear_recepcion(state: &AppState, args: Value) -> Result<Value, ApiErro
         )
         .bind(oid)
         .fetch_one(&mut *tx)
-        .await
-        .unwrap_or_default();
+        .await?;
         let f64_falt = faltante.to_f64().unwrap_or(0.0);
         let nuevo_estado = if f64_falt <= 0.0 { "recibida_completa" } else { "recibida_parcial" };
         let upd_orden_sql = format!(
             "UPDATE ordenes_pedido SET estado = $1, fecha_recepcion = {NOW_TEXT}, \
              updated_at = {NOW_TEXT} WHERE id = $2"
         );
-        let _ = sqlx::query(&upd_orden_sql)
+        sqlx::query(&upd_orden_sql)
             .bind(nuevo_estado)
             .bind(oid)
             .execute(&mut *tx)
-            .await;
+            .await?;
+
+        // La orden (con sus partidas, que viajan como hijos) cambió: avisar
+        // al escritorio. Antes no se escribía cursor y el cambio no bajaba.
+        sqlx::query(
+            "INSERT INTO sync_cursor (tabla, uuid, sucursal_id, origen_device) \
+             SELECT 'ordenes_pedido', uuid, $1, $2 FROM ordenes_pedido WHERE id = $3",
+        )
+        .bind(sucursal_id)
+        .bind(WEB_ORIGIN)
+        .bind(oid)
+        .execute(&mut *tx)
+        .await?;
     }
 
     // sync_cursor para la recepción
@@ -2068,7 +2766,7 @@ async fn crear_recepcion(state: &AppState, args: Value) -> Result<Value, ApiErro
     let usuario_nombre: String = sqlx::query_scalar(
         "SELECT nombre_completo FROM usuarios WHERE id = $1",
     )
-    .bind(r.usuario_id)
+    .bind(sesion.id)
     .fetch_optional(&state.pool)
     .await?
     .unwrap_or_else(|| "—".into());
@@ -2213,282 +2911,378 @@ async fn obtener_detalle_devolucion(state: &AppState, args: &Value) -> Result<Va
     }))
 }
 
+/// Devolución recibida del frontend (`{ datos: {...} }`).
+#[derive(Deserialize)]
+struct NuevaDevolucionWeb {
+    venta_id: i64,
+    /// Se IGNORA: quien registra es el usuario de la sesión.
+    #[serde(default)]
+    usuario_id: Option<i64>,
+    /// Se IGNORA: el servidor no confía en el id que mande el navegador.
+    #[serde(default)]
+    #[allow(dead_code)]
+    autorizado_por: Option<i64>,
+    /// PIN del dueño (cajero no admin). Se verifica aquí. El escritorio no lo
+    /// conoce y lo ignora.
+    #[serde(default)]
+    pin_autorizacion: Option<String>,
+    /// true = se regresa en efectivo de la caja (RETIRO); false = por el
+    /// mismo medio (no sale de caja). Default igual que el escritorio:
+    /// efectivo solo si la venta fue en efectivo.
+    #[serde(default)]
+    reembolso_efectivo: Option<bool>,
+    motivo: String,
+    items: Vec<ItemDevolucionWeb>,
+}
+
+#[derive(Deserialize)]
+struct ItemDevolucionWeb {
+    venta_detalle_id: i64,
+    cantidad: f64,
+}
+
+/// Mensaje cuando una venta del escritorio todavía tiene FKs crudas aquí.
+const MSG_VENTA_SIN_SINCRONIZAR: &str =
+    "Esta venta todavía no está sincronizada correctamente; regístrala en el POS de escritorio";
+
+/// ¿Las FKs de esta fila (y sus hijos) ya están en ids del servidor? Las filas
+/// hechas en la web siempre; las del escritorio solo si el sync v2 las tradujo
+/// o la reparación las corrigió (sync_fk_estado).
+async fn fks_en_ids_del_servidor(
+    conn: &mut sqlx::PgConnection,
+    tabla: &str,
+    uuid: &str,
+) -> Result<bool, ApiError> {
+    if !crate::sync_fk_map::es_uuid_escritorio(uuid) {
+        return Ok(true);
+    }
+    Ok(sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM sync_fk_estado \
+                         WHERE tabla = $1 AND uuid = $2 AND estado IN ('traducido', 'reparado'))",
+    )
+    .bind(tabla)
+    .bind(uuid)
+    .fetch_one(&mut *conn)
+    .await?)
+}
+
 async fn crear_devolucion(
     state: &AppState,
     claims: &Claims,
     args: Value,
 ) -> Result<Value, ApiError> {
-    use rust_decimal::prelude::ToPrimitive;
-
     #[derive(Deserialize)]
     struct A {
         // El cliente desktop manda `{ datos: {...} }` (param de Tauri).
         datos: NuevaDevolucionWeb,
     }
-    #[derive(Deserialize)]
-    struct NuevaDevolucionWeb {
-        venta_id: i64,
-        usuario_id: i64,
-        #[serde(default)] autorizado_por: Option<i64>,
-        motivo: String,
-        items: Vec<ItemDevolucionWeb>,
-    }
-    #[derive(Deserialize)]
-    struct ItemDevolucionWeb {
-        venta_detalle_id: i64,
-        cantidad: f64,
-    }
-
     let a: A = serde_json::from_value(args)
         .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
     let d = a.datos;
 
+    let sesion = usuario_de_sesion(state, claims).await?;
+    if let Some(uid) = d.usuario_id {
+        avisar_usuario_distinto("crear_devolucion", uid, &sesion);
+    }
+
+    // Cajero no admin → PIN de un dueño, verificado AQUÍ (antes bastaba con
+    // que `autorizado_por` viniera no nulo, con cualquier id).
+    let autorizado_por: Option<i64> = if sesion.es_admin {
+        None
+    } else {
+        let pin = d.pin_autorizacion.as_deref().unwrap_or("").trim();
+        if pin.is_empty() {
+            return Err(ApiError::BadRequest(
+                "Se requiere autorización del dueño para registrar devoluciones".into(),
+            ));
+        }
+        match buscar_dueno_por_pin(state, pin).await? {
+            Some(id) => Some(id),
+            None => return Err(ApiError::BadRequest("PIN del dueño incorrecto".into())),
+        }
+    };
+
+    let caja_equipo = caja::caja_de(&state.pool, claims).await?;
+    let mut tx = state.pool.begin().await?;
+    // Caja 'web': candado primero y fecha de la caja. La de la tienda usa el
+    // reloj real al tomar el folio.
+    let ahora = if caja_equipo == Caja::Web {
+        caja::bloquear(&mut tx, Caja::Web).await?;
+        Some(caja::ahora_caja(&mut tx, Caja::Web).await?)
+    } else {
+        None
+    };
+    let creada = crear_devolucion_tx(
+        &mut tx, caja_equipo, sesion.id, autorizado_por, &d, ahora.as_deref(),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(creada)
+}
+
+/// Núcleo de la devolución (puerto de `crear_devolucion_core` del escritorio),
+/// dentro de la transacción del llamador. Con caja 'web' el llamador ya tomó
+/// el candado y pasa `ahora`; con la caja de la tienda `ahora` es None y la
+/// fecha sale del reloj real al tomar el folio.
+///
+/// Reglas:
+///   - partidas repetidas se agrupan antes de validar;
+///   - lo ya devuelto solo cuenta por pares (venta, partida) consistentes
+///     (las filas del escritorio con ids crudos no se cuelan);
+///   - si con esta devolución la venta queda completa se regresa exactamente
+///     lo cobrado (el cobro se redondeó al peso);
+///   - el RETIRO solo existe si el reembolso es en efectivo, y va a la caja
+///     del equipo que devuelve (de ahí sale el dinero);
+///   - un equipo con caja propia solo devuelve ventas de la caja web;
+///   - una venta hecha en el escritorio solo se devuelve aquí cuando sus FKs
+///     ya están en ids del servidor (si no, se devolvería stock a otro
+///     producto).
+async fn crear_devolucion_tx(
+    conn: &mut sqlx::PgConnection,
+    caja_equipo: Caja,
+    usuario_id: i64,
+    autorizado_por: Option<i64>,
+    d: &NuevaDevolucionWeb,
+    ahora: Option<&str>,
+) -> Result<Value, ApiError> {
     if d.motivo.trim().is_empty() {
         return Err(ApiError::BadRequest("El motivo es obligatorio".into()));
     }
     if d.items.is_empty() {
         return Err(ApiError::BadRequest("Debe incluir al menos un producto a devolver".into()));
     }
+    // Agrupar por partida: si la misma partida venía dos veces, cada renglón
+    // se validaba por separado contra lo ya devuelto y se podía devolver —y
+    // retirar de caja— más de lo vendido.
+    let mut por_partida: Vec<(i64, f64)> = Vec::new();
     for it in &d.items {
-        if it.cantidad <= 0.0 {
+        if !it.cantidad.is_finite() || it.cantidad <= 0.0
+            || it.cantidad > crate::venta_calc::MAX_CANTIDAD
+        {
             return Err(ApiError::BadRequest("Las cantidades deben ser mayores a 0".into()));
+        }
+        match por_partida.iter_mut().find(|(id, _)| *id == it.venta_detalle_id) {
+            Some((_, c)) => *c += it.cantidad,
+            None => por_partida.push((it.venta_detalle_id, it.cantidad)),
         }
     }
 
-    let sucursal_id: i64 = 1;
-    let modo = modo_caja_de(state, claims).await?;
-    let mut tx = state.pool.begin().await?;
-
-    // Verificar venta no anulada y obtener su folio + origen.
-    // En modo individual, NO permitimos devolver ventas que no son web —
-    // esas pertenecen a la caja del desktop.
+    // Venta no anulada (bloqueada: dos devoluciones simultáneas de la misma
+    // venta no pueden pasar ambas la validación de cantidades).
     let venta_row = sqlx::query(
-        "SELECT folio, origen FROM ventas \
-         WHERE id = $1 AND anulada = 0 AND deleted_at IS NULL",
+        "SELECT folio, uuid, caja, metodo_pago, total::float8 AS total FROM ventas \
+         WHERE id = $1 AND anulada = 0 AND deleted_at IS NULL FOR UPDATE",
     )
     .bind(d.venta_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut *conn)
     .await?
     .ok_or_else(|| ApiError::BadRequest("Venta no encontrada o está anulada".into()))?;
     let venta_folio: String = venta_row.get("folio");
-    let origen_venta: String = venta_row.try_get("origen").unwrap_or_else(|_| "desktop".to_string());
+    let venta_uuid: String = venta_row.get("uuid");
+    let caja_venta: String = venta_row.get("caja");
+    let metodo_venta: String = venta_row.get("metodo_pago");
+    let total_venta: f64 = venta_row.get("total");
 
-    if modo == "individual" && origen_venta != "web" {
+    if caja_equipo == Caja::Web && caja_venta != Caja::Web.as_str() {
         return Err(ApiError::BadRequest(
-            "Esta venta pertenece a otra caja (POS desktop). La devolución debe hacerse desde allá, o cambia tu modo a 'espejo'.".into(),
+            "Este equipo tiene caja propia: solo devuelve ventas de la caja web. Esta venta es de \
+             la caja de la tienda; regístrala en el POS de escritorio o en un equipo en modo espejo."
+                .into(),
         ));
     }
-
-    // Si el usuario no es admin/dueño, requiere autorizado_por.
-    // Postgres no tiene tabla `roles`; usamos la convención del POS:
-    // rol_id 1 = dueño, 2 = gerente (admin), 3 = vendedor.
-    let rol_id: i64 = sqlx::query_scalar(
-        "SELECT rol_id FROM usuarios WHERE id = $1 AND deleted_at IS NULL",
-    )
-    .bind(d.usuario_id)
-    .fetch_optional(&mut *tx)
-    .await?
-    .unwrap_or(3);
-    let es_admin = rol_es_admin(state, rol_id).await;
-
-    if !es_admin && d.autorizado_por.is_none() {
-        return Err(ApiError::BadRequest(
-            "Se requiere autorización del dueño para registrar devoluciones".into(),
-        ));
+    if !fks_en_ids_del_servidor(&mut *conn, "ventas", &venta_uuid).await? {
+        return Err(ApiError::BadRequest(MSG_VENTA_SIN_SINCRONIZAR.into()));
     }
+    let reembolso_efectivo = d.reembolso_efectivo.unwrap_or(metodo_venta == "efectivo");
 
-    // Validar cantidades contra cada venta_detalle
+    // Validar cantidades contra cada venta_detalle.
     let mut total_devuelto: f64 = 0.0;
     // (venta_detalle_id, producto_id, cantidad, precio_unitario, subtotal)
     let mut items_validados: Vec<(i64, i64, f64, f64, f64)> = Vec::new();
-
-    for item in &d.items {
+    for &(venta_detalle_id, cantidad) in &por_partida {
         let row = sqlx::query(
-            "SELECT venta_id, producto_id, cantidad, precio_final \
+            "SELECT venta_id, producto_id, cantidad::float8 AS cantidad, \
+                    precio_final::float8 AS precio_final \
              FROM venta_detalle \
-             WHERE id = $1 AND deleted_at IS NULL",
+             WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
         )
-        .bind(item.venta_detalle_id)
-        .fetch_optional(&mut *tx)
+        .bind(venta_detalle_id)
+        .fetch_optional(&mut *conn)
         .await?
         .ok_or_else(|| ApiError::BadRequest(
-            format!("Partida de venta no encontrada: id={}", item.venta_detalle_id)
+            format!("Partida de venta no encontrada: id={}", venta_detalle_id)
         ))?;
 
         let vd_venta_id: i64 = row.get("venta_id");
         let prod_id: i64 = row.get("producto_id");
-        let cantidad_orig: f64 = row.try_get::<rust_decimal::Decimal, _>("cantidad")
-            .ok().and_then(|d| d.to_f64()).unwrap_or(0.0);
-        let precio_final: f64 = row.try_get::<rust_decimal::Decimal, _>("precio_final")
-            .ok().and_then(|d| d.to_f64()).unwrap_or(0.0);
+        let cantidad_orig: f64 = row.get("cantidad");
+        let precio_final: f64 = row.get("precio_final");
 
         if vd_venta_id != d.venta_id {
-            return Err(ApiError::BadRequest(
-                "Una de las partidas no pertenece a la venta".into(),
-            ));
+            return Err(ApiError::BadRequest("Una de las partidas no pertenece a la venta".into()));
         }
 
-        let ya_devuelto: f64 = sqlx::query_scalar::<_, rust_decimal::Decimal>(
-            "SELECT COALESCE(SUM(cantidad), 0)::numeric \
-             FROM devolucion_detalle \
-             WHERE venta_detalle_id = $1 AND deleted_at IS NULL",
+        // Solo cuentan devoluciones cuya venta y partida coinciden: filas del
+        // escritorio con ids crudos pueden "apuntar" a esta partida siendo de
+        // otra venta (p. ej. D-000309 contra la única partida de una venta web).
+        let ya_devuelto: f64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(dd.cantidad), 0)::float8 \
+             FROM devolucion_detalle dd \
+             JOIN devoluciones dv ON dv.id = dd.devolucion_id \
+             WHERE dd.venta_detalle_id = $1 AND dv.venta_id = $2 \
+               AND dd.deleted_at IS NULL AND dv.deleted_at IS NULL",
         )
-        .bind(item.venta_detalle_id)
-        .fetch_one(&mut *tx)
-        .await
-        .ok()
-        .and_then(|d| d.to_f64())
-        .unwrap_or(0.0);
+        .bind(venta_detalle_id)
+        .bind(d.venta_id)
+        .fetch_one(&mut *conn)
+        .await?;
 
         let disponible = cantidad_orig - ya_devuelto;
-        if item.cantidad > disponible + 0.0001 {
+        if cantidad > disponible + 0.0001 {
             return Err(ApiError::BadRequest(format!(
                 "Cantidad excede lo disponible (vendido {}, ya devuelto {}, queda {})",
                 cantidad_orig, ya_devuelto, disponible
             )));
         }
 
-        let subtotal = item.cantidad * precio_final;
+        let subtotal = cantidad * precio_final;
         total_devuelto += subtotal;
-        items_validados.push((
-            item.venta_detalle_id, prod_id, item.cantidad, precio_final, subtotal,
-        ));
+        items_validados.push((venta_detalle_id, prod_id, cantidad, precio_final, subtotal));
     }
 
-    // Generar folio D-YYYYMMDD-NNNN (mismo patrón que ventas para evitar colisión
-    // con folios del desktop, que usan D-NNNNNN sin fecha).
-    let hoy: String = sqlx::query_scalar(
-        "SELECT to_char(now() AT TIME ZONE 'America/Mexico_City', 'YYYYMMDD')",
+    // Devolución que completa la venta: regresar exactamente lo cobrado (el
+    // cobro se redondeó al peso hacia arriba; si no, quedan centavos de
+    // sobrante en la caja).
+    let restantes = sqlx::query(
+        "SELECT vd.id, (vd.cantidad - COALESCE((SELECT SUM(dd.cantidad) FROM devolucion_detalle dd \
+                         JOIN devoluciones dv ON dv.id = dd.devolucion_id \
+                         WHERE dd.venta_detalle_id = vd.id AND dv.venta_id = vd.venta_id \
+                           AND dd.deleted_at IS NULL AND dv.deleted_at IS NULL), 0))::float8 AS restante \
+         FROM venta_detalle vd WHERE vd.venta_id = $1 AND vd.deleted_at IS NULL",
     )
-    .fetch_one(&mut *tx)
+    .bind(d.venta_id)
+    .fetch_all(&mut *conn)
     .await?;
-    let count_hoy: i64 = sqlx::query_scalar(
-        r#"SELECT COUNT(*)::bigint FROM devoluciones
-           WHERE folio LIKE $1 AND deleted_at IS NULL"#,
-    )
-    .bind(format!("D-{}-%", hoy))
-    .fetch_one(&mut *tx)
-    .await?;
-    let folio = format!("D-{}-{:04}", hoy, count_hoy + 1);
-
-    // Insertar devolución
-    let dev_uuid = uuid::Uuid::now_v7().to_string();
-    let ins_sql = format!(
-        r#"
-        INSERT INTO devoluciones
-          (uuid, sucursal_id, folio, venta_id, usuario_id, autorizado_por,
-           motivo, total_devuelto, fecha, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, {NOW_TEXT}, {NOW_TEXT})
-        RETURNING id, fecha
-        "#
-    );
-    let drow = sqlx::query(&ins_sql)
-        .bind(&dev_uuid)
-        .bind(sucursal_id)
-        .bind(&folio)
+    let pendiente_tras_esta: f64 = restantes
+        .iter()
+        .map(|r| {
+            let id: i64 = r.get("id");
+            let restante: f64 = r.get("restante");
+            let ahora = por_partida.iter().find(|(p, _)| *p == id).map(|(_, c)| *c).unwrap_or(0.0);
+            (restante - ahora).max(0.0)
+        })
+        .sum();
+    if pendiente_tras_esta < 0.0001 {
+        let devuelto_antes: f64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(dv.total_devuelto), 0)::float8 FROM devoluciones dv \
+             WHERE dv.venta_id = $1 AND dv.deleted_at IS NULL \
+               AND EXISTS (SELECT 1 FROM devolucion_detalle dd \
+                           JOIN venta_detalle vd ON vd.id = dd.venta_detalle_id \
+                           WHERE dd.devolucion_id = dv.id AND vd.venta_id = dv.venta_id)",
+        )
         .bind(d.venta_id)
-        .bind(d.usuario_id)
-        .bind(d.autorizado_por)
-        .bind(&d.motivo)
-        .bind(total_devuelto)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut *conn)
         .await?;
-    let devolucion_id: i64 = drow.get("id");
-    let fecha: String = drow.get("fecha");
+        total_devuelto = (total_venta - devuelto_antes).max(0.0);
+    }
+    let total_devuelto = caja::round2(total_devuelto);
+    // Stock en orden de producto (como crear_venta): dos operaciones que
+    // tocan los mismos productos no se bloquean en orden cruzado.
+    items_validados.sort_by_key(|it| it.1);
 
-    // Insertar detalle + restaurar stock
+    // Folio D-YYYYMMDD-NNNN (los del escritorio son D-NNNNNN, no chocan) y
+    // fecha de la devolución.
+    let (folio, fecha) =
+        siguiente_folio_web(&mut *conn, "devoluciones", 'D', LOCK_FOLIO_DEVOLUCIONES, ahora).await?;
+
+    let dev_uuid = uuid::Uuid::now_v7().to_string();
+    let devolucion_id: i64 = sqlx::query_scalar(&format!(
+        "INSERT INTO devoluciones \
+           (uuid, sucursal_id, folio, venta_id, usuario_id, autorizado_por, \
+            motivo, total_devuelto, fecha, updated_at) \
+         VALUES ($1, 1, $2, $3, $4, $5, $6, $7, $8, {NOW_TEXT}) \
+         RETURNING id"
+    ))
+    .bind(&dev_uuid)
+    .bind(&folio)
+    .bind(d.venta_id)
+    .bind(usuario_id)
+    .bind(autorizado_por)
+    .bind(&d.motivo)
+    .bind(total_devuelto)
+    .bind(&fecha)
+    .fetch_one(&mut *conn)
+    .await?;
+
+    // Detalle + stock. Se suma la cantidad devuelta completa: la pieza
+    // regresa al anaquel aunque la venta haya frenado el stock en 0.
     for (vd_id, prod_id, cantidad, precio, subtotal) in &items_validados {
-        let det_uuid = uuid::Uuid::now_v7().to_string();
-        let det_sql = format!(
-            r#"
-            INSERT INTO devolucion_detalle
-              (uuid, devolucion_id, venta_detalle_id, producto_id,
-               cantidad, precio_unitario, subtotal, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, {NOW_TEXT})
-            "#
-        );
-        sqlx::query(&det_sql)
-            .bind(&det_uuid)
-            .bind(devolucion_id)
-            .bind(vd_id)
-            .bind(prod_id)
-            .bind(cantidad)
-            .bind(precio)
-            .bind(subtotal)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(&format!(
+            "INSERT INTO devolucion_detalle \
+               (uuid, devolucion_id, venta_detalle_id, producto_id, \
+                cantidad, precio_unitario, subtotal, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, {NOW_TEXT})"
+        ))
+        .bind(uuid::Uuid::now_v7().to_string())
+        .bind(devolucion_id)
+        .bind(vd_id)
+        .bind(prod_id)
+        .bind(cantidad)
+        .bind(precio)
+        .bind(caja::round2(*subtotal))
+        .execute(&mut *conn)
+        .await?;
 
-        let upd_sql = format!(
+        sqlx::query(&format!(
             "UPDATE productos SET stock_actual = stock_actual + $1, \
              updated_at = {NOW_TEXT} WHERE id = $2"
-        );
-        sqlx::query(&upd_sql)
-            .bind(cantidad)
-            .bind(prod_id)
-            .execute(&mut *tx)
-            .await?;
+        ))
+        .bind(cantidad)
+        .bind(prod_id)
+        .execute(&mut *conn)
+        .await?;
 
-        // sync_cursor productos (stock cambió)
         sqlx::query(
             "INSERT INTO sync_cursor (tabla, uuid, sucursal_id, origen_device) \
-             SELECT 'productos', p.uuid, $1, $2 FROM productos p WHERE p.id = $3",
+             SELECT 'productos', p.uuid, 1, $1 FROM productos p WHERE p.id = $2",
         )
-        .bind(sucursal_id)
         .bind(WEB_ORIGIN)
         .bind(*prod_id)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
     }
 
-    // Movimiento de caja (RETIRO) por el monto devuelto
-    let concepto = format!(
-        "Devolución {} de venta {} — {}",
-        folio, venta_folio, d.motivo
-    );
-    let mov_uuid = uuid::Uuid::now_v7().to_string();
-    let mov_sql = format!(
-        r#"
-        INSERT INTO movimientos_caja
-          (uuid, sucursal_id, tipo, usuario_id, monto, concepto,
-           autorizado_por, fecha, updated_at)
-        VALUES ($1, $2, 'RETIRO', $3, $4, $5, $6, {NOW_TEXT}, {NOW_TEXT})
-        RETURNING id
-        "#
-    );
-    let mrow = sqlx::query(&mov_sql)
-        .bind(&mov_uuid)
-        .bind(sucursal_id)
-        .bind(d.usuario_id)
-        .bind(total_devuelto)
-        .bind(&concepto)
-        .bind(d.autorizado_por)
-        .fetch_one(&mut *tx)
+    // El reembolso solo mueve la caja si se paga en efectivo, y sale de la
+    // caja del equipo que lo entrega.
+    if reembolso_efectivo && total_devuelto > 0.0 {
+        let concepto = format!("Devolución {} de venta {} — {}", folio, venta_folio, d.motivo);
+        let (mov_id, _) = caja::insertar_movimiento(
+            &mut *conn, caja_equipo, "RETIRO", usuario_id, total_devuelto, &concepto,
+            autorizado_por, None, &fecha,
+        )
         .await?;
-    let mov_id: i64 = mrow.get("id");
+        sqlx::query("UPDATE devoluciones SET movimiento_caja_id = $1 WHERE id = $2")
+            .bind(mov_id)
+            .bind(devolucion_id)
+            .execute(&mut *conn)
+            .await?;
+    }
+    caja::registrar_cursor(&mut *conn, "devoluciones", &dev_uuid).await?;
 
-    // Vincular movimiento a la devolución
-    sqlx::query(
-        "UPDATE devoluciones SET movimiento_caja_id = $1 WHERE id = $2",
+    let medio = if reembolso_efectivo { "efectivo de caja" } else { "mismo medio de pago (no sale de caja)" };
+    caja::bitacora(
+        &mut *conn,
+        usuario_id,
+        "DEVOLUCION",
+        "devoluciones",
+        Some(devolucion_id),
+        &format!(
+            "Devolución {} de venta {} — ${:.2} reembolsado en {} — {}",
+            folio, venta_folio, total_devuelto, medio, d.motivo
+        ),
+        &fecha,
     )
-    .bind(mov_id)
-    .bind(devolucion_id)
-    .execute(&mut *tx)
     .await?;
-
-    // sync_cursor para devolución y movimiento
-    sqlx::query(
-        "INSERT INTO sync_cursor (tabla, uuid, sucursal_id, origen_device) \
-         VALUES ('devoluciones', $1, $2, $3), \
-                ('movimientos_caja', $4, $2, $3)",
-    )
-    .bind(&dev_uuid)
-    .bind(sucursal_id)
-    .bind(WEB_ORIGIN)
-    .bind(&mov_uuid)
-    .execute(&mut *tx)
-    .await?;
-
-    tx.commit().await?;
 
     Ok(json!({
         "id":             devolucion_id,
@@ -2705,6 +3499,9 @@ async fn cambiar_estado_orden(state: &AppState, args: &Value) -> Result<Value, A
     let a: A = serde_json::from_value(args.clone())
         .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
 
+    // UPDATE + sync_cursor en una transacción: si el cursor fallara, el
+    // cambio de estado nunca bajaría al escritorio.
+    let mut tx = state.pool.begin().await?;
     let upd_sql = format!(
         "UPDATE ordenes_pedido SET estado = $1, updated_at = {NOW_TEXT} \
          WHERE id = $2 AND deleted_at IS NULL"
@@ -2712,7 +3509,7 @@ async fn cambiar_estado_orden(state: &AppState, args: &Value) -> Result<Value, A
     let affected = sqlx::query(&upd_sql)
         .bind(&a.nuevo_estado)
         .bind(a.orden_id)
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected();
     if affected == 0 {
@@ -2720,171 +3517,35 @@ async fn cambiar_estado_orden(state: &AppState, args: &Value) -> Result<Value, A
     }
 
     // Propagar al sync_cursor
-    let _ = sqlx::query(
+    sqlx::query(
         "INSERT INTO sync_cursor (tabla, uuid, sucursal_id, origen_device) \
          SELECT 'ordenes_pedido', uuid, 1, $1 FROM ordenes_pedido WHERE id = $2",
     )
     .bind(WEB_ORIGIN)
     .bind(a.orden_id)
-    .execute(&state.pool)
-    .await;
+    .execute(&mut *tx)
+    .await?;
 
+    tx.commit().await?;
     Ok(json!(true))
 }
 
 // =============================================================================
-// APERTURA DE CAJA
-// =============================================================================
-
-async fn obtener_apertura_hoy(state: &AppState, claims: &Claims) -> Result<Value, ApiError> {
-    use rust_decimal::prelude::ToPrimitive;
-    // En modo 'individual' filtramos por origen='web' (la "caja web" tiene su
-    // propio ciclo independiente del desktop). En modo 'espejo' no filtramos —
-    // si el desktop ya abrió hoy, esa apertura cuenta también para el web.
-    let modo = modo_caja_de(state, claims).await?;
-    let filtro_origen = if modo == "espejo" { "" } else { "AND a.origen = 'web'" };
-
-    let sql = format!(
-        r#"
-        SELECT a.id, a.usuario_id, u.nombre_completo AS usuario_nombre,
-               a.fondo_declarado, a.nota, a.fecha
-        FROM aperturas_caja a
-        JOIN usuarios u ON u.id = a.usuario_id
-        WHERE a.deleted_at IS NULL
-          {filtro_origen}
-          AND substr(a.fecha, 1, 10)
-              = to_char(now() AT TIME ZONE 'America/Mexico_City', 'YYYY-MM-DD')
-        ORDER BY a.id DESC LIMIT 1
-        "#
-    );
-    let row = sqlx::query(&sql)
-    .fetch_optional(&state.pool)
-    .await?;
-
-    Ok(match row {
-        None => Value::Null,
-        Some(r) => json!({
-            "id":              r.get::<i64, _>("id"),
-            "usuario_id":      r.get::<i64, _>("usuario_id"),
-            "usuario_nombre":  r.get::<String, _>("usuario_nombre"),
-            "fondo_declarado": r.try_get::<rust_decimal::Decimal, _>("fondo_declarado")
-                                  .ok().and_then(|d| d.to_f64()).unwrap_or(0.0),
-            "nota":            r.try_get::<Option<String>, _>("nota").ok().flatten(),
-            "fecha":           r.get::<String, _>("fecha"),
-        }),
-    })
-}
-
-async fn crear_apertura_caja(
-    state: &AppState,
-    claims: &Claims,
-    args: &Value,
-) -> Result<Value, ApiError> {
-    #[derive(Deserialize)]
-    struct A {
-        datos: NuevaAperturaWeb,
-    }
-    #[derive(Deserialize)]
-    struct NuevaAperturaWeb {
-        usuario_id: i64,
-        fondo_declarado: f64,
-        #[serde(default)] nota: Option<String>,
-    }
-    let a: A = serde_json::from_value(args.clone())
-        .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
-    let d = a.datos;
-
-    if d.fondo_declarado < 0.0 {
-        return Err(ApiError::BadRequest("El fondo no puede ser negativo".into()));
-    }
-
-    // Modo 'individual': solo bloqueamos si YA hay una apertura web hoy
-    //   (la del desktop es otra caja).
-    // Modo 'espejo':     bloqueamos si hay CUALQUIER apertura hoy (web o
-    //   desktop) — el web está compartiendo la caja del desktop.
-    let modo = modo_caja_de(state, claims).await?;
-    let filtro_origen = if modo == "espejo" { "" } else { "AND origen = 'web'" };
-
-    let existe_sql = format!(
-        "SELECT COUNT(*)::bigint FROM aperturas_caja \
-         WHERE deleted_at IS NULL {filtro_origen} \
-           AND substr(fecha, 1, 10) \
-               = to_char(now() AT TIME ZONE 'America/Mexico_City', 'YYYY-MM-DD')"
-    );
-    let existe: i64 = sqlx::query_scalar(&existe_sql)
-    .fetch_one(&state.pool)
-    .await?;
-    if existe > 0 {
-        let msg = if modo == "espejo" {
-            "Ya existe una apertura de caja para hoy (compartida con el POS desktop)"
-        } else {
-            "Ya existe una apertura de caja web para hoy"
-        };
-        return Err(ApiError::BadRequest(msg.into()));
-    }
-
-    let sucursal_id: i64 = 1;
-    let new_uuid = uuid::Uuid::now_v7().to_string();
-    let sql = format!(
-        r#"
-        INSERT INTO aperturas_caja
-          (uuid, sucursal_id, usuario_id, fondo_declarado, nota, origen, fecha, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, {NOW_TEXT}, {NOW_TEXT})
-        RETURNING id, fecha
-        "#
-    );
-    let row = sqlx::query(&sql)
-        .bind(&new_uuid)
-        .bind(sucursal_id)
-        .bind(d.usuario_id)
-        .bind(d.fondo_declarado)
-        .bind(d.nota.as_deref())
-        .bind(ORIGEN_WEB)
-        .fetch_one(&state.pool)
-        .await?;
-
-    // sync_cursor para que el desktop la jale
-    sqlx::query(
-        "INSERT INTO sync_cursor (tabla, uuid, sucursal_id, origen_device) \
-         VALUES ('aperturas_caja', $1, $2, $3)",
-    )
-    .bind(&new_uuid)
-    .bind(sucursal_id)
-    .bind(WEB_ORIGIN)
-    .execute(&state.pool)
-    .await?;
-
-    let id: i64       = row.get("id");
-    let fecha: String = row.get("fecha");
-
-    // Nombre del usuario (para devolver shape completa)
-    let nombre: String = sqlx::query_scalar(
-        "SELECT nombre_completo FROM usuarios WHERE id = $1",
-    )
-    .bind(d.usuario_id)
-    .fetch_optional(&state.pool)
-    .await?
-    .unwrap_or_default();
-
-    Ok(json!({
-        "id":              id,
-        "usuario_id":      d.usuario_id,
-        "usuario_nombre":  nombre,
-        "fondo_declarado": d.fondo_declarado,
-        "nota":            d.nota,
-        "fecha":           fecha,
-    }))
-}
-
-// =============================================================================
-// CORTES DE CAJA — módulo completo (web only, origen='web')
+// CAJA — aperturas, movimientos y cortes (motor en caja.rs)
 // =============================================================================
 //
-// Filtros: TODOS los queries de cortes/movimientos en este módulo agregan
-//   `WHERE origen = 'web'`
-// para mantener la caja web independiente del flujo desktop. El desktop ya
-// hizo sus cortes en SQLite y los pushea a postgres con origen='desktop' —
-// no los queremos contar ni mezclar aquí.
+// Envolturas delgadas sobre caja.rs, con la misma forma de respuesta que los
+// comandos del escritorio. La caja la decide el modo del dispositivo
+// (`caja::caja_de`):
+//   - modo individual → caja 'web': cadena propia que calcula y escribe este
+//     servidor (candado por caja + reloj que nunca va hacia atrás);
+//   - espejo o token sin dispositivo → caja de la tienda ('principal'): aquí
+//     solo se LEE (vista previa, historial, auditoría "según lo
+//     sincronizado"); sus cortes y aperturas los hace el escritorio. Las
+//     ventas, entradas/retiros y devoluciones de estos equipos sí entran a
+//     esa caja y bajan al escritorio, que las cuenta en su corte.
+// Quien registra es siempre el usuario de la sesión; el usuario_id del body
+// se ignora.
 
 /// Helper local: f64 desde columna NUMERIC.
 fn pg_dec(row: &sqlx::postgres::PgRow, name: &str) -> f64 {
@@ -2893,93 +3554,102 @@ fn pg_dec(row: &sqlx::postgres::PgRow, name: &str) -> f64 {
         .and_then(|d| d.to_f64()).unwrap_or(0.0)
 }
 
-const RETIRO_LIMITE_SIN_PIN: f64 = 500.0;
-
-// =============================================================================
-// MODO DE CAJA (espejo vs individual)
-// =============================================================================
-//
-// Cada navegador web declara su modo en `pos_devices.modo_caja` (ver
-// migración 005). Los handlers de aperturas/movimientos/cortes/cálculo
-// resuelven el modo del cliente actual y deciden si filtrar por
-// `origen='web'` o no:
-//
-//   - 'individual': el web es su propia caja → filtrar todo por
-//     origen='web'. Las ventas, fondos y cortes del desktop no le importan.
-//
-//   - 'espejo':     el web es otra ventana de la caja del desktop →
-//     contar TODO sin filtrar por origen. Apertura, ventas, movimientos
-//     y cortes se comparten.
-//
-// Cuando el JWT no trae `device` (tokens viejos o flujos sin login web),
-// se asume 'individual' como default seguro — replica el comportamiento
-// previo a esta feature.
-
-/// Resuelve el modo de caja para el cliente que hizo esta llamada RPC.
-/// Hace un SELECT a `pos_devices`. Cacheado: nada — la BD lo resuelve en
-/// microsegundos por índice unique.
-async fn modo_caja_de(state: &AppState, claims: &Claims) -> ApiResult<String> {
-    let Some(uuid) = claims.device.as_deref() else {
-        return Ok("individual".to_string());
-    };
-    if uuid.trim().is_empty() {
-        return Ok("individual".to_string());
+/// Rechaza escrituras a la cadena de la caja de la tienda.
+fn exigir_caja_web(caja: Caja) -> Result<(), ApiError> {
+    if caja == Caja::Web {
+        Ok(())
+    } else {
+        Err(ApiError::BadRequest(caja::MSG_PRINCIPAL_SOLO_ESCRITORIO.into()))
     }
-    let modo: Option<String> = sqlx::query_scalar(
-        "SELECT modo_caja FROM pos_devices WHERE device_uuid = $1",
-    )
-    .bind(uuid)
-    .fetch_optional(&state.pool)
-    .await?;
-    Ok(modo.unwrap_or_else(|| "individual".to_string()))
 }
 
-/// Lee el modo actual del dispositivo + flag de "ya configurado".
-/// `configurado=false` solo cuando el frontend acaba de generar un device_uuid
-/// nuevo y aún no lo ha visto antes esta máquina; el frontend usa esa señal
-/// para abrir el modal de bienvenida.
-async fn obtener_modo_caja(state: &AppState, claims: &Claims) -> Result<Value, ApiError> {
-    let Some(uuid) = claims.device.as_deref() else {
-        // Sin device en el JWT: el frontend no mandó deviceUuid al login.
-        // Lo tratamos como "individual configurado" — flujo legado, sin modal.
-        return Ok(json!({
-            "modo": "individual",
-            "configurado": true,
-            "device_uuid": null,
-        }));
-    };
+async fn obtener_apertura_hoy(state: &AppState, claims: &Claims) -> Result<Value, ApiError> {
+    let caja = caja::caja_de(&state.pool, claims).await?;
+    let mut conn = state.pool.acquire().await?;
+    let ahora = caja::reloj(&mut conn).await?;
+    a_json(caja::apertura_del_dia(&mut conn, caja, &ahora[..10]).await?)
+}
 
-    let row = sqlx::query(
-        "SELECT modo_caja, nombre, created_at FROM pos_devices WHERE device_uuid = $1",
-    )
-    .bind(uuid)
-    .fetch_optional(&state.pool)
-    .await?;
-
-    match row {
-        Some(r) => Ok(json!({
-            "modo":          r.get::<String, _>("modo_caja"),
-            "configurado":   true,
-            "device_uuid":   uuid,
-            "nombre":        r.try_get::<Option<String>, _>("nombre").ok().flatten(),
-        })),
-        None => Ok(json!({
-            "modo":        "individual",
-            "configurado": false,
-            "device_uuid": uuid,
-        })),
+/// Apertura del día de la caja 'web': conteo de verificación contra lo
+/// esperado; si difiere exige nota y registra un movimiento de ajuste.
+async fn crear_apertura_caja(
+    state: &AppState,
+    claims: &Claims,
+    args: &Value,
+) -> Result<Value, ApiError> {
+    #[derive(Deserialize)]
+    struct A {
+        datos: caja::NuevaApertura,
     }
+    let a: A = serde_json::from_value(args.clone())
+        .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
+    let caja_equipo = caja::caja_de(&state.pool, claims).await?;
+    exigir_caja_web(caja_equipo)?;
+    let sesion = usuario_de_sesion(state, claims).await?;
+    if let Some(uid) = a.datos.usuario_id {
+        avisar_usuario_distinto("crear_apertura_caja", uid, &sesion);
+    }
+
+    let mut tx = state.pool.begin().await?;
+    caja::bloquear(&mut tx, caja_equipo).await?;
+    let ahora = caja::ahora_caja(&mut tx, caja_equipo).await?;
+    let apertura = caja::crear_apertura_core(&mut tx, caja_equipo, sesion.id, a.datos, &ahora).await?;
+    tx.commit().await?;
+    a_json(apertura)
+}
+
+/// Lo que debería haber en caja al abrir (para el modal de apertura).
+async fn obtener_esperado_apertura(state: &AppState, claims: &Claims) -> Result<Value, ApiError> {
+    let caja = caja::caja_de(&state.pool, claims).await?;
+    let mut conn = state.pool.acquire().await?;
+    let ahora = caja::ahora_caja(&mut conn, caja).await?;
+    a_json(caja::calcular_esperado_apertura(&mut conn, caja, &ahora).await?)
+}
+
+/// Momento en que empieza el período abierto (fin del último corte).
+async fn obtener_inicio_proximo_cierre(state: &AppState, claims: &Claims) -> Result<Value, ApiError> {
+    let caja = caja::caja_de(&state.pool, claims).await?;
+    let mut conn = state.pool.acquire().await?;
+    Ok(json!(caja::inicio_y_fondo(&mut conn, caja).await?.0))
+}
+
+/// Fondo que dejó el último corte (por momento de conteo). Compatibilidad: la
+/// apertura usa `obtener_esperado_apertura`.
+async fn obtener_fondo_sugerido(state: &AppState, claims: &Claims) -> Result<Value, ApiError> {
+    let caja = caja::caja_de(&state.pool, claims).await?;
+    let mut conn = state.pool.acquire().await?;
+    let fondo = caja::ultimo_corte(&mut conn, caja).await?.map(|u| u.fondo_siguiente);
+    Ok(json!(fondo.unwrap_or(2000.0)))
+}
+
+/// Primer día anterior a hoy con ventas de la caja 'web' que todavía no
+/// entran en ningún corte. Para la caja de la tienda siempre null: el aviso
+/// de "cierre pendiente" es del escritorio, que es quien la corta.
+async fn verificar_corte_dia_pendiente(
+    state: &AppState,
+    claims: &Claims,
+) -> Result<Value, ApiError> {
+    let caja = caja::caja_de(&state.pool, claims).await?;
+    if caja != Caja::Web {
+        return Ok(Value::Null);
+    }
+    let mut conn = state.pool.acquire().await?;
+    let ahora = caja::reloj(&mut conn).await?;
+    Ok(match caja::primer_dia_pendiente(&mut conn, caja, &ahora[..10]).await? {
+        Some(d) => json!(d),
+        None => Value::Null,
+    })
 }
 
 /// Cambia el modo de caja del dispositivo actual.
 ///
-/// Validaciones (idénticas para ambos sentidos del cambio):
-///   1. Solo 'espejo' o 'individual'.
-///   2. No puede haber un corte parcial pendiente del modo actual:
-///      a) `aperturas_caja` con corte_id NULL del día — bloqueo.
-///      b) `movimientos_caja` con corte_id NULL — bloqueo.
-///      Estas garantizan que el cambio de modo no deja registros huérfanos
-///      asociados a una semántica que ya no aplica.
+///   - Solo 'espejo' o 'individual'.
+///   - De espejo a individual: siempre (la caja web es otra cadena).
+///   - De individual a espejo: se rechaza solo si la caja web tiene dinero sin
+///     cortar en su período abierto (si no, ese dinero quedaría sin quien lo
+///     corte). Ya no se cuentan "movimientos sin corte" sin límite de fecha:
+///     los 4 retiros huérfanos viejos del escritorio bloqueaban el cambio para
+///     siempre.
 async fn configurar_modo_caja(
     state: &AppState,
     claims: &Claims,
@@ -2997,33 +3667,23 @@ async fn configurar_modo_caja(
         ));
     }
 
-    let Some(uuid) = claims.device.as_deref() else {
+    // El centinela de "sin dispositivo" no es un equipo: nunca se le guarda
+    // un modo (si no, todas las sesiones sin equipo cambiarían de caja).
+    let Some(uuid) = caja::dispositivo_de(claims) else {
         return Err(ApiError::BadRequest(
             "Esta sesión no tiene un dispositivo registrado. Cierra sesión y vuelve a entrar.".into(),
         ));
     };
 
-    let modo_actual = modo_caja_de(state, claims).await?;
-
-    // Si está cambiando de modo (no solo re-confirmando), validar que no
-    // queden movimientos del modo viejo huérfanos.
-    if modo_actual != a.modo {
-        // Movimientos sin corte que pertenecen al modo actual.
-        let where_origen = if modo_actual == "individual" {
-            "AND origen = 'web'"
-        } else {
-            "" // espejo: cualquier movimiento pendiente bloquea
-        };
-        let sql = format!(
-            "SELECT COUNT(*)::bigint FROM movimientos_caja \
-             WHERE corte_id IS NULL AND deleted_at IS NULL {where_origen}"
-        );
-        let pendientes: i64 = sqlx::query_scalar(&sql)
-            .fetch_one(&state.pool)
-            .await?;
-        if pendientes > 0 {
+    let modo_actual = caja::modo_de_dispositivo(&state.pool, claims).await?;
+    if modo_actual == "individual" && a.modo == "espejo" {
+        let mut conn = state.pool.acquire().await?;
+        if caja::hay_efectivo_sin_cortar(&mut conn, Caja::Web).await? {
             return Err(ApiError::BadRequest(
-                "No puedes cambiar el modo: hay movimientos de caja sin corte. Haz un corte parcial primero.".into(),
+                "No puedes cambiar a modo espejo: la caja web tiene dinero sin cortar \
+                 (ventas en efectivo, entradas o retiros desde su último corte). \
+                 Haz primero un corte de la caja web."
+                    .into(),
             ));
         }
     }
@@ -3039,44 +3699,107 @@ async fn configurar_modo_caja(
                 nombre    = COALESCE(EXCLUDED.nombre, pos_devices.nombre)",
     )
     .bind(uuid)
-    .bind(a.nombre.as_deref().unwrap_or(&format!("Web {}", &uuid[..8.min(uuid.len())])))
+    .bind(a.nombre.clone().unwrap_or_else(|| format!("Web {}", prefijo_dispositivo(uuid))))
     .bind(&a.modo)
     .execute(&state.pool)
     .await?;
 
-    // Bitácora — útil para debug si las cuentas no cuadran.
+    // Bitácora — útil para revisar cuándo un equipo cambió de caja.
     let audit_sql = format!(
         r#"INSERT INTO audit_log
            (usuario_id, accion, tabla_afectada, registro_id,
             descripcion_legible, origen, fecha)
            VALUES ($1, 'MODO_CAJA_CAMBIADO', 'pos_devices', NULL, $2, 'WEB', {NOW_TEXT})"#
     );
-    let _ = sqlx::query(&audit_sql)
+    if let Err(e) = sqlx::query(&audit_sql)
         .bind(claims.sub)
         .bind(format!(
             "Modo de caja del dispositivo {} cambiado: {} → {}",
-            &uuid[..8.min(uuid.len())], modo_actual, a.modo
+            prefijo_dispositivo(uuid), modo_actual, a.modo
         ))
         .execute(&state.pool)
-        .await;
+        .await
+    {
+        tracing::warn!("configurar_modo_caja: no se registró en bitácora: {e}");
+    }
 
+    let info = info_caja_de_modo(state, &a.modo).await;
     Ok(json!({
         "modo":         a.modo,
         "configurado":  true,
         "device_uuid":  uuid,
+        "caja":                  info["caja"],
+        "cortes_en_este_equipo": info["cortes_en_este_equipo"],
+        "escritorio_recibe_web": info["escritorio_recibe_web"],
     }))
 }
 
-async fn crear_movimiento_caja(state: &AppState, args: Value) -> Result<Value, ApiError> {
+/// Lee el modo actual del dispositivo + flag de "ya configurado" + la caja con
+/// la que trabaja. `configurado=false` solo cuando el frontend acaba de
+/// generar un device_uuid nuevo; el frontend usa esa señal para abrir el
+/// modal de bienvenida.
+async fn obtener_modo_caja(state: &AppState, claims: &Claims) -> Result<Value, ApiError> {
+    let Some(uuid) = caja::dispositivo_de(claims) else {
+        // Sin device en el JWT (o el centinela): caja de la tienda, sin modal.
+        let info = info_caja_de_modo(state, "espejo").await;
+        return Ok(json!({
+            "modo": "espejo",
+            "configurado": true,
+            "device_uuid": null,
+            "caja":                  info["caja"],
+            "cortes_en_este_equipo": info["cortes_en_este_equipo"],
+            "escritorio_recibe_web": info["escritorio_recibe_web"],
+        }));
+    };
+
+    let row = sqlx::query(
+        "SELECT modo_caja, nombre FROM pos_devices WHERE device_uuid = $1",
+    )
+    .bind(uuid)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    let (modo, configurado, nombre) = match row {
+        Some(r) => (
+            r.get::<String, _>("modo_caja"),
+            true,
+            r.try_get::<Option<String>, _>("nombre").ok().flatten(),
+        ),
+        None => ("espejo".to_string(), false, None),
+    };
+    let info = info_caja_de_modo(state, &modo).await;
+    Ok(json!({
+        "modo":          modo,
+        "configurado":   configurado,
+        "device_uuid":   uuid,
+        "nombre":        nombre,
+        "caja":                  info["caja"],
+        "cortes_en_este_equipo": info["cortes_en_este_equipo"],
+        "escritorio_recibe_web": info["escritorio_recibe_web"],
+    }))
+}
+
+/// Entrada o retiro de efectivo (sin ser una venta) en la caja del equipo.
+async fn crear_movimiento_caja(
+    state: &AppState,
+    claims: &Claims,
+    args: Value,
+) -> Result<Value, ApiError> {
     #[derive(Deserialize)]
     struct A { datos: NuevoMov }
     #[derive(Deserialize)]
     struct NuevoMov {
         tipo: String,
-        usuario_id: i64,
+        /// Se IGNORA: quien registra es el usuario de la sesión.
+        #[serde(default)]
+        usuario_id: Option<i64>,
         monto: f64,
         concepto: String,
-        #[serde(default)] autorizado_por: Option<i64>,
+        /// Se IGNORA (antes se guardaba tal cual): quién autorizó lo decide
+        /// el servidor con el PIN o el rol de la sesión.
+        #[serde(default)]
+        #[allow(dead_code)]
+        autorizado_por: Option<i64>,
         #[serde(default)] pin_autorizacion: Option<String>,
     }
 
@@ -3084,345 +3807,126 @@ async fn crear_movimiento_caja(state: &AppState, args: Value) -> Result<Value, A
         .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
     let d = a.datos;
 
-    if d.monto <= 0.0 {
+    if !d.monto.is_finite() || d.monto <= 0.0 || d.monto > crate::venta_calc::MAX_IMPORTE {
         return Err(ApiError::BadRequest("El monto debe ser mayor a cero".into()));
+    }
+    // numeric(12,2): redondeamos aquí para que lo guardado, lo devuelto y lo
+    // que suma el corte sean la misma cifra.
+    let monto = caja::round2(d.monto);
+    if monto <= 0.0 {
+        return Err(ApiError::BadRequest("El monto debe ser mayor a cero".into()));
+    }
+    if d.tipo != "ENTRADA" && d.tipo != "RETIRO" {
+        return Err(ApiError::BadRequest("Tipo de movimiento inválido".into()));
     }
     if d.concepto.trim().is_empty() {
         return Err(ApiError::BadRequest("El concepto es obligatorio".into()));
     }
-    if d.tipo != "ENTRADA" && d.tipo != "RETIRO" {
-        return Err(ApiError::BadRequest("Tipo inválido (debe ser ENTRADA o RETIRO)".into()));
+
+    // Quien registra = el de la sesión. Antes el rol se leía del usuario_id
+    // del body: un vendedor podía mandar el id del dueño y saltarse el PIN.
+    let sesion = usuario_de_sesion(state, claims).await?;
+    if let Some(uid) = d.usuario_id {
+        avisar_usuario_distinto("crear_movimiento_caja", uid, &sesion);
     }
+    let caja_equipo = caja::caja_de(&state.pool, claims).await?;
 
-    let sucursal_id: i64 = 1;
-
-    // Si es RETIRO grande y el solicitante NO es admin, exigir PIN del dueño
-    let rol_id: i64 = sqlx::query_scalar(
-        "SELECT rol_id FROM usuarios WHERE id = $1 AND deleted_at IS NULL",
+    // Movimiento + sync_cursor + bitácora en UNA transacción: si el cursor
+    // fallara, no debe quedar un movimiento que nunca baja al escritorio.
+    let mut tx = state.pool.begin().await?;
+    // El PIN (bcrypt) se resuelve antes del candado: no depende de la cadena.
+    let autorizado_por = if d.tipo == "RETIRO" {
+        caja::resolver_autorizacion_retiro(&mut tx, sesion.id, monto, d.pin_autorizacion.as_deref())
+            .await?
+    } else {
+        None
+    };
+    // Caja 'web': candado + fecha de la caja. Caja de la tienda: reloj real
+    // (si llega tarde al escritorio, él la re-fecha al siguiente corte).
+    let fecha = if caja_equipo == Caja::Web {
+        caja::bloquear(&mut tx, caja_equipo).await?;
+        caja::ahora_caja(&mut tx, caja_equipo).await?
+    } else {
+        caja::reloj(&mut tx).await?
+    };
+    let (id, _) = caja::insertar_movimiento(
+        &mut tx, caja_equipo, &d.tipo, sesion.id, monto, &d.concepto, autorizado_por, None, &fecha,
     )
-    .bind(d.usuario_id)
-    .fetch_optional(&state.pool)
-    .await?
-    .unwrap_or(3);
-    let solicitante_es_admin = rol_es_admin(state, rol_id).await;
-
-    let autorizado_por_validado: Option<i64> =
-        if d.tipo == "RETIRO" && d.monto > RETIRO_LIMITE_SIN_PIN && !solicitante_es_admin {
-            let pin = d.pin_autorizacion.as_deref().unwrap_or("").trim();
-            if pin.is_empty() {
-                return Err(ApiError::BadRequest(format!(
-                    "Retiros mayores a ${:.0} requieren PIN del dueño",
-                    RETIRO_LIMITE_SIN_PIN
-                )));
-            }
-            match buscar_dueno_por_pin(state, pin).await? {
-                Some(id) => Some(id),
-                None => return Err(ApiError::BadRequest("PIN del dueño incorrecto".into())),
-            }
-        } else if d.tipo == "RETIRO" && d.monto > RETIRO_LIMITE_SIN_PIN && solicitante_es_admin {
-            Some(d.usuario_id)
-        } else {
-            d.autorizado_por
-        };
-
-    let new_uuid = uuid::Uuid::now_v7().to_string();
-    let sql = format!(
-        r#"
-        INSERT INTO movimientos_caja
-          (uuid, sucursal_id, tipo, usuario_id, monto, concepto,
-           autorizado_por, origen, fecha, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, 'web', {NOW_TEXT}, {NOW_TEXT})
-        RETURNING id, fecha
-        "#
-    );
-    let row = sqlx::query(&sql)
-        .bind(&new_uuid)
-        .bind(sucursal_id)
-        .bind(&d.tipo)
-        .bind(d.usuario_id)
-        .bind(d.monto)
-        .bind(&d.concepto)
-        .bind(autorizado_por_validado)
-        .fetch_one(&state.pool)
-        .await?;
-
-    let id: i64 = row.get("id");
-    let fecha: String = row.get("fecha");
+    .await?;
+    let accion = if d.tipo == "ENTRADA" { "ENTRADA_CAJA" } else { "RETIRO_CAJA" };
+    caja::bitacora(
+        &mut tx,
+        sesion.id,
+        accion,
+        "movimientos_caja",
+        Some(id),
+        &format!("{} de ${:.2} — {}", d.tipo, monto, d.concepto),
+        &fecha,
+    )
+    .await?;
+    tx.commit().await?;
 
     let usuario_nombre: String = sqlx::query_scalar(
         "SELECT nombre_completo FROM usuarios WHERE id = $1",
     )
-    .bind(d.usuario_id)
+    .bind(sesion.id)
     .fetch_optional(&state.pool)
     .await?
     .unwrap_or_else(|| "Desconocido".into());
 
-    // sync_cursor para que el desktop lo jale
-    sqlx::query(
-        "INSERT INTO sync_cursor (tabla, uuid, sucursal_id, origen_device) \
-         VALUES ('movimientos_caja', $1, $2, $3)",
-    )
-    .bind(&new_uuid)
-    .bind(sucursal_id)
-    .bind(WEB_ORIGIN)
-    .execute(&state.pool)
-    .await?;
-
-    Ok(json!({
-        "id":              id,
-        "tipo":            d.tipo,
-        "usuario_id":      d.usuario_id,
-        "usuario_nombre":  usuario_nombre,
-        "monto":           d.monto,
-        "concepto":        d.concepto,
-        "autorizado_por":  autorizado_por_validado,
-        "corte_id":        Value::Null,
-        "fecha":           fecha,
-    }))
+    a_json(caja::MovimientoCaja {
+        id,
+        tipo: d.tipo,
+        usuario_id: sesion.id,
+        usuario_nombre,
+        monto,
+        concepto: d.concepto,
+        autorizado_por,
+        corte_id: None,
+        fecha,
+    })
 }
 
+/// Movimientos del período en curso de la caja del equipo (sin corte,
+/// posteriores al último corte), más recientes primero.
 async fn listar_movimientos_sin_corte(
     state: &AppState,
     claims: &Claims,
 ) -> Result<Value, ApiError> {
-    let modo = modo_caja_de(state, claims).await?;
-    let filtro_origen = if modo == "espejo" { "" } else { "AND m.origen = 'web'" };
-    let sql = format!(
-        r#"
-        SELECT m.id, m.tipo, m.usuario_id, u.nombre_completo AS usuario_nombre,
-               m.monto, m.concepto, m.autorizado_por, m.corte_id, m.fecha
-        FROM movimientos_caja m
-        JOIN usuarios u ON u.id = m.usuario_id
-        WHERE m.corte_id IS NULL
-          AND m.deleted_at IS NULL
-          {filtro_origen}
-        ORDER BY m.fecha DESC
-        "#
-    );
-    let rows = sqlx::query(&sql)
-    .fetch_all(&state.pool)
-    .await?;
-
-    Ok(json!(rows.iter().map(|r| json!({
-        "id":             r.get::<i64, _>("id"),
-        "tipo":           r.get::<String, _>("tipo"),
-        "usuario_id":     r.get::<i64, _>("usuario_id"),
-        "usuario_nombre": r.try_get::<Option<String>, _>("usuario_nombre").ok().flatten().unwrap_or_default(),
-        "monto":          pg_dec(r, "monto"),
-        "concepto":       r.get::<String, _>("concepto"),
-        "autorizado_por": r.try_get::<Option<i64>, _>("autorizado_por").ok().flatten(),
-        "corte_id":       r.try_get::<Option<i64>, _>("corte_id").ok().flatten(),
-        "fecha":          r.get::<String, _>("fecha"),
-    })).collect::<Vec<_>>()))
+    let caja = caja::caja_de(&state.pool, claims).await?;
+    let mut conn = state.pool.acquire().await?;
+    a_json(caja::movimientos_sin_corte(&mut conn, caja).await?)
 }
 
+/// Vista previa del corte: desde el último corte de la caja hasta ahora. Los
+/// parámetros fechaInicio/fechaFin que mandan clientes viejos se ignoran.
 async fn calcular_datos_corte(
     state: &AppState,
     claims: &Claims,
-    args: &Value,
 ) -> Result<Value, ApiError> {
-    #[derive(Deserialize)]
+    let caja = caja::caja_de(&state.pool, claims).await?;
+    let mut conn = state.pool.acquire().await?;
+    let ahora = caja::ahora_caja(&mut conn, caja).await?;
+    a_json(caja::calcular_periodo(&mut conn, caja, &ahora).await?)
+}
+
+/// Auditoría de solo lectura de la caja del equipo (solo dueños).
+async fn auditar_caja(state: &AppState, claims: &Claims, args: &Value) -> Result<Value, ApiError> {
+    #[derive(Deserialize, Default)]
+    #[serde(rename_all = "camelCase")]
     struct A {
-        // Frontend manda camelCase via invokeCompat (sin conversion en web).
-        #[serde(rename = "fechaInicio")] fecha_inicio: String,
-        #[serde(rename = "fechaFin")] fecha_fin: String,
+        #[serde(default, alias = "limite_dias")]
+        limite_dias: Option<i64>,
     }
-    let a: A = serde_json::from_value(args.clone())
-        .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
-
-    // Filtros por modo:
-    //   'individual': cada tabla filtra por su propio origen='web' — la
-    //                 caja web es independiente del desktop.
-    //   'espejo':     NO filtra — todo lo que cae en el rango cuenta,
-    //                 incluyendo ventas/movimientos/cortes del desktop.
-    //
-    // Antes del PR de modo_caja, ventas NO tenía columna `origen` y el
-    // filtro siempre era "espejo" para ventas. Migración 005 agregó esa
-    // columna; ahora en modo individual también filtramos ventas.
-    let modo = modo_caja_de(state, claims).await?;
-    let f_ventas = if modo == "espejo" { "" } else { "AND origen = 'web'" };
-    let f_mov   = if modo == "espejo" { "" } else { "AND m.origen = 'web'" };
-    let f_aper  = if modo == "espejo" { "" } else { "AND origen = 'web'" };
-    let f_corte = if modo == "espejo" { "" } else { "AND origen = 'web'" };
-
-    let efectivo: f64 = sqlx::query_scalar::<_, rust_decimal::Decimal>(
-        &format!(
-            "SELECT COALESCE(SUM(total), 0)::numeric FROM ventas \
-             WHERE substr(fecha, 1, 10) BETWEEN substr($1, 1, 10) AND substr($2, 1, 10) AND anulada = 0 \
-               AND metodo_pago = 'efectivo' AND deleted_at IS NULL {f_ventas}"
-        ),
-    )
-    .bind(&a.fecha_inicio).bind(&a.fecha_fin)
-    .fetch_one(&state.pool).await
-    .ok().and_then(|d| { use rust_decimal::prelude::ToPrimitive; d.to_f64() })
-    .unwrap_or(0.0);
-
-    let tarjeta: f64 = sqlx::query_scalar::<_, rust_decimal::Decimal>(
-        &format!(
-            "SELECT COALESCE(SUM(total), 0)::numeric FROM ventas \
-             WHERE substr(fecha, 1, 10) BETWEEN substr($1, 1, 10) AND substr($2, 1, 10) AND anulada = 0 \
-               AND metodo_pago = 'tarjeta' AND deleted_at IS NULL {f_ventas}"
-        ),
-    )
-    .bind(&a.fecha_inicio).bind(&a.fecha_fin)
-    .fetch_one(&state.pool).await
-    .ok().and_then(|d| { use rust_decimal::prelude::ToPrimitive; d.to_f64() })
-    .unwrap_or(0.0);
-
-    let transferencia: f64 = sqlx::query_scalar::<_, rust_decimal::Decimal>(
-        &format!(
-            "SELECT COALESCE(SUM(total), 0)::numeric FROM ventas \
-             WHERE substr(fecha, 1, 10) BETWEEN substr($1, 1, 10) AND substr($2, 1, 10) AND anulada = 0 \
-               AND metodo_pago = 'transferencia' AND deleted_at IS NULL {f_ventas}"
-        ),
-    )
-    .bind(&a.fecha_inicio).bind(&a.fecha_fin)
-    .fetch_one(&state.pool).await
-    .ok().and_then(|d| { use rust_decimal::prelude::ToPrimitive; d.to_f64() })
-    .unwrap_or(0.0);
-
-    let agg = sqlx::query(
-        &format!(
-            "SELECT COUNT(*)::bigint AS n, \
-                    COALESCE(SUM(total), 0)::numeric AS total, \
-                    COALESCE(SUM(descuento), 0)::numeric AS desc \
-             FROM ventas \
-             WHERE substr(fecha, 1, 10) BETWEEN substr($1, 1, 10) AND substr($2, 1, 10) AND anulada = 0 AND deleted_at IS NULL {f_ventas}"
-        ),
-    )
-    .bind(&a.fecha_inicio).bind(&a.fecha_fin)
-    .fetch_one(&state.pool).await?;
-    let num_transacciones: i64 = agg.try_get("n").unwrap_or(0);
-    let total_ventas: f64 = pg_dec(&agg, "total");
-    let total_descuentos: f64 = pg_dec(&agg, "desc");
-
-    let total_anulaciones: f64 = sqlx::query_scalar::<_, rust_decimal::Decimal>(
-        &format!(
-            "SELECT COALESCE(SUM(total), 0)::numeric FROM ventas \
-             WHERE substr(fecha, 1, 10) BETWEEN substr($1, 1, 10) AND substr($2, 1, 10) AND anulada = 1 AND deleted_at IS NULL {f_ventas}"
-        ),
-    )
-    .bind(&a.fecha_inicio).bind(&a.fecha_fin)
-    .fetch_one(&state.pool).await
-    .ok().and_then(|d| { use rust_decimal::prelude::ToPrimitive; d.to_f64() })
-    .unwrap_or(0.0);
-
-    // Movimientos sin corte (filtrados por modo)
-    let mov_sql = format!(
-        r#"
-        SELECT m.id, m.tipo, m.usuario_id, u.nombre_completo AS usuario_nombre,
-               m.monto, m.concepto, m.autorizado_por, m.corte_id, m.fecha
-        FROM movimientos_caja m
-        JOIN usuarios u ON u.id = m.usuario_id
-        WHERE m.corte_id IS NULL
-          AND m.deleted_at IS NULL
-          {f_mov}
-        ORDER BY m.fecha ASC
-        "#
-    );
-    let mov_rows = sqlx::query(&mov_sql)
-    .fetch_all(&state.pool)
-    .await?;
-
-    let movimientos: Vec<Value> = mov_rows.iter().map(|r| json!({
-        "id":             r.get::<i64, _>("id"),
-        "tipo":           r.get::<String, _>("tipo"),
-        "usuario_id":     r.get::<i64, _>("usuario_id"),
-        "usuario_nombre": r.try_get::<Option<String>, _>("usuario_nombre").ok().flatten().unwrap_or_default(),
-        "monto":          pg_dec(r, "monto"),
-        "concepto":       r.get::<String, _>("concepto"),
-        "autorizado_por": r.try_get::<Option<i64>, _>("autorizado_por").ok().flatten(),
-        "corte_id":       r.try_get::<Option<i64>, _>("corte_id").ok().flatten(),
-        "fecha":          r.get::<String, _>("fecha"),
-    })).collect();
-
-    let total_entradas: f64 = mov_rows.iter()
-        .filter(|r| r.get::<String, _>("tipo") == "ENTRADA")
-        .map(|r| pg_dec(r, "monto")).sum();
-    let total_retiros: f64 = mov_rows.iter()
-        .filter(|r| r.get::<String, _>("tipo") == "RETIRO")
-        .map(|r| pg_dec(r, "monto")).sum();
-
-    // Fondo inicial: apertura del día (filtrada por modo) > último fondo_siguiente
-    // del último corte (filtrado por modo) > 0.
-    let dia: &str = if a.fecha_inicio.len() >= 10 { &a.fecha_inicio[..10] } else { "" };
-    let aper_sql = format!(
-        "SELECT fondo_declarado::numeric FROM aperturas_caja \
-         WHERE substr(fecha, 1, 10) = $1 \
-           AND deleted_at IS NULL {f_aper} \
-         LIMIT 1"
-    );
-    let fondo_apertura: Option<f64> = sqlx::query_scalar::<_, rust_decimal::Decimal>(&aper_sql)
-    .bind(dia)
-    .fetch_optional(&state.pool).await?
-    .and_then(|d| { use rust_decimal::prelude::ToPrimitive; d.to_f64() });
-
-    let fondo_inicial: f64 = match fondo_apertura {
-        Some(f) => f,
-        None => {
-            let corte_sql = format!(
-                "SELECT fondo_siguiente::numeric FROM cortes \
-                 WHERE deleted_at IS NULL {f_corte} \
-                 ORDER BY created_at DESC LIMIT 1"
-            );
-            sqlx::query_scalar::<_, rust_decimal::Decimal>(&corte_sql)
-                .fetch_optional(&state.pool).await?
-                .and_then(|d| { use rust_decimal::prelude::ToPrimitive; d.to_f64() })
-                .unwrap_or(0.0)
-        }
-    };
-
-    let efectivo_esperado = fondo_inicial + efectivo + total_entradas - total_retiros;
-
-    // Vendedores
-    let vend_sql = format!(
-        r#"
-        SELECT v.usuario_id, u.nombre_completo AS usuario_nombre,
-               COUNT(*)::bigint AS num_ventas,
-               COALESCE(SUM(v.total), 0)::numeric AS total,
-               MIN(v.fecha) AS hora_inicio,
-               MAX(v.fecha) AS hora_fin
-        FROM ventas v
-        JOIN usuarios u ON u.id = v.usuario_id
-        WHERE substr(v.fecha, 1, 10) BETWEEN substr($1, 1, 10) AND substr($2, 1, 10)
-          AND v.anulada = 0 AND v.deleted_at IS NULL
-          {f_ventas_v}
-        GROUP BY v.usuario_id, u.nombre_completo
-        ORDER BY total DESC
-        "#,
-        f_ventas_v = if modo == "espejo" { "" } else { "AND v.origen = 'web'" }
-    );
-    let vrows = sqlx::query(&vend_sql)
-    .bind(&a.fecha_inicio).bind(&a.fecha_fin)
-    .fetch_all(&state.pool)
-    .await?;
-
-    let vendedores: Vec<Value> = vrows.iter().map(|r| json!({
-        "usuario_id":     r.get::<i64, _>("usuario_id"),
-        "usuario_nombre": r.try_get::<Option<String>, _>("usuario_nombre").ok().flatten().unwrap_or_default(),
-        "num_ventas":     r.try_get::<i64, _>("num_ventas").unwrap_or(0),
-        "total_vendido":  pg_dec(r, "total"),
-        "hora_inicio":    r.try_get::<Option<String>, _>("hora_inicio").ok().flatten().unwrap_or_default(),
-        "hora_fin":       r.try_get::<Option<String>, _>("hora_fin").ok().flatten().unwrap_or_default(),
-    })).collect();
-
-    Ok(json!({
-        "fecha_inicio":               a.fecha_inicio,
-        "fecha_fin":                  a.fecha_fin,
-        "fondo_inicial":              fondo_inicial,
-        "total_ventas_efectivo":      efectivo,
-        "total_ventas_tarjeta":       tarjeta,
-        "total_ventas_transferencia": transferencia,
-        "total_ventas":               total_ventas,
-        "num_transacciones":          num_transacciones,
-        "total_descuentos":           total_descuentos,
-        "total_anulaciones":          total_anulaciones,
-        "total_entradas_efectivo":    total_entradas,
-        "total_retiros_efectivo":     total_retiros,
-        "efectivo_esperado":          efectivo_esperado,
-        "movimientos":                movimientos,
-        "vendedores":                 vendedores,
-    }))
+    let sesion = usuario_de_sesion(state, claims).await?;
+    if !sesion.es_admin {
+        return Err(ApiError::Forbidden);
+    }
+    let a: A = serde_json::from_value(args.clone()).unwrap_or_default();
+    let dias = a.limite_dias.unwrap_or(90).clamp(1, 3650);
+    let caja = caja::caja_de(&state.pool, claims).await?;
+    let mut conn = state.pool.acquire().await?;
+    a_json(caja::auditar(&mut conn, caja, dias).await?)
 }
 
 // =============================================================================
@@ -3444,7 +3948,8 @@ async fn calcular_datos_corte(
 // Estos handlers hacen la agregación en una sola query SQL en el servidor.
 // Devuelven exactamente lo que necesita la UI sin necesidad de iterar.
 //
-// Todos respetan el modo de caja (individual filtra origen='web', espejo no).
+// Son de solo lectura: cuentan todas las ventas (escritorio y web, de
+// cualquier caja), sin filtro por modo de caja.
 
 // Args comunes a los 4: solo rango de fechas (camelCase desde frontend).
 #[derive(Deserialize)]
@@ -3459,15 +3964,11 @@ struct RangoReporte {
 /// Reemplaza el patrón frontend de iterar venta por venta.
 async fn obtener_top_productos(
     state: &AppState,
-    claims: &Claims,
     args: &Value,
 ) -> Result<Value, ApiError> {
     let a: RangoReporte = serde_json::from_value(args.clone())
         .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
     let limite = a.limite.unwrap_or(10).clamp(1, 100);
-
-    let modo = modo_caja_de(state, claims).await?;
-    let f_v = if modo == "espejo" { "" } else { "AND v.origen = 'web'" };
 
     let sql = format!(
         r#"
@@ -3483,7 +3984,6 @@ async fn obtener_top_productos(
           AND vd.deleted_at IS NULL
           AND v.anulada = 0
           AND substr(v.fecha, 1, 10) BETWEEN substr($1, 1, 10) AND substr($2, 1, 10)
-          {f_v}
         GROUP BY vd.producto_id, p.codigo, p.nombre
         ORDER BY cantidad DESC
         LIMIT $3
@@ -3508,14 +4008,10 @@ async fn obtener_top_productos(
 /// Totales de venta agrupados por vendedor.
 async fn obtener_ventas_por_vendedor(
     state: &AppState,
-    claims: &Claims,
     args: &Value,
 ) -> Result<Value, ApiError> {
     let a: RangoReporte = serde_json::from_value(args.clone())
         .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
-
-    let modo = modo_caja_de(state, claims).await?;
-    let f_v = if modo == "espejo" { "" } else { "AND v.origen = 'web'" };
 
     let sql = format!(
         r#"
@@ -3528,7 +4024,6 @@ async fn obtener_ventas_por_vendedor(
         WHERE v.deleted_at IS NULL
           AND v.anulada = 0
           AND substr(v.fecha, 1, 10) BETWEEN substr($1, 1, 10) AND substr($2, 1, 10)
-          {f_v}
         GROUP BY v.usuario_id, u.nombre_completo
         ORDER BY total DESC
         "#
@@ -3549,14 +4044,10 @@ async fn obtener_ventas_por_vendedor(
 /// Totales agrupados por método de pago.
 async fn obtener_ventas_por_metodo(
     state: &AppState,
-    claims: &Claims,
     args: &Value,
 ) -> Result<Value, ApiError> {
     let a: RangoReporte = serde_json::from_value(args.clone())
         .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
-
-    let modo = modo_caja_de(state, claims).await?;
-    let f_v = if modo == "espejo" { "" } else { "AND v.origen = 'web'" };
 
     let sql = format!(
         r#"
@@ -3567,7 +4058,6 @@ async fn obtener_ventas_por_metodo(
         WHERE v.deleted_at IS NULL
           AND v.anulada = 0
           AND substr(v.fecha, 1, 10) BETWEEN substr($1, 1, 10) AND substr($2, 1, 10)
-          {f_v}
         GROUP BY v.metodo_pago
         ORDER BY total DESC
         "#
@@ -3588,14 +4078,10 @@ async fn obtener_ventas_por_metodo(
 /// Totales agrupados por día del rango.
 async fn obtener_ventas_por_dia(
     state: &AppState,
-    claims: &Claims,
     args: &Value,
 ) -> Result<Value, ApiError> {
     let a: RangoReporte = serde_json::from_value(args.clone())
         .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
-
-    let modo = modo_caja_de(state, claims).await?;
-    let f_v = if modo == "espejo" { "" } else { "AND v.origen = 'web'" };
 
     let sql = format!(
         r#"
@@ -3606,7 +4092,6 @@ async fn obtener_ventas_por_dia(
         WHERE v.deleted_at IS NULL
           AND v.anulada = 0
           AND substr(v.fecha, 1, 10) BETWEEN substr($1, 1, 10) AND substr($2, 1, 10)
-          {f_v}
         GROUP BY substr(v.fecha, 1, 10)
         ORDER BY fecha ASC
         "#
@@ -3624,254 +4109,35 @@ async fn obtener_ventas_por_dia(
     })).collect::<Vec<_>>()))
 }
 
+/// Confirmar y guardar un corte (de turno o del día) de la caja 'web'. Se
+/// recalcula en la transacción, con el candado de la caja, y se rechaza con
+/// DATOS_CAMBIARON si el esperado ya no es el que vio el cajero. El retiro de
+/// turno viaja DENTRO del corte (`datos.retiro`).
 async fn crear_corte(
     state: &AppState,
     claims: &Claims,
     args: Value,
 ) -> Result<Value, ApiError> {
     #[derive(Deserialize)]
-    struct A { datos: NuevoCorteWeb }
-    #[derive(Deserialize)]
-    struct NuevoCorteWeb {
-        tipo: String,
-        usuario_id: i64,
-        fecha_inicio: String,
-        fecha_fin: String,
-        datos: DatosCorteWeb,
-        efectivo_contado: f64,
-        #[serde(default)] nota_diferencia: Option<String>,
-        fondo_siguiente: f64,
-        #[serde(default)] denominaciones: Option<Vec<DenomInput>>,
-    }
-    #[derive(Deserialize)]
-    struct DatosCorteWeb {
-        fondo_inicial: f64,
-        total_ventas_efectivo: f64,
-        total_ventas_tarjeta: f64,
-        total_ventas_transferencia: f64,
-        total_ventas: f64,
-        num_transacciones: i64,
-        total_descuentos: f64,
-        total_anulaciones: f64,
-        total_entradas_efectivo: f64,
-        total_retiros_efectivo: f64,
-        efectivo_esperado: f64,
-        #[serde(default)] vendedores: Vec<VendedorInput>,
-    }
-    #[derive(Deserialize)]
-    struct VendedorInput {
-        usuario_id: i64,
-        num_ventas: i64,
-        total_vendido: f64,
-        hora_inicio: String,
-        hora_fin: String,
-    }
-    #[derive(Deserialize)]
-    struct DenomInput {
-        denominacion: f64,
-        tipo: String,
-        cantidad: i64,
-    }
-
+    struct A { datos: caja::NuevoCorte }
     let a: A = serde_json::from_value(args)
         .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
-    let c = a.datos;
-
-    if c.tipo != "PARCIAL" && c.tipo != "DIA" {
-        return Err(ApiError::BadRequest("Tipo inválido (PARCIAL o DIA)".into()));
+    let caja_equipo = caja::caja_de(&state.pool, claims).await?;
+    exigir_caja_web(caja_equipo)?;
+    let sesion = usuario_de_sesion(state, claims).await?;
+    if let Some(uid) = a.datos.usuario_id {
+        avisar_usuario_distinto("crear_corte", uid, &sesion);
     }
-
-    let sucursal_id: i64 = 1;
-    let modo = modo_caja_de(state, claims).await?;
-    let f_corte_origen = if modo == "espejo" { "" } else { "AND origen = 'web'" };
-    let f_mov_origen   = if modo == "espejo" { "" } else { "AND origen = 'web'" };
 
     let mut tx = state.pool.begin().await?;
-
-    // Solo un corte DIA por día — comparado por `fecha_fin` (el día que
-    // CUBRE el corte), NO por `created_at` (cuándo se hizo el clic).
-    // Ver comentario detallado del bug en commands/cortes.rs del desktop.
-    if c.tipo == "DIA" {
-        let dia = if c.fecha_fin.len() >= 10 { &c.fecha_fin[..10] } else { "" };
-        let dup_sql = format!(
-            "SELECT COUNT(*)::bigint FROM cortes \
-             WHERE tipo = 'DIA' AND deleted_at IS NULL {f_corte_origen} \
-               AND substr(fecha_fin, 1, 10) = $1"
-        );
-        let existe: i64 = sqlx::query_scalar(&dup_sql)
-        .bind(dia)
-        .fetch_one(&mut *tx).await?;
-        if existe > 0 {
-            let msg = if modo == "espejo" {
-                format!("Ya existe un corte del día que cubre el {} (caja compartida con desktop). Cada día solo puede cerrarse una vez.", dia)
-            } else {
-                format!("Ya existe un corte del día (web) que cubre el {}. Cada día solo puede cerrarse una vez.", dia)
-            };
-            return Err(ApiError::BadRequest(msg));
-        }
-    }
-
-    let diferencia = c.efectivo_contado - c.datos.efectivo_esperado;
-    let new_uuid = uuid::Uuid::now_v7().to_string();
-
-    let ins_sql = format!(
-        r#"
-        INSERT INTO cortes
-          (uuid, sucursal_id, tipo, usuario_id, fecha_inicio, fecha_fin,
-           fondo_inicial, total_ventas_efectivo, total_ventas_tarjeta,
-           total_ventas_transferencia, total_ventas, num_transacciones,
-           total_descuentos, total_anulaciones, total_entradas_efectivo,
-           total_retiros_efectivo, efectivo_esperado, efectivo_contado,
-           diferencia, nota_diferencia, fondo_siguiente, origen,
-           created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6,
-                $7, $8, $9, $10, $11, $12,
-                $13, $14, $15, $16, $17, $18,
-                $19, $20, $21, 'web',
-                {NOW_TEXT}, {NOW_TEXT})
-        RETURNING id, created_at
-        "#
-    );
-    let row = sqlx::query(&ins_sql)
-        .bind(&new_uuid)
-        .bind(sucursal_id)
-        .bind(&c.tipo)
-        .bind(c.usuario_id)
-        .bind(&c.fecha_inicio)
-        .bind(&c.fecha_fin)
-        .bind(c.datos.fondo_inicial)
-        .bind(c.datos.total_ventas_efectivo)
-        .bind(c.datos.total_ventas_tarjeta)
-        .bind(c.datos.total_ventas_transferencia)
-        .bind(c.datos.total_ventas)
-        .bind(c.datos.num_transacciones)
-        .bind(c.datos.total_descuentos)
-        .bind(c.datos.total_anulaciones)
-        .bind(c.datos.total_entradas_efectivo)
-        .bind(c.datos.total_retiros_efectivo)
-        .bind(c.datos.efectivo_esperado)
-        .bind(c.efectivo_contado)
-        .bind(diferencia)
-        .bind(c.nota_diferencia.as_deref())
-        .bind(c.fondo_siguiente)
-        .fetch_one(&mut *tx)
-        .await?;
-    let corte_id: i64 = row.get("id");
-    let created_at: String = row.get("created_at");
-
-    // Asociar movimientos pendientes a este corte. En modo individual solo
-    // los del web; en modo espejo asocia TODOS (incluyendo los del desktop)
-    // porque comparten caja.
-    //
-    // RETURNING uuid: necesitamos los UUIDs de las filas modificadas para
-    // emitir sync_cursor por cada uno. Sin esto, el desktop nunca se entera
-    // que sus movimientos quedaron asignados a un corte web → en su próximo
-    // corte los volvería a contar (doble conteo).
-    let upd_sql = format!(
-        "UPDATE movimientos_caja \
-         SET corte_id = $1, updated_at = $2 \
-         WHERE corte_id IS NULL AND deleted_at IS NULL {f_mov_origen} \
-         RETURNING uuid"
-    );
-    let movs_actualizados = sqlx::query(&upd_sql)
-        .bind(corte_id)
-        .bind(&created_at)
-        .fetch_all(&mut *tx)
-        .await?;
-
-    // Emitir sync_cursor por cada movimiento tocado. Critical en modo
-    // espejo (movimientos origen='desktop' regresan al desktop con su
-    // corte_id resuelto). En modo individual también es safe — los uuids
-    // del web están en sync_cursor y el desktop los pull-ea para tener
-    // el historial completo.
-    for r in &movs_actualizados {
-        let mov_uuid: String = r.get("uuid");
-        sqlx::query(
-            "INSERT INTO sync_cursor (tabla, uuid, sucursal_id, origen_device) \
-             VALUES ('movimientos_caja', $1, $2, $3)",
-        )
-        .bind(&mov_uuid)
-        .bind(sucursal_id)
-        .bind(WEB_ORIGIN)
-        .execute(&mut *tx)
-        .await?;
-    }
-
-    // Denominaciones
-    if let Some(denoms) = &c.denominaciones {
-        for d in denoms {
-            if d.cantidad > 0 {
-                let subtotal = d.denominacion * d.cantidad as f64;
-                let den_uuid = uuid::Uuid::now_v7().to_string();
-                let dsql = format!(
-                    r#"
-                    INSERT INTO corte_denominaciones
-                      (uuid, corte_id, denominacion, tipo, cantidad, subtotal, updated_at)
-                    VALUES ($1, $2, $3, $4, $5, $6, {NOW_TEXT})
-                    "#
-                );
-                sqlx::query(&dsql)
-                    .bind(&den_uuid)
-                    .bind(corte_id)
-                    .bind(d.denominacion)
-                    .bind(&d.tipo)
-                    .bind(d.cantidad)
-                    .bind(subtotal)
-                    .execute(&mut *tx)
-                    .await?;
-            }
-        }
-    }
-
-    // Vendedores (solo en corte DIA)
-    if c.tipo == "DIA" {
-        for v in &c.datos.vendedores {
-            let vu_uuid = uuid::Uuid::now_v7().to_string();
-            let vsql = format!(
-                r#"
-                INSERT INTO corte_vendedores
-                  (uuid, corte_id, usuario_id, num_ventas, total_vendido,
-                   hora_inicio, hora_fin, updated_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, {NOW_TEXT})
-                "#
-            );
-            sqlx::query(&vsql)
-                .bind(&vu_uuid)
-                .bind(corte_id)
-                .bind(v.usuario_id)
-                .bind(v.num_ventas)
-                .bind(v.total_vendido)
-                .bind(&v.hora_inicio)
-                .bind(&v.hora_fin)
-                .execute(&mut *tx)
-                .await?;
-        }
-    }
-
-    // sync_cursor para que el desktop jale el corte
-    sqlx::query(
-        "INSERT INTO sync_cursor (tabla, uuid, sucursal_id, origen_device) \
-         VALUES ('cortes', $1, $2, $3)",
-    )
-    .bind(&new_uuid)
-    .bind(sucursal_id)
-    .bind(WEB_ORIGIN)
-    .execute(&mut *tx)
-    .await?;
-
+    caja::bloquear(&mut tx, caja_equipo).await?;
+    let ahora = caja::ahora_caja(&mut tx, caja_equipo).await?;
+    let creado = caja::crear_corte_core(&mut tx, caja_equipo, sesion.id, a.datos, &ahora).await?;
     tx.commit().await?;
-
-    Ok(json!({
-        "id":                corte_id,
-        "tipo":              c.tipo,
-        "diferencia":        diferencia,
-        "efectivo_esperado": c.datos.efectivo_esperado,
-        "efectivo_contado":  c.efectivo_contado,
-        "fondo_siguiente":   c.fondo_siguiente,
-        "created_at":        created_at,
-    }))
+    a_json(creado)
 }
 
+/// Cortes de la caja del equipo, más recientes primero.
 async fn listar_cortes(
     state: &AppState,
     claims: &Claims,
@@ -3880,249 +4146,31 @@ async fn listar_cortes(
     #[derive(Deserialize, Default)]
     struct A { #[serde(default)] limite: Option<i64> }
     let a: A = serde_json::from_value(args.clone()).unwrap_or_default();
-    let limite = a.limite.unwrap_or(50);
-    let modo = modo_caja_de(state, claims).await?;
-    let f_origen = if modo == "espejo" { "" } else { "AND c.origen = 'web'" };
-
-    // LEFT JOIN para no ocultar cortes cuyo usuario aún no llegó por sync
-    // (ej. corte del desktop con un usuario_id que el postgres todavía no
-    // tiene). Sin esto un corte huérfano desaparece del historial.
-    //
-    // SHAPE COMPLETA: el frontend (TarjetaCorte) lee total_ventas_*,
-    // num_transacciones, total_entradas_efectivo, total_retiros_efectivo,
-    // fondo_inicial, nota_diferencia. Si faltan, el render hace
-    // `undefined.toFixed(2)` y revienta.
-    let sql = format!(
-        r#"
-        SELECT c.id, c.tipo,
-               COALESCE(u.nombre_completo, '(usuario id ' || c.usuario_id || ')') AS usuario_nombre,
-               c.created_at,
-               c.fondo_inicial,
-               c.total_ventas_efectivo, c.total_ventas_tarjeta,
-               c.total_ventas_transferencia, c.total_ventas,
-               c.num_transacciones,
-               c.total_entradas_efectivo, c.total_retiros_efectivo,
-               c.efectivo_esperado, c.efectivo_contado,
-               c.diferencia, c.nota_diferencia,
-               c.fondo_siguiente
-        FROM cortes c
-        LEFT JOIN usuarios u ON u.id = c.usuario_id
-        WHERE c.deleted_at IS NULL {f_origen}
-        ORDER BY c.created_at DESC
-        LIMIT $1
-        "#
-    );
-    let rows = sqlx::query(&sql)
-    .bind(limite)
-    .fetch_all(&state.pool)
-    .await?;
-
-    Ok(json!(rows.iter().map(|r| json!({
-        "id":                         r.get::<i64, _>("id"),
-        "tipo":                       r.get::<String, _>("tipo"),
-        "usuario_nombre":             r.try_get::<Option<String>, _>("usuario_nombre").ok().flatten().unwrap_or_default(),
-        "created_at":                 r.get::<String, _>("created_at"),
-        "fondo_inicial":              pg_dec(r, "fondo_inicial"),
-        "total_ventas_efectivo":      pg_dec(r, "total_ventas_efectivo"),
-        "total_ventas_tarjeta":       pg_dec(r, "total_ventas_tarjeta"),
-        "total_ventas_transferencia": pg_dec(r, "total_ventas_transferencia"),
-        "total_ventas":               pg_dec(r, "total_ventas"),
-        "num_transacciones":          r.try_get::<i64, _>("num_transacciones").unwrap_or(0),
-        "total_entradas_efectivo":    pg_dec(r, "total_entradas_efectivo"),
-        "total_retiros_efectivo":     pg_dec(r, "total_retiros_efectivo"),
-        "efectivo_esperado":          pg_dec(r, "efectivo_esperado"),
-        "efectivo_contado":           pg_dec(r, "efectivo_contado"),
-        "diferencia":                 pg_dec(r, "diferencia"),
-        "nota_diferencia":            r.try_get::<Option<String>, _>("nota_diferencia").ok().flatten(),
-        "fondo_siguiente":            pg_dec(r, "fondo_siguiente"),
-    })).collect::<Vec<_>>()))
+    let caja = caja::caja_de(&state.pool, claims).await?;
+    let mut conn = state.pool.acquire().await?;
+    a_json(caja::listar_cortes(&mut conn, caja, a.limite.unwrap_or(50)).await?)
 }
 
+/// Detalle completo de un corte (denominaciones + movimientos + vendedores).
 async fn obtener_detalle_corte(state: &AppState, args: &Value) -> Result<Value, ApiError> {
     #[derive(Deserialize)]
     struct A { id: i64 }
     let a: A = serde_json::from_value(args.clone())
         .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
-
-    // LEFT JOIN para no ocultar cortes con usuario aún sin sincronizar.
-    let cab = sqlx::query(
-        r#"
-        SELECT c.id, c.tipo,
-               COALESCE(u.nombre_completo, '(usuario id ' || c.usuario_id || ')') AS usuario_nombre,
-               c.created_at,
-               c.efectivo_esperado, c.efectivo_contado, c.diferencia, c.fondo_siguiente
-        FROM cortes c
-        LEFT JOIN usuarios u ON u.id = c.usuario_id
-        WHERE c.id = $1 AND c.deleted_at IS NULL
-        "#,
-    )
-    .bind(a.id)
-    .fetch_optional(&state.pool)
-    .await?
-    .ok_or(ApiError::NotFound)?;
-
-    let denoms = sqlx::query(
-        "SELECT denominacion, tipo, cantidad, subtotal \
-         FROM corte_denominaciones \
-         WHERE corte_id = $1 AND deleted_at IS NULL \
-         ORDER BY denominacion DESC",
-    )
-    .bind(a.id)
-    .fetch_all(&state.pool).await.unwrap_or_default();
-
-    let movs = sqlx::query(
-        r#"
-        SELECT m.id, m.tipo, m.usuario_id, u.nombre_completo AS usuario_nombre,
-               m.monto, m.concepto, m.autorizado_por, m.corte_id, m.fecha
-        FROM movimientos_caja m
-        JOIN usuarios u ON u.id = m.usuario_id
-        WHERE m.corte_id = $1 AND m.deleted_at IS NULL
-        ORDER BY m.fecha ASC
-        "#,
-    )
-    .bind(a.id)
-    .fetch_all(&state.pool).await.unwrap_or_default();
-
-    let vends = sqlx::query(
-        r#"
-        SELECT cv.usuario_id, u.nombre_completo AS usuario_nombre,
-               cv.num_ventas, cv.total_vendido, cv.hora_inicio, cv.hora_fin
-        FROM corte_vendedores cv
-        JOIN usuarios u ON u.id = cv.usuario_id
-        WHERE cv.corte_id = $1 AND cv.deleted_at IS NULL
-        ORDER BY cv.total_vendido DESC
-        "#,
-    )
-    .bind(a.id)
-    .fetch_all(&state.pool).await.unwrap_or_default();
-
-    Ok(json!({
-        "corte": {
-            "id":                cab.get::<i64, _>("id"),
-            "tipo":              cab.get::<String, _>("tipo"),
-            "usuario_nombre":    cab.try_get::<Option<String>, _>("usuario_nombre").ok().flatten().unwrap_or_default(),
-            "created_at":        cab.get::<String, _>("created_at"),
-            "efectivo_esperado": pg_dec(&cab, "efectivo_esperado"),
-            "efectivo_contado":  pg_dec(&cab, "efectivo_contado"),
-            "diferencia":        pg_dec(&cab, "diferencia"),
-            "fondo_siguiente":   pg_dec(&cab, "fondo_siguiente"),
-        },
-        "denominaciones": denoms.iter().map(|r| json!({
-            "denominacion": pg_dec(r, "denominacion"),
-            "tipo":         r.get::<String, _>("tipo"),
-            "cantidad":     r.try_get::<i64, _>("cantidad").unwrap_or(0),
-            "subtotal":     pg_dec(r, "subtotal"),
-        })).collect::<Vec<_>>(),
-        "movimientos": movs.iter().map(|r| json!({
-            "id":             r.get::<i64, _>("id"),
-            "tipo":           r.get::<String, _>("tipo"),
-            "usuario_id":     r.get::<i64, _>("usuario_id"),
-            "usuario_nombre": r.try_get::<Option<String>, _>("usuario_nombre").ok().flatten().unwrap_or_default(),
-            "monto":          pg_dec(r, "monto"),
-            "concepto":       r.get::<String, _>("concepto"),
-            "autorizado_por": r.try_get::<Option<i64>, _>("autorizado_por").ok().flatten(),
-            "corte_id":       r.try_get::<Option<i64>, _>("corte_id").ok().flatten(),
-            "fecha":          r.get::<String, _>("fecha"),
-        })).collect::<Vec<_>>(),
-        "vendedores": vends.iter().map(|r| json!({
-            "usuario_id":     r.get::<i64, _>("usuario_id"),
-            "usuario_nombre": r.try_get::<Option<String>, _>("usuario_nombre").ok().flatten().unwrap_or_default(),
-            "num_ventas":     r.try_get::<i64, _>("num_ventas").unwrap_or(0),
-            "total_vendido":  pg_dec(r, "total_vendido"),
-            "hora_inicio":    r.try_get::<Option<String>, _>("hora_inicio").ok().flatten().unwrap_or_default(),
-            "hora_fin":       r.try_get::<Option<String>, _>("hora_fin").ok().flatten().unwrap_or_default(),
-        })).collect::<Vec<_>>(),
-    }))
-}
-
-async fn obtener_fondo_sugerido(state: &AppState, claims: &Claims) -> Result<Value, ApiError> {
-    let modo = modo_caja_de(state, claims).await?;
-    let f_origen = if modo == "espejo" { "" } else { "AND origen = 'web'" };
-    let sql = format!(
-        "SELECT fondo_siguiente::numeric FROM cortes \
-         WHERE tipo = 'DIA' AND deleted_at IS NULL {f_origen} \
-         ORDER BY created_at DESC LIMIT 1"
-    );
-    let fondo: Option<f64> = sqlx::query_scalar::<_, rust_decimal::Decimal>(&sql)
-    .fetch_optional(&state.pool).await?
-    .and_then(|d| { use rust_decimal::prelude::ToPrimitive; d.to_f64() });
-
-    Ok(json!(fondo.unwrap_or(2000.0)))
-}
-
-async fn verificar_corte_dia_pendiente(
-    state: &AppState,
-    claims: &Claims,
-) -> Result<Value, ApiError> {
-    // Día más reciente con ventas anterior a HOY que NO tenga corte DIA.
-    //
-    // - 'individual': solo nos importan ventas de origen='web' y solo cortes
-    //   DIA web cubren la deuda. Mantiene el comportamiento previo.
-    // - 'espejo':     cualquier venta del día (web o desktop) cuenta y
-    //   cualquier corte DIA (web o desktop) la cubre.
-    let modo = modo_caja_de(state, claims).await?;
-    let f_v_origen = if modo == "espejo" { "" } else { "AND v.origen = 'web'" };
-    let f_c_origen = if modo == "espejo" { "" } else { "AND c.origen = 'web'" };
-
-    let sql = format!(
-        r#"
-        SELECT substr(v.fecha, 1, 10) AS dia
-        FROM ventas v
-        WHERE substr(v.fecha, 1, 10)
-              < to_char(now() AT TIME ZONE 'America/Mexico_City', 'YYYY-MM-DD')
-          AND v.deleted_at IS NULL
-          {f_v_origen}
-          AND NOT EXISTS (
-              SELECT 1 FROM cortes c
-              WHERE c.tipo = 'DIA'
-                AND c.deleted_at IS NULL
-                {f_c_origen}
-                AND (
-                  -- Comparamos la fecha del día de la venta contra el rango
-                  -- del corte, tomando en cuenta que fecha_fin puede estar
-                  -- almacenada como ISO UTC (ej. '2026-04-27T05:00:00.000Z')
-                  -- lo que al hacer substr da el día SIGUIENTE en hora México.
-                  -- Solución: parsear como timestamptz y convertir a México.
-                  substr(v.fecha, 1, 10) BETWEEN
-                    to_char(
-                      CASE
-                        WHEN c.fecha_inicio ~ 'Z$|[+-][0-9]{{2}}:[0-9]{{2}}$'
-                        THEN c.fecha_inicio::timestamptz AT TIME ZONE 'America/Mexico_City'
-                        ELSE (c.fecha_inicio || '-06')::timestamptz AT TIME ZONE 'America/Mexico_City'
-                      END,
-                      'YYYY-MM-DD'
-                    )
-                    AND
-                    to_char(
-                      CASE
-                        WHEN c.fecha_fin ~ 'Z$|[+-][0-9]{{2}}:[0-9]{{2}}$'
-                        THEN c.fecha_fin::timestamptz AT TIME ZONE 'America/Mexico_City'
-                        ELSE (c.fecha_fin || '-06')::timestamptz AT TIME ZONE 'America/Mexico_City'
-                      END,
-                      'YYYY-MM-DD'
-                    )
-                )
-          )
-        GROUP BY dia
-        ORDER BY dia DESC
-        LIMIT 1
-        "#
-    );
-    let pendiente: Option<String> = sqlx::query_scalar(&sql)
-    .fetch_optional(&state.pool)
-    .await?;
-
-    Ok(match pendiente {
-        Some(s) => json!(s),
-        None => Value::Null,
-    })
+    let mut conn = state.pool.acquire().await?;
+    a_json(caja::detalle_corte(&mut conn, a.id).await?)
 }
 
 /// Busca un usuario admin/dueño por PIN comparando contra el bcrypt hash.
+///
+/// Admin = `roles.es_admin = 1`, igual que el desktop (`verificar_pin_dueno`
+/// en src-tauri/src/commands/auth.rs). Antes era `rol_id IN (1,2)`, pero en
+/// la tabla `roles` el 2 es 'vendedor': el PIN de cualquier vendedora
+/// autorizaba descuentos, devoluciones y retiros grandes en el POS web.
 async fn buscar_dueno_por_pin(state: &AppState, pin: &str) -> Result<Option<i64>, ApiError> {
     let candidatos = sqlx::query(
-        "SELECT id, pin FROM usuarios \
-         WHERE rol_id IN (1,2) AND activo = 1 AND deleted_at IS NULL",
+        "SELECT u.id, u.pin FROM usuarios u JOIN roles r ON r.id = u.rol_id \
+         WHERE r.es_admin = 1 AND u.activo = 1 AND u.deleted_at IS NULL",
     )
     .fetch_all(&state.pool)
     .await?;
@@ -4149,7 +4197,21 @@ async fn buscar_dueno_por_pin(state: &AppState, pin: &str) -> Result<Option<i64>
 // `listar_clientes` (mismo payload por consistencia, aunque la página solo
 // recarga toda la lista después de un mutate).
 
-async fn crear_cliente(state: &AppState, args: Value) -> Result<Value, ApiError> {
+/// Valida el % de descuento de un cliente: 0..100, a 2 decimales
+/// (numeric(6,2)). Ese % se aplica después sin PIN a todas las partidas
+/// (ver crear_venta).
+///
+/// PENDIENTE de decisión del dueño: ¿un vendedor puede dejar a un cliente con
+/// más % que su propio límite sin PIN? El escritorio no lo impide, así que
+/// por ahora aquí tampoco (solo se valida el rango).
+fn validar_descuento_cliente(nuevo_pct: f64) -> Result<f64, ApiError> {
+    if !nuevo_pct.is_finite() || !(0.0..=100.0).contains(&nuevo_pct) {
+        return Err(ApiError::BadRequest("El descuento debe estar entre 0 y 100%".into()));
+    }
+    Ok(crate::venta_calc::round2(nuevo_pct))
+}
+
+async fn crear_cliente(state: &AppState, claims: &Claims, args: Value) -> Result<Value, ApiError> {
     use rust_decimal::prelude::ToPrimitive;
 
     #[derive(Deserialize)]
@@ -4169,6 +4231,8 @@ async fn crear_cliente(state: &AppState, args: Value) -> Result<Value, ApiError>
     if a.nombre.trim().is_empty() {
         return Err(ApiError::BadRequest("El nombre es obligatorio".into()));
     }
+    let sesion = usuario_de_sesion(state, claims).await?;
+    let descuento_porcentaje = validar_descuento_cliente(a.descuento_porcentaje)?;
 
     let uuid = uuid::Uuid::now_v7().to_string();
     let mut tx = state.pool.begin().await?;
@@ -4185,7 +4249,7 @@ async fn crear_cliente(state: &AppState, args: Value) -> Result<Value, ApiError>
         .bind(&a.nombre)
         .bind(a.telefono.as_deref())
         .bind(a.email.as_deref())
-        .bind(a.descuento_porcentaje)
+        .bind(descuento_porcentaje)
         .bind(a.notas.as_deref())
         .fetch_one(&mut *tx)
         .await?;
@@ -4206,12 +4270,13 @@ async fn crear_cliente(state: &AppState, args: Value) -> Result<Value, ApiError>
             descripcion_legible, origen, fecha)
            VALUES ($1, 'CLIENTE_CREADO', 'clientes', $2, $3, 'WEB', {NOW_TEXT})"#
     );
-    let _ = sqlx::query(&audit_sql)
-        .bind(a.usuario_id)
+    let _ = a.usuario_id; // se usa el de la sesión
+    sqlx::query(&audit_sql)
+        .bind(sesion.id)
         .bind(id)
-        .bind(format!("Cliente creado: {}", a.nombre))
+        .bind(format!("Cliente creado: {} ({}%)", a.nombre, descuento_porcentaje))
         .execute(&mut *tx)
-        .await;
+        .await?;
 
     tx.commit().await?;
 
@@ -4227,7 +4292,7 @@ async fn crear_cliente(state: &AppState, args: Value) -> Result<Value, ApiError>
     }))
 }
 
-async fn actualizar_cliente(state: &AppState, args: Value) -> Result<Value, ApiError> {
+async fn actualizar_cliente(state: &AppState, claims: &Claims, args: Value) -> Result<Value, ApiError> {
     #[derive(Deserialize)]
     struct A { datos: ClienteUpd, #[serde(default)] usuario_id: Option<i64> }
     #[derive(Deserialize)]
@@ -4244,15 +4309,23 @@ async fn actualizar_cliente(state: &AppState, args: Value) -> Result<Value, ApiE
         .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
     let c = a.datos;
 
+    let sesion = usuario_de_sesion(state, claims).await?;
     let mut tx = state.pool.begin().await?;
 
-    let uuid: String = sqlx::query_scalar(
-        "SELECT uuid FROM clientes WHERE id = $1 AND deleted_at IS NULL",
+    let prev = sqlx::query(
+        "SELECT uuid, descuento_porcentaje FROM clientes \
+         WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
     )
     .bind(c.id)
     .fetch_optional(&mut *tx)
     .await?
     .ok_or(ApiError::NotFound)?;
+    let uuid: String = prev.get("uuid");
+    let pct_anterior = prev
+        .try_get::<rust_decimal::Decimal, _>("descuento_porcentaje")
+        .map(dec_f64)
+        .unwrap_or(0.0);
+    let descuento_porcentaje = validar_descuento_cliente(c.descuento_porcentaje)?;
 
     let upd_sql = format!(
         r#"UPDATE clientes SET
@@ -4264,7 +4337,7 @@ async fn actualizar_cliente(state: &AppState, args: Value) -> Result<Value, ApiE
         .bind(&c.nombre)
         .bind(c.telefono.as_deref())
         .bind(c.email.as_deref())
-        .bind(c.descuento_porcentaje)
+        .bind(descuento_porcentaje)
         .bind(c.notas.as_deref())
         .bind(c.id)
         .execute(&mut *tx)
@@ -4285,12 +4358,13 @@ async fn actualizar_cliente(state: &AppState, args: Value) -> Result<Value, ApiE
             descripcion_legible, origen, fecha)
            VALUES ($1, 'CLIENTE_EDITADO', 'clientes', $2, $3, 'WEB', {NOW_TEXT})"#
     );
-    let _ = sqlx::query(&audit_sql)
-        .bind(a.usuario_id)
+    let _ = a.usuario_id; // se usa el de la sesión
+    sqlx::query(&audit_sql)
+        .bind(sesion.id)
         .bind(c.id)
-        .bind(format!("Cliente editado: {}", c.nombre))
+        .bind(format!("Cliente editado: {} ({}% → {}%)", c.nombre, pct_anterior, descuento_porcentaje))
         .execute(&mut *tx)
-        .await;
+        .await?;
 
     tx.commit().await?;
     Ok(json!(true))
@@ -4346,13 +4420,13 @@ async fn toggle_cliente_activo(state: &AppState, args: &Value) -> Result<Value, 
             descripcion_legible, origen, fecha)
            VALUES ($1, $2, 'clientes', $3, $4, 'WEB', {NOW_TEXT})"#
     );
-    let _ = sqlx::query(&audit_sql)
+    sqlx::query(&audit_sql)
         .bind(a.usuario_id)
         .bind(accion)
         .bind(a.id)
         .bind(descr)
         .execute(&mut *tx)
-        .await;
+        .await?;
 
     tx.commit().await?;
     Ok(json!(true))
@@ -4362,20 +4436,16 @@ async fn toggle_cliente_activo(state: &AppState, args: &Value) -> Result<Value, 
 // VENTAS — listar del día y anular (paridad con `commands/ventas.rs:224, 319`)
 // =============================================================================
 
-/// Ventas del día actual en zona horaria de México.
-/// El web NO filtra por `origen` (no existe esa columna en `ventas`); muestra
-/// todas las ventas del día — simétrico a desktop.
-async fn listar_ventas_dia(state: &AppState, claims: &Claims) -> Result<Value, ApiError> {
+/// Ventas del día actual en zona horaria de México. Solo lectura: todas las
+/// ventas del día (escritorio y web), simétrico al escritorio; cada fila trae
+/// `caja` y `origen`.
+async fn listar_ventas_dia(state: &AppState) -> Result<Value, ApiError> {
     use rust_decimal::prelude::ToPrimitive;
-
-    // En modo individual filtramos por origen='web' — el listado del día es
-    // específico de "mi caja". En modo espejo se muestra todo.
-    let modo = modo_caja_de(state, claims).await?;
-    let f_origen = if modo == "espejo" { "" } else { "AND v.origen = 'web'" };
 
     let sql = format!(
         r#"
         SELECT v.id, v.folio, v.total, v.metodo_pago, v.anulada, v.fecha,
+               v.caja, v.origen,
                u.nombre_completo AS usuario_nombre,
                c.nombre AS cliente_nombre,
                COALESCE((SELECT COUNT(*) FROM venta_detalle vd
@@ -4386,7 +4456,6 @@ async fn listar_ventas_dia(state: &AppState, claims: &Claims) -> Result<Value, A
         LEFT JOIN clientes c ON c.id = v.cliente_id
         WHERE v.deleted_at IS NULL
           AND substr(v.fecha, 1, 10) = to_char(now() AT TIME ZONE 'America/Mexico_City', 'YYYY-MM-DD')
-          {f_origen}
         ORDER BY v.fecha DESC
         "#
     );
@@ -4405,28 +4474,48 @@ async fn listar_ventas_dia(state: &AppState, claims: &Claims) -> Result<Value, A
         "anulada":         r.get::<i32, _>("anulada") != 0,
         "fecha":           r.get::<String, _>("fecha"),
         "num_productos":   r.get::<i64, _>("num_productos"),
+        "caja":            r.get::<String, _>("caja"),
+        "origen":          r.get::<String, _>("origen"),
     })).collect::<Vec<_>>()))
 }
 
-/// Anular una venta. Reglas (mismas que desktop):
+/// Anular una venta desde la web. Reglas (las del escritorio):
 ///   1. Solo el día en curso — para días anteriores se usa devolución.
 ///   2. No debe tener devoluciones parciales registradas.
-///   3. Restaura stock de cada partida.
-///   4. NO crea movimiento de caja: `calcular_datos_corte` ya excluye
-///      ventas con `anulada = 1`, así que generar un retiro contaría doble.
+///   3. Restaura el stock completo de cada partida.
+///   4. Si la venta fue en efectivo y ya entró en un corte cerrado, ese corte
+///      ya contó el dinero: el reembolso sale AHORA y se registra como RETIRO
+///      del período en curso. Si sigue en el período abierto no hace falta
+///      (el corte excluye ventas anuladas).
+///
+/// Cajas:
+///   - venta de la caja de la tienda ('principal', incluidas las espejo):
+///     se rechaza; su cadena es del escritorio. Se registra una devolución.
+///   - venta de la caja 'web': se anula aquí, con el candado de esa caja; el
+///     reembolso (si aplica) es un RETIRO de la caja web.
+///
+/// Identidad y permisos se resuelven AQUÍ:
+///   - quien anula = usuario de la sesión (se ignora `usuarioId` del body);
+///   - cajero no admin → `pinAutorizacion` de un dueño (roles.es_admin = 1).
+/// La anulación baja al escritorio: updated_at + sync_cursor de la venta, de
+/// cada producto cuyo stock se restauró y del movimiento.
 async fn anular_venta(
     state: &AppState,
     claims: &Claims,
     args: &Value,
 ) -> Result<Value, ApiError> {
-    use rust_decimal::prelude::ToPrimitive;
-
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct A {
         venta_id: i64,
-        usuario_id: i64,
+        /// Se IGNORA: quien anula es el usuario de la sesión.
+        #[serde(default)]
+        usuario_id: Option<i64>,
         motivo: String,
+        /// PIN del dueño cuando el cajero no es admin. El escritorio no lo
+        /// manda a su comando local y aquí se verifica.
+        #[serde(default)]
+        pin_autorizacion: Option<String>,
     }
 
     let a: A = serde_json::from_value(args.clone())
@@ -4435,50 +4524,101 @@ async fn anular_venta(
         return Err(ApiError::BadRequest("El motivo es obligatorio".into()));
     }
 
-    let modo = modo_caja_de(state, claims).await?;
-    let mut tx = state.pool.begin().await?;
+    let sesion = usuario_de_sesion(state, claims).await?;
+    if let Some(uid) = a.usuario_id {
+        avisar_usuario_distinto("anular_venta", uid, &sesion);
+    }
+    if !sesion.es_admin {
+        let pin = a.pin_autorizacion.as_deref().unwrap_or("").trim();
+        if pin.is_empty() {
+            return Err(ApiError::BadRequest(
+                "Se requiere el PIN del dueño para anular una venta".into(),
+            ));
+        }
+        if buscar_dueno_por_pin(state, pin).await?.is_none() {
+            return Err(ApiError::BadRequest("PIN del dueño incorrecto".into()));
+        }
+    }
 
-    // Verificar que existe, no está anulada, y es del día en curso.
-    // Traemos también `origen` para validar que pertenece al modo del cliente:
-    // en modo individual NO permitimos anular ventas que no son del web (esas
-    // pertenecen a la caja del desktop y deben anularse desde allá).
-    let v = sqlx::query(
-        "SELECT folio, fecha, origen FROM ventas \
-         WHERE id = $1 AND anulada = 0 AND deleted_at IS NULL",
+    // La caja de la venta no cambia nunca (el sync no la toca): se lee antes
+    // para tomar su candado PRIMERO, igual que crear_venta.
+    let caja_venta: Option<String> = sqlx::query_scalar(
+        "SELECT caja FROM ventas WHERE id = $1 AND anulada = 0 AND deleted_at IS NULL",
     )
     .bind(a.venta_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&state.pool)
+    .await?;
+    let Some(caja_venta) = caja_venta else {
+        return Err(ApiError::BadRequest("Venta no encontrada o ya anulada".into()));
+    };
+    if caja_venta != Caja::Web.as_str() {
+        return Err(ApiError::BadRequest(MSG_ANULAR_CAJA_TIENDA.into()));
+    }
+
+    let mut tx = state.pool.begin().await?;
+    caja::bloquear(&mut tx, Caja::Web).await?;
+    let ahora = caja::ahora_caja(&mut tx, Caja::Web).await?;
+    anular_venta_tx(&mut tx, sesion.id, a.venta_id, &a.motivo, &ahora).await?;
+    tx.commit().await?;
+    Ok(json!(true))
+}
+
+const MSG_ANULAR_CAJA_TIENDA: &str =
+    "Las ventas de la caja de la tienda se anulan en el POS de escritorio; desde aquí registra una devolución";
+
+/// Núcleo de la anulación de una venta de la caja 'web' (puerto de
+/// `anular_venta_core` del escritorio). Dentro de la transacción del
+/// llamador, que ya tomó el candado de la caja web; `ahora` = `ahora_caja`.
+async fn anular_venta_tx(
+    conn: &mut sqlx::PgConnection,
+    usuario_id: i64,
+    venta_id: i64,
+    motivo: &str,
+    ahora: &str,
+) -> Result<(), ApiError> {
+    // FOR UPDATE: dos anulaciones simultáneas no pueden restaurar el stock
+    // dos veces.
+    let v = sqlx::query(&format!(
+        "SELECT folio, fecha, metodo_pago, total::float8 AS total, caja, uuid, \
+                {} AS momento \
+         FROM ventas WHERE id = $1 AND anulada = 0 AND deleted_at IS NULL FOR UPDATE",
+        caja::MOMENTO_SQL
+    ))
+    .bind(venta_id)
+    .fetch_optional(&mut *conn)
     .await?
     .ok_or_else(|| ApiError::BadRequest("Venta no encontrada o ya anulada".into()))?;
 
     let folio: String = v.get("folio");
     let fecha_venta: String = v.get("fecha");
-    let origen_venta: String = v.try_get("origen").unwrap_or_else(|_| "desktop".to_string());
+    let metodo_pago: String = v.get("metodo_pago");
+    let total_venta: f64 = v.get("total");
+    let caja_venta: String = v.get("caja");
+    let venta_uuid: String = v.get("uuid");
+    let momento_venta: String = v.get("momento");
 
-    if modo == "individual" && origen_venta != "web" {
-        return Err(ApiError::BadRequest(
-            "Esta venta pertenece a otra caja (POS desktop). Anúlala desde allá o cambia tu modo a 'espejo'.".into(),
-        ));
+    if caja_venta != Caja::Web.as_str() {
+        return Err(ApiError::BadRequest(MSG_ANULAR_CAJA_TIENDA.into()));
     }
 
-    let hoy: String = sqlx::query_scalar(
-        "SELECT to_char(now() AT TIME ZONE 'America/Mexico_City', 'YYYY-MM-DD')",
-    )
-    .fetch_one(&mut *tx)
-    .await?;
-    if !fecha_venta.starts_with(&hoy) {
+    let hoy = ahora.get(..10).unwrap_or(ahora);
+    if !fecha_venta.starts_with(hoy) {
         return Err(ApiError::BadRequest(
             "Solo se puede anular una venta del día en curso. Para ventas anteriores, usa el flujo de devolución.".into(),
         ));
     }
 
-    // ¿Tiene devoluciones parciales?
+    // ¿Tiene devoluciones parciales? Solo cuentan las que de verdad son de
+    // esta venta (venta y partidas coinciden; ver crear_devolucion).
     let num_dev: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*)::bigint FROM devoluciones \
-         WHERE venta_id = $1 AND deleted_at IS NULL",
+        "SELECT COUNT(*)::bigint FROM devoluciones dv \
+         WHERE dv.venta_id = $1 AND dv.deleted_at IS NULL \
+           AND EXISTS (SELECT 1 FROM devolucion_detalle dd \
+                       JOIN venta_detalle vd ON vd.id = dd.venta_detalle_id \
+                       WHERE dd.devolucion_id = dv.id AND vd.venta_id = dv.venta_id)",
     )
-    .bind(a.venta_id)
-    .fetch_one(&mut *tx)
+    .bind(venta_id)
+    .fetch_one(&mut *conn)
     .await?;
     if num_dev > 0 {
         return Err(ApiError::BadRequest(
@@ -4486,57 +4626,89 @@ async fn anular_venta(
         ));
     }
 
-    // Restaurar stock de cada partida.
-    let items = sqlx::query(
-        "SELECT producto_id, cantidad FROM venta_detalle \
-         WHERE venta_id = $1 AND deleted_at IS NULL",
-    )
-    .bind(a.venta_id)
-    .fetch_all(&mut *tx)
-    .await?;
+    // ¿La venta ya quedó dentro de un corte cerrado? Si su momento en la
+    // cadena es anterior o igual al del último corte, ese corte ya contó su
+    // efectivo.
+    let ya_cortada = caja::ultimo_corte(&mut *conn, Caja::Web)
+        .await?
+        .map(|u| momento_venta.as_str() <= u.fin.as_str())
+        .unwrap_or(false);
 
+    // Restaurar stock: la cantidad completa de cada partida (la pieza regresa
+    // al anaquel aunque al vender se haya frenado en 0). En orden de producto.
+    let items = sqlx::query(
+        "SELECT producto_id, cantidad::float8 AS cantidad FROM venta_detalle \
+         WHERE venta_id = $1 AND deleted_at IS NULL ORDER BY producto_id, id",
+    )
+    .bind(venta_id)
+    .fetch_all(&mut *conn)
+    .await?;
     let upd_stock_sql = format!(
         "UPDATE productos SET stock_actual = stock_actual + $1, updated_at = {NOW_TEXT} \
          WHERE id = $2"
     );
+    let mut productos_tocados: Vec<i64> = Vec::new();
     for it in &items {
         let prod_id: i64 = it.get("producto_id");
-        let cantidad: f64 = it.try_get::<rust_decimal::Decimal, _>("cantidad")
-            .ok().and_then(|d| d.to_f64()).unwrap_or(0.0);
+        let cantidad: f64 = it.get("cantidad");
         sqlx::query(&upd_stock_sql)
             .bind(cantidad)
             .bind(prod_id)
-            .execute(&mut *tx)
+            .execute(&mut *conn)
             .await?;
+        if !productos_tocados.contains(&prod_id) {
+            productos_tocados.push(prod_id);
+        }
     }
 
-    // Marcar como anulada.
-    sqlx::query(
-        "UPDATE ventas SET anulada = 1, anulada_por = $1, motivo_anulacion = $2 \
-         WHERE id = $3",
-    )
-    .bind(a.usuario_id)
-    .bind(&a.motivo)
-    .bind(a.venta_id)
-    .execute(&mut *tx)
+    // Marcar como anulada (updated_at para que gane en el sync).
+    sqlx::query(&format!(
+        "UPDATE ventas SET anulada = 1, anulada_por = $1, motivo_anulacion = $2, \
+         updated_at = {NOW_TEXT} WHERE id = $3"
+    ))
+    .bind(usuario_id)
+    .bind(motivo)
+    .bind(venta_id)
+    .execute(&mut *conn)
     .await?;
 
-    // Bitácora.
-    let audit_sql = format!(
-        r#"INSERT INTO audit_log
-           (usuario_id, accion, tabla_afectada, registro_id,
-            descripcion_legible, origen, fecha)
-           VALUES ($1, 'ANULACION', 'ventas', $2, $3, 'WEB', {NOW_TEXT})"#
-    );
-    let _ = sqlx::query(&audit_sql)
-        .bind(a.usuario_id)
-        .bind(a.venta_id)
-        .bind(format!("Venta {} anulada — Motivo: {}", folio, a.motivo))
-        .execute(&mut *tx)
-        .await;
+    // Reembolso de una venta en efectivo que ya entró en un corte cerrado.
+    if metodo_pago == "efectivo" && ya_cortada && total_venta > 0.0 {
+        let concepto = format!(
+            "Reembolso por anulación de venta {} (ya incluida en un corte) — {}",
+            folio, motivo
+        );
+        caja::insertar_movimiento(
+            &mut *conn, Caja::Web, "RETIRO", usuario_id, caja::round2(total_venta), &concepto,
+            None, None, ahora,
+        )
+        .await?;
+    }
 
-    tx.commit().await?;
-    Ok(json!(true))
+    // sync_cursor: productos (stock) y la venta, igual que crear_venta.
+    for prod_id in &productos_tocados {
+        sqlx::query(
+            "INSERT INTO sync_cursor (tabla, uuid, sucursal_id, origen_device) \
+             SELECT 'productos', p.uuid, 1, $1 FROM productos p WHERE p.id = $2",
+        )
+        .bind(WEB_ORIGIN)
+        .bind(*prod_id)
+        .execute(&mut *conn)
+        .await?;
+    }
+    caja::registrar_cursor(&mut *conn, "ventas", &venta_uuid).await?;
+
+    caja::bitacora(
+        &mut *conn,
+        usuario_id,
+        "ANULACION",
+        "ventas",
+        Some(venta_id),
+        &format!("Venta {} anulada — Motivo: {}", folio, motivo),
+        ahora,
+    )
+    .await?;
+    Ok(())
 }
 
 // =============================================================================
@@ -4694,12 +4866,12 @@ async fn crear_usuario(
             descripcion_legible, origen, fecha)
            VALUES ($1, 'USUARIO_CREADO', 'usuarios', $2, $3, 'WEB', {NOW_TEXT})"#
     );
-    let _ = sqlx::query(&audit_sql)
+    sqlx::query(&audit_sql)
         .bind(admin_id)
         .bind(id)
         .bind(format!("Usuario creado: {} ({})", u.nombre_completo, u.nombre_usuario))
         .execute(&mut *tx)
-        .await;
+        .await?;
 
     tx.commit().await?;
 
@@ -4818,12 +4990,12 @@ async fn actualizar_usuario(
             descripcion_legible, origen, fecha)
            VALUES ($1, 'USUARIO_EDITADO', 'usuarios', $2, $3, 'WEB', {NOW_TEXT})"#
     );
-    let _ = sqlx::query(&audit_sql)
+    sqlx::query(&audit_sql)
         .bind(admin_id)
         .bind(u.id)
         .bind(format!("Usuario editado: {}", u.nombre_completo))
         .execute(&mut *tx)
-        .await;
+        .await?;
 
     tx.commit().await?;
     Ok(json!(true))
@@ -4889,15 +5061,26 @@ async fn toggle_usuario_activo(
             descripcion_legible, origen, fecha)
            VALUES ($1, $2, 'usuarios', $3, $4, 'WEB', {NOW_TEXT})"#
     );
-    let _ = sqlx::query(&audit_sql)
+    sqlx::query(&audit_sql)
         .bind(admin_id)
         .bind(accion)
         .bind(a.usuario_id)
         .bind(descr)
         .execute(&mut *tx)
-        .await;
+        .await?;
 
     tx.commit().await?;
     Ok(json!(true))
 }
 
+
+// Pruebas de integración contra Postgres (se saltan sin TEST_DATABASE_URL).
+#[cfg(test)]
+#[path = "rpc_precios_tests.rs"]
+mod precios_tests;
+
+// Caja web y caja de la tienda (caja.rs + envolturas de aquí), también contra
+// Postgres.
+#[cfg(test)]
+#[path = "rpc_caja_tests.rs"]
+mod caja_tests;

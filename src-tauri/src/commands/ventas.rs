@@ -54,6 +54,11 @@ pub struct VentaResumen {
     pub anulada: bool,
     pub fecha: String,
     pub num_productos: i64,
+    /// 'principal' (cajón de la tienda) | 'web' (caja aparte de la web).
+    /// Las ventas de caja 'web' no se pueden anular en el escritorio.
+    pub caja: String,
+    /// Quién creó la venta: 'desktop' | 'web'.
+    pub origen: String,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -90,6 +95,8 @@ pub struct VentaDetalleCompleto {
     pub fecha: String,
     pub items: Vec<VentaDetalleItem>,
     pub total_devuelto: f64,
+    pub caja: String,
+    pub origen: String,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -113,34 +120,67 @@ pub fn crear_venta(
 ) -> Result<VentaCreada, String> {
     let db = state.db.lock().unwrap();
     let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    crear_venta_core(&db, venta, &now)
+}
 
-    // Nota: Aunque el POS permite vender sin existencias (el empleado puede agregar al carrito),
-    // el stock_actual siempre se frena en cero (0) mediante MAX() en lugar de quedar en negativo.
+pub(crate) fn crear_venta_core(
+    db: &rusqlite::Connection,
+    venta: NuevaVenta,
+    now: &str,
+) -> Result<VentaCreada, String> {
+    let now = now.to_string();
+    if venta.items.is_empty() {
+        return Err("La venta no tiene productos".to_string());
+    }
+    // Antes del BEGIN: una venta rechazada no gasta folio ni toca stock.
+    if let Some(msg) = validar_cordura_venta(&venta) {
+        return Err(msg);
+    }
 
-    // Generar folio con secuencia dedicada (nunca se duplica)
+    // Regla de stock (decisión del dueño, se mantiene):
+    //   - El POS permite vender sin existencias (el sistema suele tener menos
+    //     de lo que hay en el anaquel), pero stock_actual se frena en cero con
+    //     MAX(0, …): nunca queda negativo por una venta.
+    //   - Al anular (anular_venta_core) o devolver (crear_devolucion_core) se
+    //     suma la cantidad COMPLETA de la partida, aunque la venta haya
+    //     descontado menos por el freno en 0: la pieza regresa físicamente al
+    //     anaquel. Un error de captura o una pieza defectuosa se corrige con un
+    //     ajuste de inventario.
+
+    // Usar transacción para asegurar atomicidad. El folio se consume DENTRO
+    // de la transacción: antes se incrementaba fuera, y si la venta fallaba
+    // el número quedaba gastado (huecos en la secuencia de folios).
+    db.execute("BEGIN TRANSACTION", []).map_err(|e| e.to_string())?;
+
     let ultimo_folio: i64 = db.query_row(
         "SELECT ultimo_valor FROM folio_secuencia WHERE id = 1",
         [], |row| row.get(0),
     ).unwrap_or(0);
     let nuevo_folio = ultimo_folio + 1;
-    db.execute(
+    if let Err(e) = db.execute(
         "UPDATE folio_secuencia SET ultimo_valor = ? WHERE id = 1",
         rusqlite::params![nuevo_folio],
-    ).map_err(|e| e.to_string())?;
+    ) {
+        let _ = db.execute("ROLLBACK", []);
+        return Err(e.to_string());
+    }
     let folio = format!("V-{:06}", nuevo_folio);
 
-    // Usar transacción para asegurar atomicidad
-    db.execute("BEGIN TRANSACTION", []).map_err(|e| e.to_string())?;
+    // `fecha` = reloj real. Si el reloj de la PC quedó en o antes del último
+    // corte (reloj atrasado), la venta entra al período abierto por
+    // registrado_at = fin del corte + 1 s; si no, NULL (ver "RELOJ MONÓTONO"
+    // en cortes.rs).
+    let registrado_at = super::cortes::registrado_at_para(db, &now);
 
     // Insertar venta
     let result = db.execute(
         r#"INSERT INTO ventas (folio, usuario_id, cliente_id, subtotal, descuento, total,
-           metodo_pago, monto_recibido, cambio, fecha)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+           metodo_pago, monto_recibido, cambio, fecha, registrado_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         rusqlite::params![
             folio, venta.usuario_id, venta.cliente_id,
             venta.subtotal, venta.descuento, venta.total,
-            venta.metodo_pago, venta.monto_recibido, venta.cambio, now
+            venta.metodo_pago, venta.monto_recibido, venta.cambio, now, registrado_at
         ],
     );
 
@@ -172,7 +212,7 @@ pub fn crear_venta(
             return Err(format!("Error al insertar detalle: {}", e));
         }
 
-        // Descontar stock (no permitir que baje de cero)
+        // Descontar stock (no permitir que baje de cero; ver la regla arriba)
         let r = db.execute(
             "UPDATE productos SET stock_actual = MAX(0, stock_actual - ?), updated_at = ? WHERE id = ?",
             rusqlite::params![item.cantidad, now, item.producto_id],
@@ -219,6 +259,35 @@ pub fn crear_venta(
     })
 }
 
+/// Cordura mínima de una venta del POS de escritorio.
+///
+/// El escritorio es la caja de confianza de la tienda: su pantalla ya aplica
+/// precios, descuentos, límite del vendedor y PIN, así que aquí NO se
+/// recalculan precios ni se exigen autorizaciones (eso sí lo hace el
+/// servidor web, ver server-remoto/src/venta_calc.rs). Solo se rechaza lo
+/// que la pantalla nunca produce y que corrompería stock o caja: cantidades
+/// <= 0 (sumarían stock), precios negativos, descuentos fuera de 0–100 % o
+/// importes no numéricos. En 14,763 partidas reales no hay ningún caso así.
+pub(crate) fn validar_cordura_venta(v: &NuevaVenta) -> Option<String> {
+    let encabezado = [v.subtotal, v.descuento, v.total, v.monto_recibido, v.cambio];
+    if encabezado.iter().any(|x| !x.is_finite()) || v.total < 0.0 {
+        return Some("Total de la venta inválido".to_string());
+    }
+    for (i, it) in v.items.iter().enumerate() {
+        let ok = it.cantidad.is_finite() && it.cantidad > 0.0
+            && it.precio_original.is_finite() && it.precio_original >= 0.0
+            && it.descuento_porcentaje.is_finite()
+            && (0.0..=100.0).contains(&it.descuento_porcentaje)
+            && it.precio_final.is_finite() && it.subtotal.is_finite();
+        if !ok {
+            return Some(format!(
+                "Partida {} inválida (cantidad, precio o descuento fuera de rango)", i + 1
+            ));
+        }
+    }
+    None
+}
+
 /// Obtener ventas del día actual
 #[tauri::command]
 pub fn listar_ventas_dia(state: State<'_, AppState>) -> Vec<VentaResumen> {
@@ -226,11 +295,12 @@ pub fn listar_ventas_dia(state: State<'_, AppState>) -> Vec<VentaResumen> {
     let hoy = chrono::Local::now().format("%Y-%m-%d").to_string();
     let mut stmt = db.prepare(
         r#"
-        SELECT v.id, v.folio, u.nombre_completo, cl.nombre,
+        SELECT v.id, v.folio, COALESCE(u.nombre_completo, 'Desconocido'), cl.nombre,
                v.total, v.metodo_pago, v.anulada, v.fecha,
-               (SELECT COUNT(*) FROM venta_detalle vd WHERE vd.venta_id = v.id)
+               (SELECT COUNT(*) FROM venta_detalle vd WHERE vd.venta_id = v.id),
+               v.caja, v.origen
         FROM ventas v
-        JOIN usuarios u ON u.id = v.usuario_id
+        LEFT JOIN usuarios u ON u.id = v.usuario_id
         LEFT JOIN clientes cl ON cl.id = v.cliente_id
         WHERE date(v.fecha) = ?
         ORDER BY v.fecha DESC
@@ -248,6 +318,8 @@ pub fn listar_ventas_dia(state: State<'_, AppState>) -> Vec<VentaResumen> {
             anulada: row.get(6)?,
             fecha: row.get(7)?,
             num_productos: row.get(8)?,
+            caja: row.get(9)?,
+            origen: row.get(10)?,
         })
     }).unwrap()
     .filter_map(|r| r.ok())
@@ -324,16 +396,40 @@ pub fn anular_venta(
 ) -> Result<bool, String> {
     let db = state.db.lock().unwrap();
     let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    anular_venta_core(&db, venta_id, usuario_id, motivo, &now)
+}
 
-    // Verificar que la venta existe, no está anulada y es del mismo día
-    let (folio, fecha_venta, metodo_pago, total_venta): (String, String, String, f64) = db.query_row(
-        "SELECT folio, fecha, metodo_pago, total FROM ventas WHERE id = ? AND anulada = 0",
+pub(crate) fn anular_venta_core(
+    db: &rusqlite::Connection,
+    venta_id: i64,
+    usuario_id: i64,
+    motivo: String,
+    now: &str,
+) -> Result<bool, String> {
+    if motivo.trim().is_empty() {
+        return Err("El motivo es obligatorio".to_string());
+    }
+
+    // Verificar que la venta existe, no está anulada ni borrada (borrado
+    // lógico del sync, igual que el servidor) y es del mismo día
+    let (folio, fecha_venta, metodo_pago, total_venta, caja, momento_venta):
+        (String, String, String, f64, String, String) = db.query_row(
+        "SELECT folio, fecha, metodo_pago, total, caja, COALESCE(registrado_at, fecha) \
+         FROM ventas WHERE id = ? AND anulada = 0 AND deleted_at IS NULL",
         rusqlite::params![venta_id],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
     ).map_err(|_| "Venta no encontrada o ya anulada".to_string())?;
 
-    let hoy = Local::now().format("%Y-%m-%d").to_string();
-    if !fecha_venta.starts_with(&hoy) {
+    // Las ventas de la caja web se guardan aquí solo como historial: su
+    // dinero no está en este cajón y su cadena de cortes es del servidor.
+    if caja != "principal" {
+        return Err(
+            "Esta venta es de la caja web; anúlala desde la web o registra una devolución.".to_string()
+        );
+    }
+
+    let hoy = &now[..10];
+    if !fecha_venta.starts_with(hoy) {
         return Err("Solo se puede anular una venta del día en curso. Para ventas anteriores, usa el flujo de devolución.".to_string());
     }
 
@@ -347,50 +443,90 @@ pub fn anular_venta(
         return Err("La venta tiene devoluciones parciales registradas. No se puede anular completa.".to_string());
     }
 
+    // ¿La venta ya quedó dentro de un corte cerrado? Si su momento en la
+    // cadena (registrado_at si llegó tarde por sync, si no su fecha) es
+    // anterior o igual al momento del último corte, ese corte ya contó su
+    // efectivo.
+    let ya_cortada = super::cortes::ultimo_corte(db)
+        .map(|u| momento_venta.as_str() <= u.fin.as_str())
+        .unwrap_or(false);
+
     db.execute("BEGIN TRANSACTION", []).map_err(|e| e.to_string())?;
 
-    // Restaurar stock
-    let mut stmt = db.prepare(
-        "SELECT producto_id, cantidad FROM venta_detalle WHERE venta_id = ?"
-    ).map_err(|e| e.to_string())?;
+    let resultado = (|| -> Result<(), String> {
+        // Restaurar stock: se suma la cantidad completa de cada partida (la
+        // pieza regresa al anaquel), aunque al vender se haya frenado en 0.
+        let items: Vec<(i64, f64)> = {
+            let mut stmt = db.prepare(
+                "SELECT producto_id, cantidad FROM venta_detalle WHERE venta_id = ?"
+            ).map_err(|e| e.to_string())?;
+            let rows = stmt.query_map(
+                rusqlite::params![venta_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect();
+            rows
+        };
 
-    let items: Vec<(i64, f64)> = stmt.query_map(
-        rusqlite::params![venta_id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    ).map_err(|e| e.to_string())?
-    .filter_map(|r| r.ok())
-    .collect();
+        for (prod_id, cantidad) in &items {
+            db.execute(
+                "UPDATE productos SET stock_actual = stock_actual + ?, updated_at = ? WHERE id = ?",
+                rusqlite::params![cantidad, now, prod_id],
+            ).map_err(|e| e.to_string())?;
+        }
 
-    for (prod_id, cantidad) in &items {
+        // Marcar como anulada (updated_at en hora local, como todo el sync)
+        db.execute(
+            "UPDATE ventas SET anulada = 1, anulada_por = ?, motivo_anulacion = ?, updated_at = ? \
+             WHERE id = ?",
+            rusqlite::params![usuario_id, motivo, now, venta_id],
+        ).map_err(|e| e.to_string())?;
+
+        // Efecto en caja de una venta en efectivo anulada:
+        //   - Si sigue en el período abierto, NO hace falta movimiento: el
+        //     cálculo del corte excluye ventas anuladas, así que el esperado
+        //     baja solo (y el dinero sale al devolverlo).
+        //   - Si ya entró en un corte cerrado, ese corte contó el efectivo y
+        //     ya no se recalcula. El reembolso sale de la caja AHORA, así que
+        //     se registra como retiro del período en curso. Antes no se
+        //     registraba y el siguiente corte salía con faltante.
+        if metodo_pago == "efectivo" && ya_cortada && total_venta > 0.0 {
+            // Con el reloj atrasado el retiro entra igual al período abierto
+            // (registrado_at = fin del último corte + 1 s).
+            db.execute(
+                "INSERT INTO movimientos_caja (tipo, usuario_id, monto, concepto, fecha, registrado_at) \
+                 VALUES ('RETIRO', ?, ?, ?, ?, ?)",
+                rusqlite::params![
+                    usuario_id, total_venta,
+                    format!("Reembolso por anulación de venta {} (ya incluida en un corte) — {}", folio, motivo),
+                    now, super::cortes::registrado_at_para(db, now)
+                ],
+            ).map_err(|e| e.to_string())?;
+        }
+
         let _ = db.execute(
-            "UPDATE productos SET stock_actual = stock_actual + ?, updated_at = ? WHERE id = ?",
-            rusqlite::params![cantidad, now, prod_id],
+            r#"INSERT INTO audit_log (usuario_id, accion, tabla_afectada, registro_id,
+               descripcion_legible, origen)
+               VALUES (?, 'ANULACION', 'ventas', ?, ?, 'POS')"#,
+            rusqlite::params![
+                usuario_id, venta_id,
+                format!("Venta {} anulada — Motivo: {}", folio, motivo)
+            ],
         );
+        Ok(())
+    })();
+
+    match resultado {
+        Ok(()) => {
+            db.execute("COMMIT", []).map_err(|e| e.to_string())?;
+            Ok(true)
+        }
+        Err(e) => {
+            let _ = db.execute("ROLLBACK", []);
+            Err(e)
+        }
     }
-
-    // Marcar como anulada
-    db.execute(
-        "UPDATE ventas SET anulada = 1, anulada_por = ?, motivo_anulacion = ? WHERE id = ?",
-        rusqlite::params![usuario_id, motivo, venta_id],
-    ).map_err(|e| { let _ = db.execute("ROLLBACK", []); e.to_string() })?;
-
-    // NOTA: No creamos movimiento_caja para anulaciones porque
-    // calcular_datos_corte ya filtra ventas con anulada = 0.
-    // Crear un retiro aquí causaría doble conteo.
-
-    // Bitácora
-    let _ = db.execute(
-        r#"INSERT INTO audit_log (usuario_id, accion, tabla_afectada, registro_id,
-           descripcion_legible, origen)
-           VALUES (?, 'ANULACION', 'ventas', ?, ?, 'POS')"#,
-        rusqlite::params![
-            usuario_id, venta_id,
-            format!("Venta {} anulada — Motivo: {}", folio, motivo)
-        ],
-    );
-
-    db.execute("COMMIT", []).map_err(|e| e.to_string())?;
-    Ok(true)
 }
 
 /// Buscar ventas por folio / rango de fechas / cliente (histórico completo)
@@ -410,11 +546,12 @@ pub fn buscar_ventas(
     let db = state.db.lock().unwrap();
 
     let mut sql = String::from(
-        r#"SELECT v.id, v.folio, u.nombre_completo, cl.nombre,
+        r#"SELECT v.id, v.folio, COALESCE(u.nombre_completo, 'Desconocido'), cl.nombre,
                   v.total, v.metodo_pago, v.anulada, v.fecha,
-                  (SELECT COUNT(*) FROM venta_detalle vd WHERE vd.venta_id = v.id)
+                  (SELECT COUNT(*) FROM venta_detalle vd WHERE vd.venta_id = v.id),
+                  v.caja, v.origen
            FROM ventas v
-           JOIN usuarios u ON u.id = v.usuario_id
+           LEFT JOIN usuarios u ON u.id = v.usuario_id
            LEFT JOIN clientes cl ON cl.id = v.cliente_id
            WHERE 1=1"#,
     );
@@ -466,6 +603,8 @@ pub fn buscar_ventas(
                 anulada: row.get(6)?,
                 fecha: row.get(7)?,
                 num_productos: row.get(8)?,
+                caja: row.get(9)?,
+                origen: row.get(10)?,
             })
         })
         .map_err(|e| e.to_string())?
@@ -550,17 +689,18 @@ pub fn obtener_detalle_venta(
 
     let (id, folio, usuario_id, usuario_nombre, cliente_id, cliente_nombre,
          subtotal, descuento, total, metodo_pago, anulada, anulada_por_nombre,
-         motivo_anulacion, fecha): (
+         motivo_anulacion, fecha, caja, origen): (
         i64, String, i64, String, Option<i64>, Option<String>,
         f64, f64, f64, String, bool, Option<String>,
-        Option<String>, String
+        Option<String>, String, String, String
     ) = db.query_row(
-        r#"SELECT v.id, v.folio, v.usuario_id, u.nombre_completo,
+        r#"SELECT v.id, v.folio, v.usuario_id, COALESCE(u.nombre_completo, 'Desconocido'),
                   v.cliente_id, cl.nombre,
                   v.subtotal, v.descuento, v.total, v.metodo_pago,
-                  v.anulada, ua.nombre_completo, v.motivo_anulacion, v.fecha
+                  v.anulada, ua.nombre_completo, v.motivo_anulacion, v.fecha,
+                  v.caja, v.origen
            FROM ventas v
-           JOIN usuarios u ON u.id = v.usuario_id
+           LEFT JOIN usuarios u ON u.id = v.usuario_id
            LEFT JOIN usuarios ua ON ua.id = v.anulada_por
            LEFT JOIN clientes cl ON cl.id = v.cliente_id
            WHERE v.id = ?"#,
@@ -568,7 +708,7 @@ pub fn obtener_detalle_venta(
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
                   row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?,
                   row.get(8)?, row.get(9)?, row.get(10)?, row.get(11)?,
-                  row.get(12)?, row.get(13)?)),
+                  row.get(12)?, row.get(13)?, row.get(14)?, row.get(15)?)),
     ).map_err(|_| "Venta no encontrada".to_string())?;
 
     let mut stmt = db.prepare(
@@ -615,6 +755,6 @@ pub fn obtener_detalle_venta(
     Ok(VentaDetalleCompleto {
         id, folio, usuario_id, usuario_nombre, cliente_id, cliente_nombre,
         subtotal, descuento, total, metodo_pago, anulada, anulada_por_nombre,
-        motivo_anulacion, fecha, items, total_devuelto,
+        motivo_anulacion, fecha, items, total_devuelto, caja, origen,
     })
 }

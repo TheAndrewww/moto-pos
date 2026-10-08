@@ -1,7 +1,7 @@
 // pages/Dashboard.tsx — Layout principal del POS (post-login)
 // Navegación lateral + contenido dinámico
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useAuthStore, leerModoCaja, setModoCajaLocal } from '../store/authStore';
 import { invoke, isTauri } from '../lib/invokeCompat';
 import ModalModoCaja from '../components/ModalModoCaja';
@@ -19,7 +19,7 @@ import HistorialVentas from './HistorialVentas';
 import Reportes from './Reportes';
 import Ajustes from './Ajustes';
 import Sincronizacion from './Sincronizacion';
-import { useCortesStore } from '../store/cortesStore';
+import { useCortesStore, infoCajaDeRespuesta } from '../store/cortesStore';
 import {
   ShoppingCart, Package, BarChart3, LogOut, ClipboardList,
   TruckIcon, Tag, Users, ScrollText, DollarSign, History, Settings, UserPlus, TrendingUp,
@@ -62,7 +62,14 @@ export default function Dashboard() {
   const [modoConfigurado, setModoConfigurado] = useState<boolean>(() => leerModoCaja().configurado);
   const [forzarModalModo, setForzarModalModo] = useState<boolean>(false);
   const debeMostrarModalModo = !isTauri() && (!modoConfigurado || forzarModalModo);
-  const { obtenerAperturaHoy } = useCortesStore();
+  const { obtenerAperturaHoy, infoCaja, setInfoCaja, cargarInfoCaja } = useCortesStore();
+
+  // ¿Se hacen cortes y aperturas en este equipo? Siempre en escritorio. En la
+  // web solo con caja propia (modo individual): la caja de la tienda se abre y
+  // se corta en el POS de escritorio. Mientras la web no sabe su caja, no.
+  const cortesAqui = isTauri() || (infoCaja?.cortes_en_este_equipo ?? false);
+  const cortesAquiRef = useRef(cortesAqui);
+  cortesAquiRef.current = cortesAqui;
 
   // Triggers para abrir modales de cortes desde shortcuts globales
   const [triggerMovimiento, setTriggerMovimiento] = useState(0);
@@ -83,14 +90,20 @@ export default function Dashboard() {
   // token JWT viejo sin device_uuid.
   useEffect(() => {
     if (isTauri()) return;
-    invoke<{ modo: 'espejo' | 'individual'; configurado: boolean } | null>('obtener_modo_caja')
+    invoke<{
+      modo: 'espejo' | 'individual'; configurado: boolean; caja?: string;
+      cortes_en_este_equipo?: boolean; escritorio_recibe_web?: boolean;
+    } | null>('obtener_modo_caja')
       .then((r) => {
         if (!r) return;
         setModoCajaState(r.modo);
         setModoConfigurado(r.configurado);
         setModoCajaLocal(r.modo, r.configurado);
+        const info = infoCajaDeRespuesta(r);
+        if (info) setInfoCaja(info);
       })
-      .catch(() => {});
+      // Sin respuesta: la store decide lo prudente (sin cortes aquí).
+      .catch(() => { cargarInfoCaja(); });
   }, []);
 
   // Auto-respaldo diario (una vez al arrancar si no hay uno de hoy)
@@ -121,13 +134,22 @@ export default function Dashboard() {
       .catch(() => {});
   }, [modulo]);
 
-  // Verificar apertura de caja del día — bloquea operación si no hay
+  // Verificar apertura de caja del día — bloquea operación si no hay. Solo
+  // donde se abre la caja: escritorio, o web con caja propia. Un equipo web
+  // en modo espejo usa la caja de la tienda, que abre el escritorio.
+  const cajaConocida = isTauri() || infoCaja !== null;
   useEffect(() => {
+    if (!cajaConocida) return; // la web todavía no sabe su caja
+    if (!cortesAqui) {
+      setNecesitaApertura(false);
+      setVerificandoApertura(false);
+      return;
+    }
     obtenerAperturaHoy()
       .then(apertura => setNecesitaApertura(apertura === null))
       .catch(() => setNecesitaApertura(true))
       .finally(() => setVerificandoApertura(false));
-  }, []);
+  }, [cajaConocida, cortesAqui]);
 
   // Atajos de teclado globales
   useEffect(() => {
@@ -137,8 +159,15 @@ export default function Dashboard() {
       if (e.key === 'F8') { e.preventDefault(); setModulo('dashboard'); }
       if (e.key === 'F6') { e.preventDefault(); setModulo('cortes'); setTriggerMovimiento(n => n + 1); }
       if (e.key === 'F7') { e.preventDefault(); setModulo('historial'); }
-      if (e.key === 'F11' && !e.shiftKey) { e.preventDefault(); setModulo('cortes'); setTriggerParcial(n => n + 1); }
-      if (e.key === 'F11' && e.shiftKey) { e.preventDefault(); setModulo('cortes'); setTriggerDia(n => n + 1); }
+      // Sin cortes en este equipo (web en espejo) F11 solo abre la pantalla.
+      if (e.key === 'F11' && !e.shiftKey) {
+        e.preventDefault(); setModulo('cortes');
+        if (cortesAquiRef.current) setTriggerParcial(n => n + 1);
+      }
+      if (e.key === 'F11' && e.shiftKey) {
+        e.preventDefault(); setModulo('cortes');
+        if (cortesAquiRef.current) setTriggerDia(n => n + 1);
+      }
       if (e.key === 'F10') { e.preventDefault(); setModulo('reportes'); }
       if (e.key === 'F12') { e.preventDefault(); logout(); }
     };
@@ -189,6 +218,8 @@ export default function Dashboard() {
           setModoCajaState(m);
           setModoConfigurado(true);
           setForzarModalModo(false);
+          // La caja cambió: vuelve a decidir si aquí se abre y se corta.
+          cargarInfoCaja();
         }}
         onCerrar={() => setForzarModalModo(false)}
       />
@@ -231,8 +262,8 @@ export default function Dashboard() {
               onClick={() => setForzarModalModo(true)}
               title={
                 modoCaja === 'espejo'
-                  ? 'Caja compartida con POS desktop. Click para cambiar.'
-                  : 'Caja propia independiente. Click para cambiar.'
+                  ? 'Vendes con el dinero de la caja de la tienda; sus cortes se hacen en el POS de escritorio. Click para cambiar.'
+                  : 'Caja propia (caja web), con su propia apertura y sus propios cortes. Click para cambiar.'
               }
               className="btn-ghost"
               style={{
@@ -361,14 +392,17 @@ export default function Dashboard() {
           }}>
             <span style={{ fontSize: 15 }}>⚠️</span>
             <span style={{ fontSize: 13, fontWeight: 600, flex: '1 1 200px', color: 'var(--color-warning)' }}>
-              No se hizo el cierre de caja del {cortePendiente}. Realiza el cierre antes de continuar.
+              Hay ventas sin cerrar desde el {cortePendiente}. El próximo cierre de caja las incluye; hazlo cuando cuentes el efectivo.
             </span>
+            {/* Solo lleva a Caja: abrir aquí el cierre del día hacía que un
+                cierre de la mañana ocupara el cierre de HOY y bloqueara el de
+                la noche. Desde Caja se elige Corte de turno o Cerrar Caja. */}
             <button
               className="btn btn-sm"
               style={{ background: 'var(--color-warning)', color: '#fff', border: 'none' }}
-              onClick={() => { setModulo('cortes'); setTriggerDia(n => n + 1); }}
+              onClick={() => setModulo('cortes')}
             >
-              Hacer corte ahora
+              Ir a Caja
             </button>
             <button
               className="btn btn-ghost btn-sm"
@@ -436,6 +470,7 @@ export default function Dashboard() {
         {modulo === 'reportes' && <Reportes />}
         <div style={{ display: modulo === 'cortes' ? 'flex' : 'none', flexDirection: 'column', flex: 1, overflow: 'hidden' }}>
           <CortesCaja
+            visible={modulo === 'cortes'}
             triggerMovimiento={triggerMovimiento}
             triggerParcial={triggerParcial}
             triggerDia={triggerDia}

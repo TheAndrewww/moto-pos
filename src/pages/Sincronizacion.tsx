@@ -1,8 +1,19 @@
 // pages/Sincronizacion.tsx — Configuración del sync con el servidor remoto (Railway)
 
 import { useState, useEffect } from 'react';
-import { invoke } from '../lib/invokeCompat';
-import { Cloud, CloudOff, CheckCircle2, AlertTriangle, RefreshCw, Wifi, Save, Upload, Zap, Trash2 } from 'lucide-react';
+import { invoke, isTauri } from '../lib/invokeCompat';
+import {
+  Cloud, CloudOff, CheckCircle2, AlertTriangle, RefreshCw, Wifi, Save, Upload, Zap, Trash2,
+  Wrench, Inbox, Activity, ChevronDown, ChevronRight,
+} from 'lucide-react';
+
+interface TareasSync {
+  acepta_web_desde: string | null;
+  mapa_ids_subido_at: string | null;
+  referencias_reparadas_at: string | null;
+  replay_cursor: string | null;
+  replay_hasta: string | null;
+}
 
 interface EstadoSync {
   activo: boolean;
@@ -12,6 +23,10 @@ interface EstadoSync {
   last_push_at: string | null;
   last_pull_at: string | null;
   pendientes: number;
+  /** Cambios recibidos del servidor que esperan en la bandeja (sync_inbox). */
+  recibidos_pendientes?: number;
+  tareas?: TareasSync;
+  replay_pendiente?: boolean;
 }
 
 interface OutboxError {
@@ -22,7 +37,41 @@ interface OutboxError {
   intentos: number;
   ultimo_error: string | null;
   created_at: string;
+  /** 'outbox' = cambio local que no sube; 'inbox' = cambio recibido que no se pudo aplicar. */
+  fuente?: 'outbox' | 'inbox';
+  motivo?: string | null;
 }
+
+interface MapaTabla { tabla: string; enviados: number; recibidos: number; desconocidos: number }
+interface EspejoTabla { tabla: string; filas: number; celdas_cambiadas: number; sin_resolver: number }
+interface ReporteReparacion {
+  mapa: { tablas: MapaTabla[] };
+  servidor: unknown;
+  espejo: { tablas: EspejoTabla[]; filas: number; celdas_cambiadas: number; sin_resolver: number; errores?: string[] };
+}
+
+interface DiagnosticoSync {
+  version_bd: number;
+  bandera_supresion: number;
+  outbox_pendientes: number;
+  outbox_con_error: number;
+  errores_outbox: OutboxError[];
+  bandeja: { motivo: string; cantidad: number }[];
+  tareas: TareasSync;
+  tablas: { tabla: string; columnas: string[] }[];
+}
+
+/** Texto de un error: en escritorio (Tauri) llega como string; en la web,
+ *  como Error (antes se mostraba solo el mensaje genérico). */
+function textoError(e: any): string {
+  return typeof e === 'string' ? e : (e?.message ?? String(e));
+}
+
+const MOTIVOS_BANDEJA: Record<string, string> = {
+  error: 'Error al aplicar',
+  pendiente_local: 'Espera a que suba el cambio local',
+  sin_fk: 'Falta un dato relacionado',
+};
 
 export default function Sincronizacion() {
   const [estado, setEstado] = useState<EstadoSync | null>(null);
@@ -35,6 +84,11 @@ export default function Sincronizacion() {
   const [reintentando, setReintentando] = useState(false);
   const [errores, setErrores] = useState<OutboxError[]>([]);
   const [verErrores, setVerErrores] = useState(false);
+  const [reparando, setReparando] = useState(false);
+  const [reporte, setReporte] = useState<ReporteReparacion | null>(null);
+  const [verDiagnostico, setVerDiagnostico] = useState(false);
+  const [diagnostico, setDiagnostico] = useState<DiagnosticoSync | null>(null);
+  const [cargandoDiag, setCargandoDiag] = useState(false);
   const [mensaje, setMensaje] = useState<{ tipo: 'ok' | 'error' | 'info'; texto: string } | null>(null);
 
   // Form
@@ -86,8 +140,7 @@ export default function Sincronizacion() {
       setPassword('');
       setMensaje({ tipo: 'ok', texto: 'Conectado al servidor remoto. La sincronización empezará automáticamente.' });
     } catch (e: any) {
-      const msg = typeof e === 'string' ? e : e?.message ?? 'Error desconocido';
-      setMensaje({ tipo: 'error', texto: msg });
+      setMensaje({ tipo: 'error', texto: textoError(e) });
     } finally {
       setConectando(false);
     }
@@ -101,7 +154,7 @@ export default function Sincronizacion() {
       cargarEstado();
       setMensaje({ tipo: 'info', texto: 'Sincronización desactivada.' });
     } catch (e: any) {
-      setMensaje({ tipo: 'error', texto: typeof e === 'string' ? e : 'No se pudo desactivar.' });
+      setMensaje({ tipo: 'error', texto: textoError(e) });
     } finally {
       setDesactivando(false);
     }
@@ -119,7 +172,7 @@ export default function Sincronizacion() {
         texto: `${total} registros encolados. Empezarán a subirse en los próximos 30 segundos.`,
       });
     } catch (e: any) {
-      setMensaje({ tipo: 'error', texto: typeof e === 'string' ? e : 'Error encolando datos.' });
+      setMensaje({ tipo: 'error', texto: textoError(e) });
     } finally {
       setReenviando(false);
     }
@@ -134,7 +187,7 @@ export default function Sincronizacion() {
       await cargarErrores();
       setMensaje({ tipo: 'ok', texto: 'Sincronización forzada ejecutada. Revisa pendientes/errores.' });
     } catch (e: any) {
-      setMensaje({ tipo: 'error', texto: typeof e === 'string' ? e : 'Error al forzar sync.' });
+      setMensaje({ tipo: 'error', texto: textoError(e) });
     } finally {
       setForzando(false);
     }
@@ -157,7 +210,7 @@ export default function Sincronizacion() {
       cargarEstado();
       setMensaje({ tipo: 'ok', texto: `${n} registros reseteados. Se reintentarán en el próximo ciclo.` });
     } catch (e: any) {
-      setMensaje({ tipo: 'error', texto: typeof e === 'string' ? e : 'Error reintentando.' });
+      setMensaje({ tipo: 'error', texto: textoError(e) });
     } finally {
       setReintentando(false);
     }
@@ -171,8 +224,42 @@ export default function Sincronizacion() {
       cargarEstado();
       setMensaje({ tipo: 'info', texto: 'Registro descartado.' });
     } catch (e: any) {
-      setMensaje({ tipo: 'error', texto: typeof e === 'string' ? e : 'Error descartando.' });
+      setMensaje({ tipo: 'error', texto: textoError(e) });
     }
+  };
+
+  const repararReferencias = async () => {
+    if (!confirm('¿Reparar referencias con el servidor? Se sube el mapa de registros de este equipo, el servidor corrige vendedores/productos/ventas de las filas de este POS y aquí se corrigen las referencias de lo que se hizo en la web. No cambia montos ni cortes. Puede tardar un par de minutos.')) return;
+    setReparando(true);
+    setMensaje(null);
+    try {
+      const r = await invoke<ReporteReparacion>('reparar_referencias');
+      setReporte(r);
+      cargarEstado();
+      await cargarErrores();
+      setMensaje({ tipo: 'ok', texto: `Referencias reparadas. Aquí se corrigieron ${r.espejo.celdas_cambiadas} referencias de registros hechos en la web.` });
+    } catch (e: any) {
+      setMensaje({ tipo: 'error', texto: textoError(e) });
+    } finally {
+      setReparando(false);
+    }
+  };
+
+  const cargarDiagnostico = async () => {
+    setCargandoDiag(true);
+    try {
+      setDiagnostico(await invoke<DiagnosticoSync>('diagnostico_sync'));
+    } catch (e: any) {
+      setMensaje({ tipo: 'error', texto: textoError(e) });
+    } finally {
+      setCargandoDiag(false);
+    }
+  };
+
+  const alternarDiagnostico = () => {
+    const abrir = !verDiagnostico;
+    setVerDiagnostico(abrir);
+    if (abrir && !diagnostico) cargarDiagnostico();
   };
 
   const probar = async () => {
@@ -182,7 +269,7 @@ export default function Sincronizacion() {
       const ok = await invoke<boolean>('probar_conexion_sync');
       setMensaje({ tipo: ok ? 'ok' : 'error', texto: ok ? 'Servidor responde correctamente.' : 'No hay respuesta del servidor.' });
     } catch (e: any) {
-      setMensaje({ tipo: 'error', texto: typeof e === 'string' ? e : 'Error probando conexión.' });
+      setMensaje({ tipo: 'error', texto: textoError(e) });
     } finally {
       setProbando(false);
     }
@@ -206,8 +293,13 @@ export default function Sincronizacion() {
   // alertar. Un solo 401 ya implica que el server rechazó el token —
   // no es un error transitorio que valga la pena ignorar. Esperar a
   // que sean "la mayoría" demoraba la alerta sin razón.
-  const errores401 = errores.filter(e => (e.ultimo_error || '').includes('401'));
+  // La lista trae primero los errores del outbox y luego la bandeja de
+  // entrada (cambios recibidos que no se pudieron aplicar).
+  const erroresOutbox = errores.filter(e => e.fuente !== 'inbox');
+  const bandeja = errores.filter(e => e.fuente === 'inbox');
+  const errores401 = erroresOutbox.filter(e => (e.ultimo_error || '').includes('401'));
   const tokenMuerto = conectado && errores401.length > 0;
+  const tareas = estado?.tareas;
 
   return (
     <div style={{ padding: 20, maxWidth: 720, margin: '0 auto', overflow: 'auto' }}>
@@ -277,6 +369,23 @@ export default function Sincronizacion() {
                 {estado!.pendientes}
               </span>
             </div>
+            <div>
+              <strong>Recibidos sin aplicar:</strong>{' '}
+              <span style={{ color: (estado!.recibidos_pendientes ?? 0) > 0 ? 'var(--color-warning)' : 'var(--color-text-muted)' }}>
+                {estado!.recibidos_pendientes ?? 0}
+              </span>
+            </div>
+            {tareas && (
+              <div>
+                <strong>Referencias:</strong>{' '}
+                {tareas.referencias_reparadas_at
+                  ? `reparadas ${fmtFecha(tareas.referencias_reparadas_at)}`
+                  : tareas.mapa_ids_subido_at
+                    ? 'mapa subido, falta reparar'
+                    : 'pendiente (se hace sola cuando el servidor esté actualizado)'}
+                {estado!.replay_pendiente && ' · descargando registros web faltantes…'}
+              </div>
+            )}
             <div style={{ fontSize: 11, opacity: 0.7 }}>
               Device: <code>{estado!.device_uuid}</code>
             </div>
@@ -401,6 +510,19 @@ export default function Sincronizacion() {
                   ? <><RefreshCw size={14} className="spin" /> Encolando…</>
                   : <><Upload size={14} /> Reenviar todo</>}
               </button>
+              {/* Solo en escritorio: en la web estos comandos no existen. */}
+              {isTauri() && (
+                <button
+                  className="btn btn-ghost"
+                  onClick={repararReferencias}
+                  disabled={reparando}
+                  title="Corrige vendedores, productos y ventas ligados entre este POS y el servidor. No cambia montos ni cortes."
+                >
+                  {reparando
+                    ? <><RefreshCw size={14} className="spin" /> Reparando…</>
+                    : <><Wrench size={14} /> Reparar referencias</>}
+                </button>
+              )}
               <button
                 className="btn btn-ghost"
                 onClick={desactivar}
@@ -414,6 +536,67 @@ export default function Sincronizacion() {
         </div>
       </div>
 
+      {/* ─── Reporte de la reparación de referencias ─── */}
+      {reporte && (
+        <div style={{
+          marginTop: 18, padding: 14, borderRadius: 8,
+          border: '1px solid var(--color-border)', background: 'var(--color-card)',
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10 }}>
+            <Wrench size={16} />
+            <strong style={{ fontSize: 14, flex: 1 }}>Reporte de la reparación</strong>
+            <button className="btn btn-ghost btn-sm" onClick={() => setReporte(null)}>Cerrar</button>
+          </div>
+          <div style={{ fontSize: 12, display: 'grid', gap: 10 }}>
+            <div>
+              <strong>Mapa de registros subido:</strong>{' '}
+              {reporte.mapa.tablas.reduce((a, t) => a + t.enviados, 0)} registros
+              {reporte.mapa.tablas.some(t => t.desconocidos > 0) && (
+                <span style={{ color: 'var(--color-warning)' }}>
+                  {' '}({reporte.mapa.tablas.reduce((a, t) => a + t.desconocidos, 0)} que el servidor no tiene)
+                </span>
+              )}
+            </div>
+            <div>
+              <strong>En este equipo (registros hechos en la web):</strong>{' '}
+              {reporte.espejo.filas} revisados, {reporte.espejo.celdas_cambiadas} referencias corregidas
+              {reporte.espejo.sin_resolver > 0 && `, ${reporte.espejo.sin_resolver} sin resolver`}
+            </div>
+            {(reporte.espejo.errores ?? []).length > 0 && (
+              <div style={{ color: 'var(--color-danger)' }}>
+                <strong>No se pudieron revisar:</strong> {(reporte.espejo.errores ?? []).join(' · ')}
+              </div>
+            )}
+            {reporte.espejo.tablas.some(t => t.filas > 0) && (
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+                <thead>
+                  <tr>
+                    <th style={errHeadStyle}>Tabla</th>
+                    <th style={{ ...errHeadStyle, textAlign: 'right' }}>Revisados</th>
+                    <th style={{ ...errHeadStyle, textAlign: 'right' }}>Corregidas</th>
+                    <th style={{ ...errHeadStyle, textAlign: 'right' }}>Sin resolver</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {reporte.espejo.tablas.filter(t => t.filas > 0).map(t => (
+                    <tr key={t.tabla} style={{ borderTop: '1px solid var(--color-border)' }}>
+                      <td style={errCellStyle}>{t.tabla}</td>
+                      <td style={{ ...errCellStyle, textAlign: 'right' }}>{t.filas}</td>
+                      <td style={{ ...errCellStyle, textAlign: 'right' }}>{t.celdas_cambiadas}</td>
+                      <td style={{ ...errCellStyle, textAlign: 'right' }}>{t.sin_resolver}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+            <details>
+              <summary style={{ cursor: 'pointer' }}><strong>Reporte del servidor</strong></summary>
+              <pre style={preStyle}>{JSON.stringify(reporte.servidor, null, 2)}</pre>
+            </details>
+          </div>
+        </div>
+      )}
+
       {/* ─── Panel de errores del outbox ─── */}
       {conectado && (
         <div style={{
@@ -425,7 +608,14 @@ export default function Sincronizacion() {
         }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10 }}>
             <AlertTriangle size={16} style={{ color: 'var(--color-warning)' }} />
-            <strong style={{ fontSize: 14, flex: 1 }}>Errores de sincronización</strong>
+            <strong style={{ fontSize: 14, flex: 1 }}>
+              Errores de sincronización
+              {(erroresOutbox.length > 0 || bandeja.length > 0) && (
+                <span style={{ fontWeight: 400, fontSize: 12, color: 'var(--color-text-muted)' }}>
+                  {' '}({erroresOutbox.length} por subir · {bandeja.length} recibidos sin aplicar)
+                </span>
+              )}
+            </strong>
             <button
               className="btn btn-ghost btn-sm"
               onClick={() => setVerErrores(v => !v)}
@@ -446,18 +636,18 @@ export default function Sincronizacion() {
                 <button
                   className="btn btn-sm"
                   onClick={reintentarErrores}
-                  disabled={reintentando || errores.length === 0}
+                  disabled={reintentando || erroresOutbox.length === 0}
                 >
                   {reintentando
                     ? <><RefreshCw size={14} className="spin" /> Reseteando…</>
-                    : <><RefreshCw size={14} /> Reintentar fallidos ({errores.length})</>}
+                    : <><RefreshCw size={14} /> Reintentar fallidos ({erroresOutbox.length})</>}
                 </button>
                 <button className="btn btn-ghost btn-sm" onClick={cargarErrores}>
                   <RefreshCw size={14} /> Recargar lista
                 </button>
               </div>
 
-              {errores.length === 0 ? (
+              {erroresOutbox.length === 0 ? (
                 <div style={{
                   padding: 16, textAlign: 'center',
                   color: 'var(--color-text-muted)', fontSize: 13,
@@ -477,7 +667,7 @@ export default function Sincronizacion() {
                       </tr>
                     </thead>
                     <tbody>
-                      {errores.map(e => (
+                      {erroresOutbox.map(e => (
                         <tr key={e.id} style={{ borderTop: '1px solid var(--color-border)' }}>
                           <td style={errCellStyle}>
                             <strong>{e.tabla}</strong>
@@ -510,7 +700,126 @@ export default function Sincronizacion() {
                   </table>
                 </div>
               )}
+
+              {/* ─── Bandeja de entrada (cambios recibidos sin aplicar) ─── */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 16, marginBottom: 6 }}>
+                <Inbox size={14} />
+                <strong style={{ fontSize: 13 }}>Recibidos del servidor sin aplicar ({bandeja.length})</strong>
+              </div>
+              <p style={{ fontSize: 12, color: 'var(--color-text-muted)', marginTop: 0, marginBottom: 10 }}>
+                Cambios que llegaron del servidor y no se pudieron guardar aquí. Se reintentan solos
+                (los que esperan un cambio local, en cuanto ese cambio sube). Después de 30 días se descartan.
+              </p>
+              {bandeja.length === 0 ? (
+                <div style={{ padding: 12, textAlign: 'center', color: 'var(--color-text-muted)', fontSize: 13 }}>
+                  Nada pendiente.
+                </div>
+              ) : (
+                <div style={{ maxHeight: 260, overflow: 'auto', border: '1px solid var(--color-border)', borderRadius: 6 }}>
+                  <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+                    <thead style={{ position: 'sticky', top: 0, background: 'var(--color-surface)' }}>
+                      <tr>
+                        <th style={errHeadStyle}>Tabla</th>
+                        <th style={errHeadStyle}>Motivo</th>
+                        <th style={{ ...errHeadStyle, textAlign: 'center' }}>Intentos</th>
+                        <th style={errHeadStyle}>Detalle</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {bandeja.map(e => (
+                        <tr key={`inbox-${e.id}`} style={{ borderTop: '1px solid var(--color-border)' }}>
+                          <td style={errCellStyle}>
+                            <strong>{e.tabla}</strong>
+                            <div style={{ fontSize: 10, color: 'var(--color-text-muted)', fontFamily: 'monospace' }}>
+                              {e.uuid.slice(0, 8)}…
+                            </div>
+                          </td>
+                          <td style={errCellStyle}>{MOTIVOS_BANDEJA[e.motivo ?? ''] ?? e.motivo}</td>
+                          <td style={{ ...errCellStyle, textAlign: 'center', color: 'var(--color-warning)' }}>{e.intentos}</td>
+                          <td style={{ ...errCellStyle, fontSize: 11, color: 'var(--color-text-muted)', maxWidth: 280 }}>
+                            <div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={e.ultimo_error || ''}>
+                              {e.ultimo_error || '(sin detalle)'}
+                            </div>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
             </>
+          )}
+        </div>
+      )}
+
+      {/* ─── Diagnóstico (plegable; solo escritorio) ─── */}
+      {conectado && isTauri() && (
+        <div style={{
+          marginTop: 18, padding: 14, borderRadius: 8,
+          border: '1px solid var(--color-border)', background: 'var(--color-card)',
+        }}>
+          <div
+            style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer' }}
+            onClick={alternarDiagnostico}
+          >
+            {verDiagnostico ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+            <Activity size={16} />
+            <strong style={{ fontSize: 14, flex: 1 }}>Diagnóstico</strong>
+            {verDiagnostico && (
+              <button
+                className="btn btn-ghost btn-sm"
+                onClick={ev => { ev.stopPropagation(); cargarDiagnostico(); }}
+                disabled={cargandoDiag}
+              >
+                <RefreshCw size={14} className={cargandoDiag ? 'spin' : undefined} /> Actualizar
+              </button>
+            )}
+          </div>
+          {verDiagnostico && (
+            <div style={{ marginTop: 12, fontSize: 12 }}>
+              {!diagnostico ? (
+                <div style={{ color: 'var(--color-text-muted)' }}>Cargando…</div>
+              ) : (
+                <div style={{ display: 'grid', gap: 6 }}>
+                  <div><strong>Versión de la base de datos:</strong> {diagnostico.version_bd}</div>
+                  <div>
+                    <strong>Bandera de supresión:</strong>{' '}
+                    <span style={{ color: diagnostico.bandera_supresion === 0 ? 'rgb(34,197,94)' : 'var(--color-danger)' }}>
+                      {diagnostico.bandera_supresion === 0 ? 'limpia' : `PUESTA (${diagnostico.bandera_supresion}) — reinicia el POS`}
+                    </span>
+                  </div>
+                  <div><strong>Outbox:</strong> {diagnostico.outbox_pendientes} pendientes, {diagnostico.outbox_con_error} con error</div>
+                  <div>
+                    <strong>Bandeja de entrada:</strong>{' '}
+                    {diagnostico.bandeja.length === 0
+                      ? 'vacía'
+                      : diagnostico.bandeja.map(b => `${MOTIVOS_BANDEJA[b.motivo] ?? b.motivo}: ${b.cantidad}`).join(' · ')}
+                  </div>
+                  <div>
+                    <strong>Tareas únicas:</strong>{' '}
+                    mapa {diagnostico.tareas.mapa_ids_subido_at ?? '—'} · reparación {diagnostico.tareas.referencias_reparadas_at ?? '—'}
+                    {' '}· re-descarga {diagnostico.tareas.replay_cursor ?? '—'}/{diagnostico.tareas.replay_hasta ?? '—'}
+                    {' '}· acepta web desde {diagnostico.tareas.acepta_web_desde ?? '—'}
+                  </div>
+                  {diagnostico.errores_outbox.length > 0 && (
+                    <details>
+                      <summary style={{ cursor: 'pointer' }}><strong>Errores del outbox ({diagnostico.errores_outbox.length})</strong></summary>
+                      <pre style={preStyle}>
+                        {diagnostico.errores_outbox.map(e => `${e.tabla} ${e.uuid} ×${e.intentos}: ${e.ultimo_error ?? ''}`).join('\n')}
+                      </pre>
+                    </details>
+                  )}
+                  <details>
+                    <summary style={{ cursor: 'pointer' }}><strong>Esquema de tablas sincronizadas ({diagnostico.tablas.length})</strong></summary>
+                    <pre style={preStyle}>
+                      {diagnostico.tablas.map(t =>
+                        `${t.tabla}${t.columnas.length === 0 ? '  (NO EXISTE)' : ''}\n${t.columnas.map(c => '  ' + c).join('\n')}`
+                      ).join('\n\n')}
+                    </pre>
+                  </details>
+                </div>
+              )}
+            </div>
           )}
         </div>
       )}
@@ -536,6 +845,19 @@ const errHeadStyle: React.CSSProperties = {
 const errCellStyle: React.CSSProperties = {
   padding: '8px 10px',
   verticalAlign: 'top',
+};
+
+const preStyle: React.CSSProperties = {
+  marginTop: 8,
+  padding: 10,
+  maxHeight: 320,
+  overflow: 'auto',
+  fontSize: 11,
+  lineHeight: 1.45,
+  background: 'var(--color-surface)',
+  border: '1px solid var(--color-border)',
+  borderRadius: 6,
+  whiteSpace: 'pre-wrap',
 };
 
 function Field({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {

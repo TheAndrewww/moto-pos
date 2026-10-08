@@ -19,6 +19,8 @@ const MIGRATIONS: &[MigrationFn] = &[
     migracion_011_audit_log_sync,
     migracion_012_vendedor_sin_inventario,
     migracion_013_permisos_recepcion,
+    migracion_014_permisos_sin_duplicados,
+    migracion_015_sync_v2,
 ];
 
 pub fn aplicar_migraciones(conn: &Connection) -> Result<()> {
@@ -867,6 +869,15 @@ fn migracion_012_vendedor_sin_inventario(conn: &Connection) -> Result<()> {
 // Idempotente: borra cualquier (rol, recepcion, *) previa antes de
 // insertar. Permite re-ejecutarse sin duplicar.
 fn migracion_013_permisos_recepcion(conn: &Connection) -> Result<()> {
+    // En una instalación nueva las migraciones corren ANTES de SEED_DATA, así
+    // que la tabla roles está vacía y estos INSERT violaban la llave foránea
+    // (permisos.rol_id → roles.id): el POS no arrancaba en una computadora
+    // nueva. En ese caso no hay nada que migrar — SEED_DATA ya trae los
+    // permisos de recepción.
+    let roles: i64 = conn.query_row("SELECT COUNT(*) FROM roles", [], |r| r.get(0))?;
+    if roles == 0 {
+        return Ok(());
+    }
     conn.execute("DELETE FROM permisos WHERE modulo = 'recepcion'", [])?;
     conn.execute_batch(r#"
         INSERT INTO permisos (rol_id, modulo, accion, permitido) VALUES
@@ -874,5 +885,250 @@ fn migracion_013_permisos_recepcion(conn: &Connection) -> Result<()> {
             (2, 'recepcion', 'ver',   1), (2, 'recepcion', 'crear', 1),
             (3, 'recepcion', 'ver',   1), (3, 'recepcion', 'crear', 1);
     "#)?;
+    Ok(())
+}
+
+// ─── Migración 014 ────────────────────────────────────────
+// Elimina permisos duplicados y evita que vuelvan a crearse.
+//
+// SEED_DATA corre en CADA arranque con `INSERT OR IGNORE INTO permisos`, pero
+// la tabla no tenía índice único sobre (rol_id, modulo, accion): el OR IGNORE
+// nunca ignoraba nada y cada vez que se abría el POS se duplicaba la lista
+// completa de permisos. Se conserva la fila más reciente de cada permiso (la
+// que refleja los cambios de las migraciones 012 y 013) y se crea el índice
+// único para que el seed deje de duplicar.
+fn migracion_014_permisos_sin_duplicados(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "DELETE FROM permisos WHERE id NOT IN \
+         (SELECT MAX(id) FROM permisos GROUP BY rol_id, modulo, accion)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_permisos_unico ON permisos(rol_id, modulo, accion)",
+        [],
+    )?;
+    Ok(())
+}
+
+// ─── Migración 015 ────────────────────────────────────────
+// Sync v2: caja/origen en las tablas de dinero, bandeja de cambios recibidos
+// que no se pudieron aplicar, y un solo reloj (hora local) para updated_at.
+//
+// 1. `origen` ('desktop' | 'web') y `caja` ('principal' | 'web') en ventas,
+//    cortes, movimientos_caja y aperturas_caja. El servidor ya tenía `origen`
+//    y por esa columna faltante el escritorio rechazaba TODA fila de dinero
+//    hecha en la web. `caja` dice a qué cajón pertenece: 'principal' es el de
+//    la tienda (cuenta en los cortes del escritorio), 'web' es una caja aparte
+//    de la web (nunca cuenta aquí).
+// 2. `registrado_at` en ventas y movimientos_caja: momento en que una venta o
+//    movimiento hecho en la web llegó a este equipo DESPUÉS de un corte que ya
+//    cubría su fecha. El corte usa COALESCE(registrado_at, fecha) para que esa
+//    venta entre al corte siguiente en vez de perderse. Las filas del propio
+//    escritorio lo dejan NULL (su comportamiento no cambia).
+// 3. `sync_inbox`: cambios recibidos del servidor que no se pudieron aplicar
+//    (antes solo se escribían en el log y se perdían para siempre).
+// 4. Columnas de control en sync_state (subida del mapa de ids, reparación de
+//    referencias, re-descarga de filas web faltantes).
+// 5. Reloj único: los triggers `trg_*_bump_updated` escribían
+//    datetime('now') = UTC, mientras el servidor y parte del código usan hora
+//    local; la comparación "el más nuevo gana" quedaba 6 horas chueca y el
+//    servidor rechazaba cambios del escritorio. Se recrean con hora local y
+//    se normalizan las marcas que quedaron en el futuro.
+// 6. stock_sucursal sale del sync (nadie la lee) y se limpia la bandera de
+//    supresión de triggers por si quedó pegada.
+//
+// Idempotente y sin dependencias de SEED_DATA (en instalación nueva corre
+// antes del seed).
+fn migracion_015_sync_v2(conn: &Connection) -> Result<()> {
+    // 1 y 2. Columnas nuevas (default constante: SQLite lo acepta en tablas
+    // con datos y no dispara triggers).
+    for tabla in ["ventas", "cortes", "movimientos_caja", "aperturas_caja"] {
+        if !tabla_existe(conn, tabla) { continue; }
+        if !columna_existe(conn, tabla, "origen") {
+            conn.execute(
+                &format!("ALTER TABLE {tabla} ADD COLUMN origen TEXT NOT NULL DEFAULT 'desktop'"),
+                [],
+            )?;
+        }
+        if !columna_existe(conn, tabla, "caja") {
+            conn.execute(
+                &format!("ALTER TABLE {tabla} ADD COLUMN caja TEXT NOT NULL DEFAULT 'principal'"),
+                [],
+            )?;
+        }
+    }
+    for tabla in ["ventas", "movimientos_caja"] {
+        if !tabla_existe(conn, tabla) { continue; }
+        if !columna_existe(conn, tabla, "registrado_at") {
+            conn.execute(&format!("ALTER TABLE {tabla} ADD COLUMN registrado_at TEXT"), [])?;
+        }
+    }
+    conn.execute_batch(r#"
+        CREATE INDEX IF NOT EXISTS idx_ventas_caja_fecha ON ventas(caja, fecha);
+        CREATE INDEX IF NOT EXISTS idx_ventas_momento ON ventas(COALESCE(registrado_at, fecha));
+        CREATE INDEX IF NOT EXISTS idx_movimientos_caja_caja ON movimientos_caja(caja, corte_id);
+        CREATE INDEX IF NOT EXISTS idx_movimientos_momento ON movimientos_caja(COALESCE(registrado_at, fecha));
+    "#)?;
+
+    // Filas que ya estaban aquí pero las creó la web (uuid que no es de 32 hex:
+    // las pocas que alcanzaron a bajar antes de que el servidor agregara
+    // `origen`). Se marcan con la bandera de supresión puesta para no
+    // re-empujarlas ni mover su updated_at.
+    conn.execute("INSERT OR IGNORE INTO sync_suppress_flag (id) VALUES (1)", [])?;
+    for tabla in ["ventas", "cortes", "movimientos_caja", "aperturas_caja"] {
+        if !tabla_existe(conn, tabla) { continue; }
+        conn.execute(
+            &format!(
+                "UPDATE {tabla} SET origen = 'web' \
+                 WHERE uuid IS NOT NULL AND origen = 'desktop' \
+                   AND NOT (length(uuid) = 32 AND uuid NOT GLOB '*[^0-9a-f]*')"
+            ),
+            [],
+        )?;
+    }
+    conn.execute("DELETE FROM sync_suppress_flag", [])?;
+
+    // 3. Bandeja de cambios recibidos pendientes.
+    conn.execute_batch(r#"
+        CREATE TABLE IF NOT EXISTS sync_inbox (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            tabla           TEXT NOT NULL,
+            uuid            TEXT NOT NULL,
+            motivo          TEXT NOT NULL,          -- 'error' | 'pendiente_local' | 'sin_fk'
+            error           TEXT,
+            payload         TEXT,                   -- el cambio tal como llegó (JSON)
+            intentos        INTEGER NOT NULL DEFAULT 0,
+            proximo_intento TEXT,
+            ultimo_intento  TEXT,
+            created_at      TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+            UNIQUE(tabla, uuid)
+        );
+    "#)?;
+
+    // 4. Control de tareas únicas del sync v2.
+    if tabla_existe(conn, "sync_state") {
+        for col in [
+            "acepta_web_desde",          // ventas web con fecha anterior nunca se re-acomodan
+            "mapa_ids_subido_at",        // subida del mapa id → uuid al servidor
+            "referencias_reparadas_at",  // reparación de referencias (servidor + espejo)
+            "replay_cursor",             // re-descarga de filas web faltantes
+            "replay_hasta",
+        ] {
+            if !columna_existe(conn, "sync_state", col) {
+                conn.execute(&format!("ALTER TABLE sync_state ADD COLUMN {col} TEXT"), [])?;
+            }
+        }
+        conn.execute(
+            "UPDATE sync_state SET acepta_web_desde = datetime('now','localtime') \
+             WHERE acepta_web_desde IS NULL",
+            [],
+        )?;
+    }
+
+    // 5. Reloj único: triggers de updated_at en hora local.
+    let con_updated_auto: &[&str] = &[
+        "productos", "proveedores", "clientes", "usuarios", "categorias",
+        "sucursales", "stock_sucursal",
+        "ventas", "presupuestos", "ordenes_pedido", "recepciones",
+        "cortes", "devoluciones", "transferencias",
+        "movimientos_caja", "aperturas_caja",
+    ];
+    for tabla in con_updated_auto {
+        if !tabla_existe(conn, tabla) || !columna_existe(conn, tabla, "updated_at") { continue; }
+        conn.execute_batch(&format!(
+            r#"
+            DROP TRIGGER IF EXISTS trg_{tabla}_bump_updated;
+            CREATE TRIGGER trg_{tabla}_bump_updated
+            AFTER UPDATE ON {tabla}
+            WHEN NEW.updated_at = OLD.updated_at
+             AND NOT EXISTS (SELECT 1 FROM sync_suppress_flag WHERE id=1)
+            BEGIN
+                UPDATE {tabla} SET updated_at = datetime('now','localtime') WHERE id = NEW.id;
+            END;
+            "#
+        ))?;
+    }
+
+    // Marcas en el futuro: las escribió la versión anterior en UTC (6 h
+    // adelante) o con formato 'T'. Se convierten a la hora local REAL en que se
+    // hizo el cambio (no a "ahora": eso haría que la copia vieja de la tienda
+    // pisara ediciones hechas en la web en esas horas), con tope en ahora por si
+    // el reloj de la PC estaba adelantado. Se hace con la bandera de supresión
+    // puesta: no se re-encolan ni se mueve updated_at otra vez.
+    let mut con_updated: Vec<&str> = con_updated_auto.to_vec();
+    con_updated.push("audit_log");
+    // Las de catálogo se anotan en la bandeja para pedir al servidor su versión
+    // en el primer ciclo: la versión anterior pudo saltarse una edición web por
+    // la marca chueca, y así se recupera (gana la más nueva).
+    let catalogo = ["productos", "proveedores", "clientes", "usuarios", "categorias", "sucursales"];
+    for tabla in catalogo {
+        if !tabla_existe(conn, tabla) || !columna_existe(conn, tabla, "updated_at") { continue; }
+        conn.execute(
+            &format!(
+                "INSERT OR IGNORE INTO sync_inbox (tabla, uuid, motivo, error, proximo_intento) \
+                 SELECT '{tabla}', uuid, 'error', 'marca futura de la versión anterior', \
+                        datetime('now','localtime') \
+                   FROM {tabla} \
+                  WHERE uuid IS NOT NULL AND updated_at > datetime('now','localtime') \
+                    AND EXISTS (SELECT 1 FROM sync_state WHERE id = 1 AND activo = 1)"
+            ),
+            [],
+        )?;
+    }
+    conn.execute("INSERT OR IGNORE INTO sync_suppress_flag (id) VALUES (1)", [])?;
+    for tabla in &con_updated {
+        if !tabla_existe(conn, tabla) || !columna_existe(conn, tabla, "updated_at") { continue; }
+        conn.execute(
+            &format!(
+                "UPDATE {tabla} \
+                    SET updated_at = MIN(COALESCE(datetime(updated_at, 'localtime'), \
+                                                  datetime('now','localtime')), \
+                                         datetime('now','localtime')) \
+                  WHERE updated_at > datetime('now','localtime')"
+            ),
+            [],
+        )?;
+    }
+    conn.execute("DELETE FROM sync_suppress_flag", [])?;
+    // Filas que el servidor rechazó por "remoto más nuevo": se reintentan. El
+    // servidor v2 acepta la versión del escritorio cuando la fila del servidor
+    // la escribió este mismo equipo, y en productos fusiona campo por campo.
+    if tabla_existe(conn, "sync_outbox") {
+        conn.execute(
+            "UPDATE sync_outbox SET intentos = 0, ultimo_error = NULL \
+              WHERE synced_at IS NULL AND ultimo_error LIKE '%remoto_mas_nuevo%'",
+            [],
+        )?;
+    }
+
+    // Base de la fusión de 3 vías de productos: la última versión de cada fila
+    // que este equipo y el servidor tuvieron en común (lo último que se empujó
+    // con éxito o que se aplicó desde el servidor). Con ella el servidor sabe
+    // qué campos cambió el escritorio y aplica la existencia como diferencia.
+    conn.execute_batch(r#"
+        CREATE TABLE IF NOT EXISTS sync_base (
+            tabla      TEXT NOT NULL,
+            uuid       TEXT NOT NULL,
+            datos      TEXT NOT NULL,   -- JSON de la fila
+            updated_at TEXT,
+            PRIMARY KEY (tabla, uuid)
+        );
+    "#)?;
+
+    // 6. stock_sucursal fuera del sync.
+    conn.execute_batch(r#"
+        DROP TRIGGER IF EXISTS trg_stock_sucursal_outbox_ins;
+        DROP TRIGGER IF EXISTS trg_stock_sucursal_outbox_upd;
+        DROP TRIGGER IF EXISTS trg_stock_sucursal_outbox_del;
+    "#)?;
+    if tabla_existe(conn, "sync_outbox") {
+        conn.execute(
+            "UPDATE sync_outbox SET synced_at = datetime('now','localtime'), \
+                    ultimo_error = 'stock_sucursal fuera de sync' \
+              WHERE tabla = 'stock_sucursal' AND synced_at IS NULL",
+            [],
+        )?;
+    }
+    conn.execute("DELETE FROM sync_suppress_flag", [])?;
     Ok(())
 }

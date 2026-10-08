@@ -1,19 +1,23 @@
-// components/ModalModoCaja.tsx — Selector inicial del modo de caja del web.
+// components/ModalModoCaja.tsx — Selector del modo de caja del equipo web.
 //
 // Se muestra:
 //   - Automáticamente al primer login en un nuevo navegador (modo_configurado=false).
-//   - Manualmente desde Ajustes → "Cambiar modo de caja".
+//   - Manualmente desde el chip de modo de caja de la barra superior.
 //
-// Dos modos:
-//   🪞 Espejo:     comparte caja con el POS desktop (1 fondo, 1 corte único).
-//   🧾 Individual: caja propia (fondo, ventas y corte separados del desktop).
+// Dos modos (ver server-remoto/src/caja.rs):
+//   🪞 Espejo (recomendado): vende con el dinero del cajón de la tienda. Sus
+//      ventas, entradas y retiros entran a la caja de la tienda y se cuentan
+//      en el corte del POS de escritorio; aquí no se hacen cortes.
+//   🧾 Caja propia: dinero fuera del cajón de la tienda. Todos los equipos en
+//      este modo comparten la caja web, con su propia apertura y sus cortes.
 //
-// El backend (rpc.rs) hace cumplir el cambio: rechaza si hay movimientos
-// pendientes del modo previo. Aquí solo capturamos la elección.
+// El servidor hace cumplir el cambio: no deja volver a espejo si la caja web
+// tiene dinero sin cortar. Aquí solo se captura la elección.
 
 import { useState } from 'react';
 import { invoke } from '../lib/invokeCompat';
 import { setModoCajaLocal } from '../store/authStore';
+import { useCortesStore, infoCajaDeRespuesta } from '../store/cortesStore';
 import { Monitor, Wallet, X } from 'lucide-react';
 
 interface Props {
@@ -30,7 +34,12 @@ export default function ModalModoCaja({
   onSeleccion,
   onCerrar,
 }: Props) {
-  const [seleccion, setSeleccion] = useState<'espejo' | 'individual' | null>(modoActual ?? null);
+  // Primera vez en este equipo: se sugiere espejo (la web se usa como
+  // respaldo del mismo cajón de la tienda).
+  const [seleccion, setSeleccion] = useState<'espejo' | 'individual' | null>(
+    bloqueante ? 'espejo' : (modoActual ?? 'espejo'),
+  );
+  const { setInfoCaja } = useCortesStore();
   const [guardando, setGuardando] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -39,8 +48,10 @@ export default function ModalModoCaja({
     setGuardando(true);
     setError(null);
     try {
-      await invoke('configurar_modo_caja', { modo: seleccion });
+      const r = await invoke<Parameters<typeof infoCajaDeRespuesta>[0]>('configurar_modo_caja', { modo: seleccion });
       setModoCajaLocal(seleccion, true);
+      const info = infoCajaDeRespuesta(r);
+      if (info) setInfoCaja(info);
       onSeleccion(seleccion);
       onCerrar?.();
     } catch (e: any) {
@@ -76,7 +87,7 @@ export default function ModalModoCaja({
               {bloqueante ? '¿Cómo quieres usar este equipo?' : 'Cambiar modo de caja'}
             </h2>
             <p style={{ fontSize: 12, color: 'var(--color-text-dim)', marginTop: 4 }}>
-              Esta configuración determina cómo cuenta las ventas, el dinero y los cortes.
+              Elige de qué cajón sale y a qué cajón entra el dinero de este equipo.
             </p>
           </div>
           {!bloqueante && (
@@ -90,18 +101,18 @@ export default function ModalModoCaja({
           <OpcionModo
             id="espejo"
             icon={<Monitor size={32} />}
-            titulo="Espejo de la caja"
-            descripcion="Esta computadora vende junto con el POS desktop. Las ventas, el dinero y los cortes se cuentan en una sola caja."
-            ejemplo="Útil cuando: alguien atiende desde el celular o una pestaña adicional pero el dinero físico está en la misma caja."
+            titulo="Caja de la tienda (recomendado)"
+            descripcion="Vendes con el dinero de la caja de la tienda. Tus ventas, entradas y retiros se suman al corte del POS de escritorio; los cortes y la apertura se hacen allá."
+            ejemplo="Útil cuando: el POS de escritorio falló, o atiendes desde el celular o una tablet junto al mismo cajón."
             seleccionado={seleccion === 'espejo'}
             onClick={() => setSeleccion('espejo')}
           />
           <OpcionModo
             id="individual"
             icon={<Wallet size={32} />}
-            titulo="Caja propia independiente"
-            descripcion="Esta computadora es su propia caja con su propio fondo, ventas y corte. No comparte con el desktop."
-            ejemplo="Útil cuando: hay un segundo mostrador, una tablet en otra área o el dueño sale a vender afuera."
+            titulo="Caja propia"
+            descripcion="El dinero de este equipo va fuera del cajón de la tienda (otro cajón o una bolsa). Tiene su propia apertura y sus propios cortes, que se hacen aquí y no se mezclan con el escritorio."
+            ejemplo="Útil cuando: hay un segundo mostrador con su propio cajón o el dueño vende fuera de la tienda. Todos los equipos en caja propia comparten la misma caja web."
             seleccionado={seleccion === 'individual'}
             onClick={() => setSeleccion('individual')}
           />

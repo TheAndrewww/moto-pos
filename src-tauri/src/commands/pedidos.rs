@@ -1,6 +1,6 @@
 // commands/pedidos.rs — Gestión de pedidos a proveedores
 
-use chrono::Utc;
+
 use serde::{Deserialize, Serialize};
 use tauri::State;
 use crate::commands::auth::AppState;
@@ -48,7 +48,8 @@ pub fn crear_orden_pedido(
     state: State<'_, AppState>,
 ) -> Result<OrdenPedido, String> {
     let db = state.db.lock().unwrap();
-    let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    // Hora local de la tienda (en UTC un pedido de la tarde salía con fecha de mañana).
+    let now = super::cortes::ahora_local();
 
     let siguiente_id: i64 = db.query_row(
         "SELECT COALESCE(MAX(id), 0) + 1 FROM ordenes_pedido",

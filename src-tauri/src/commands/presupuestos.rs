@@ -1,6 +1,6 @@
 // commands/presupuestos.rs — CRUD de presupuestos (cotizaciones)
 
-use chrono::Utc;
+
 use serde::{Deserialize, Serialize};
 use tauri::State;
 use crate::commands::auth::AppState;
@@ -68,7 +68,8 @@ pub fn crear_presupuesto(
 ) -> Result<Presupuesto, String> {
     let db = state.db.lock().unwrap();
     let folio = generar_folio_presupuesto(&db)?;
-    let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    // Hora local de la tienda (en UTC un presupuesto de la tarde salía con fecha de mañana).
+    let now = super::cortes::ahora_local();
     let vigencia = presupuesto.vigencia_dias.unwrap_or(7);
 
     db.execute(

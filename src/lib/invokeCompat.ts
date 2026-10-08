@@ -95,6 +95,42 @@ export async function invoke<T = unknown>(
   return rpcWeb<T>(cmd, args);
 }
 
+/**
+ * Versión del cliente web. El servidor la exige en las RPC que mueven dinero
+ * de la caja: una pestaña con un bundle viejo (sin este header) recibe
+ * "Hay una versión nueva del POS web. Recarga la página (F5)" en vez de
+ * registrar movimientos con reglas viejas.
+ */
+const VERSION_CLIENTE_WEB = '2';
+
+/**
+ * Mensaje legible a partir de una respuesta de error del servidor.
+ * El servidor responde `{ "error": "bad request: <mensaje>" }`; aquí se
+ * quita el prefijo técnico para que el cajero vea solo el mensaje.
+ */
+function mensajeDeError(status: number, cuerpo: string, statusText: string): string {
+  let msg = '';
+  try {
+    const j = JSON.parse(cuerpo) as { error?: unknown };
+    if (j && typeof j.error === 'string') msg = j.error;
+  } catch {
+    // No es JSON (p. ej. página HTML de un proxy caído): solo se muestra si
+    // es un texto corto y no HTML.
+    const t = cuerpo.trim();
+    msg = t.startsWith('<') || t.length > 300 ? '' : t;
+  }
+  msg = msg.trim().replace(/^bad request:\s*/i, '');
+  if (!msg || msg === 'internal error') {
+    if (status >= 500) return 'Error interno del servidor. Intenta de nuevo.';
+    if (status === 403 || msg === 'forbidden') return 'No tienes permiso para esta acción.';
+    if (status === 404) return 'No encontrado.';
+    return `Error ${status}${statusText ? ` (${statusText})` : ''}`;
+  }
+  if (msg === 'forbidden') return 'No tienes permiso para esta acción.';
+  if (msg === 'not found') return 'No encontrado.';
+  return msg;
+}
+
 async function rpcWeb<T>(cmd: string, args?: InvokeArgs): Promise<T> {
   const url = `${apiBase()}/rpc/${cmd}`;
   const token = getAuthToken();
@@ -102,6 +138,7 @@ async function rpcWeb<T>(cmd: string, args?: InvokeArgs): Promise<T> {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
+      'x-pos-cliente': VERSION_CLIENTE_WEB,
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
     },
     body: JSON.stringify(args ?? {}),
@@ -116,7 +153,12 @@ async function rpcWeb<T>(cmd: string, args?: InvokeArgs): Promise<T> {
       return new Promise(() => {}) as T;
     }
     const text = await res.text().catch(() => '');
-    throw new Error(`RPC ${cmd} failed: ${res.status} ${text || res.statusText}`);
+    const msg = mensajeDeError(res.status, text, res.statusText);
+    // `err.message` y `String(err)` muestran el mismo texto limpio: hay
+    // pantallas que hacen alert(err.message) y otras alert('...' + e).
+    const err = new Error(msg);
+    err.toString = () => msg;
+    throw err;
   }
   // El server puede devolver null, número, string, array u objeto.
   // Preservar el tipo de retorno que espera el cliente.

@@ -137,6 +137,14 @@ export default function Catalogo() {
     const handleSubmit = async (e: React.FormEvent) => {
       e.preventDefault();
       if (!form.nombre.trim()) return setError('El nombre es obligatorio');
+      // Solo se valida el stock que se captura (alta) o se cambia: hay
+      // productos que ya traen stock negativo y editar su precio o nombre
+      // no debe obligar a tocar el stock (ajustarStock solo corre si cambió).
+      const stockCambiado = !editando || Number(form.stock_actual) !== editando.stock_actual;
+      if (stockCambiado && Number(form.stock_actual) < 0) {
+        alert('El stock no puede ser negativo');
+        return;
+      }
       if (!usuario) return;
 
       setGuardando(true);
@@ -394,12 +402,14 @@ export default function Catalogo() {
             <div className="pos-stats-3" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12 }}>
               <div>
                 <label style={labelStyle}>{editando ? 'STOCK ACTUAL' : 'STOCK INICIAL'}</label>
-                <input className="input mono" type="number" step="1" value={form.stock_actual}
+                {/* min: 0, o el stock actual si ya es negativo (el navegador no
+                    debe bloquear guardar otros cambios de ese producto). */}
+                <input className="input mono" type="number" step="1" min={Math.min(0, Math.floor(editando?.stock_actual ?? 0))} value={form.stock_actual}
                   onChange={e => setForm(f => ({ ...f, stock_actual: parseFloat(e.target.value) || 0 }))} />
               </div>
               <div>
                 <label style={labelStyle}>STOCK MÍNIMO</label>
-                <input className="input mono" type="number" step="1" value={form.stock_minimo}
+                <input className="input mono" type="number" step="1" min={0} value={form.stock_minimo}
                   onChange={e => setForm(f => ({ ...f, stock_minimo: parseFloat(e.target.value) || 0 }))} />
               </div>
               <div>

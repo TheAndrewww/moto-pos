@@ -1,8 +1,11 @@
 // api.rs — Endpoints REST para el panel web admin.
 //
 // Toda escritura desde la web debe:
-//   1. Actualizar `updated_at = now()`
-//   2. Registrar en `sync_cursor` con origen_device = 'web-admin'
+//   1. Actualizar `updated_at = NOW_TEXT` (hora local de la tienda, igual
+//      que el escritorio)
+//   2. Registrar en `sync_cursor` con origen_device = 'web-admin', en la
+//      MISMA transacción que la escritura (si no, un fallo a la mitad deja un
+//      cambio que nunca baja al escritorio)
 // Así el POS recibe los cambios en su siguiente pull y el sync es simétrico.
 
 use axum::{
@@ -16,6 +19,9 @@ use sqlx::Row;
 
 use crate::auth::autenticar;
 use crate::error::{ApiError, ApiResult};
+use crate::rpc::{
+    anotar_celdas_fk_web, fks_producto_cambiadas, validar_numeros_producto, verificar_codigo_libre,
+};
 use crate::AppState;
 
 const WEB_ORIGIN: &str = "web-admin";
@@ -119,13 +125,25 @@ pub struct ProductoInput {
     pub activo: Option<bool>,
 }
 
+/// Mismas reglas que el formulario del POS web (rpc.rs): código obligatorio,
+/// precios válidos y stock mínimo no negativo.
+fn validar_producto_input(input: &ProductoInput) -> Result<(), ApiError> {
+    if input.codigo.trim().is_empty() {
+        return Err(ApiError::BadRequest("El código es obligatorio".into()));
+    }
+    validar_numeros_producto(input.precio_costo, input.precio_venta, input.stock_minimo.unwrap_or(0.0))
+}
+
 pub async fn productos_create(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(input): Json<ProductoInput>,
 ) -> ApiResult<Json<Value>> {
     autenticar(&headers, &state.jwt_secret)?;
+    validar_producto_input(&input)?;
     let uuid = uuid::Uuid::now_v7().to_string();
+    let mut tx = state.pool.begin().await?;
+    verificar_codigo_libre(&mut tx, &input.codigo, None).await?;
     let sql = format!(r#"
         INSERT INTO productos
             (uuid, codigo, codigo_tipo, nombre, descripcion, categoria_id,
@@ -149,10 +167,11 @@ pub async fn productos_create(
     .bind(input.proveedor_id)
     .bind(input.foto_url.as_deref())
     .bind(input.activo)
-    .fetch_one(&state.pool)
+    .fetch_one(&mut *tx)
     .await?;
 
-    registrar_cambio(&state.pool, "productos", &uuid, None).await?;
+    registrar_cambio(&mut *tx, "productos", &uuid, None).await?;
+    tx.commit().await?;
     Ok(Json(row_to_json(&row)))
 }
 
@@ -163,6 +182,27 @@ pub async fn productos_update(
     Json(input): Json<ProductoInput>,
 ) -> ApiResult<Json<Value>> {
     autenticar(&headers, &state.jwt_secret)?;
+    validar_producto_input(&input)?;
+    let mut tx = state.pool.begin().await?;
+    let actual = sqlx::query(
+        "SELECT id, codigo, categoria_id, proveedor_id FROM productos \
+         WHERE uuid = $1 AND deleted_at IS NULL FOR UPDATE",
+    )
+    .bind(&uuid)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(ApiError::NotFound)?;
+    let fks_cambiadas = fks_producto_cambiadas(
+        actual.get("categoria_id"),
+        actual.get("proveedor_id"),
+        input.categoria_id,
+        input.proveedor_id,
+    );
+    // Solo si el código cambia (hay duplicados viejos que deben poder editarse).
+    if actual.get::<String, _>("codigo") != input.codigo {
+        let id: i64 = actual.get("id");
+        verificar_codigo_libre(&mut tx, &input.codigo, Some(id)).await?;
+    }
     let sql = format!(r#"
         UPDATE productos SET
             codigo = $2,
@@ -193,11 +233,15 @@ pub async fn productos_update(
     .bind(input.proveedor_id)
     .bind(input.foto_url.as_deref())
     .bind(input.activo)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&mut *tx)
     .await?
     .ok_or(ApiError::NotFound)?;
+    // Categoría/proveedor que la web cambió en un producto del escritorio
+    // todavía sin reparar: ya son ids de aquí (ver anotar_celdas_fk_web).
+    anotar_celdas_fk_web(&mut tx, "productos", &uuid, &fks_cambiadas).await?;
 
-    registrar_cambio(&state.pool, "productos", &uuid, None).await?;
+    registrar_cambio(&mut *tx, "productos", &uuid, None).await?;
+    tx.commit().await?;
     Ok(Json(row_to_json(&row)))
 }
 
@@ -211,15 +255,17 @@ pub async fn productos_delete(
         "UPDATE productos SET deleted_at = {NOW_TEXT}, updated_at = {NOW_TEXT} \
          WHERE uuid = $1 AND deleted_at IS NULL"
     );
+    let mut tx = state.pool.begin().await?;
     let affected = sqlx::query(&sql)
     .bind(&uuid)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await?
     .rows_affected();
     if affected == 0 {
         return Err(ApiError::NotFound);
     }
-    registrar_cambio(&state.pool, "productos", &uuid, None).await?;
+    registrar_cambio(&mut *tx, "productos", &uuid, None).await?;
+    tx.commit().await?;
     Ok(Json(json!({ "ok": true })))
 }
 

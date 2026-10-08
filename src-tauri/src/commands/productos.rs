@@ -3,7 +3,9 @@
 use serde::{Deserialize, Serialize};
 use tauri::State;
 use super::auth::AppState;
-use chrono::Utc;
+use super::cortes::ahora_local;
+
+use rusqlite::Connection;
 
 // ─── Structs ──────────────────────────────────────────────
 
@@ -105,6 +107,19 @@ pub struct ActualizarCliente {
 }
 
 // ─── Helpers ──────────────────────────────────────────────
+
+/// Rechaza existencias negativas o no numéricas (NaN/infinito). El stock solo
+/// puede quedar en 0 o más: una venta lo frena en 0 y los ajustes, altas e
+/// importaciones no pueden dejarlo negativo.
+pub(crate) fn validar_stock(valor: f64, campo: &str) -> Result<(), String> {
+    if !valor.is_finite() {
+        return Err(format!("{} inválido", campo));
+    }
+    if valor < 0.0 {
+        return Err(format!("El {} no puede ser negativo", campo.to_lowercase()));
+    }
+    Ok(())
+}
 
 pub fn normalizar_texto(texto: &str) -> String {
     texto
@@ -231,6 +246,22 @@ pub fn crear_producto(
     state: State<'_, AppState>,
 ) -> Result<Producto, String> {
     let db = state.db.lock().unwrap();
+    crear_producto_core(&db, producto, usuario_id, &ahora_local())
+}
+
+/// Alta de producto. Si el código pertenece a un producto que se eliminó
+/// (soft delete: deleted_at con valor), se REACTIVA ese mismo registro (mismo
+/// id y uuid, con los datos nuevos) en lugar de fallar por código duplicado:
+/// es la misma pieza que vuelve al catálogo y conserva su historial.
+/// `now` (hora local) se usa para updated_at.
+pub(crate) fn crear_producto_core(
+    db: &Connection,
+    producto: NuevoProducto,
+    usuario_id: i64,
+    now: &str,
+) -> Result<Producto, String> {
+    validar_stock(producto.stock_actual, "Stock")?;
+    validar_stock(producto.stock_minimo, "Stock mínimo")?;
 
     // Generar código si no se proporcionó
     let codigo = match producto.codigo {
@@ -256,33 +287,66 @@ pub fn crear_producto(
         producto.descripcion.as_deref().unwrap_or("")
     ));
 
-    let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    // created_at y updated_at en hora local de la tienda (el sync compara
+    // updated_at contra la hora local del servidor).
+    let creado_utc = super::cortes::ahora_local();
 
-    db.execute(
-        r#"INSERT INTO productos
-           (codigo, codigo_tipo, nombre, descripcion, categoria_id,
-            precio_costo, precio_venta,
-            stock_actual, stock_minimo, proveedor_id, foto_url, search_text,
-            created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
-        rusqlite::params![
-            codigo, codigo_tipo, producto.nombre, producto.descripcion, producto.categoria_id,
-            producto.precio_costo, producto.precio_venta,
-            producto.stock_actual, producto.stock_minimo, producto.proveedor_id,
-            producto.foto_url, search_text, now, now
-        ],
-    ).map_err(|e| e.to_string())?;
+    let existente: Option<(i64, Option<String>)> = db.query_row(
+        "SELECT id, deleted_at FROM productos WHERE codigo = ?",
+        rusqlite::params![codigo],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).ok();
 
-    let id = db.last_insert_rowid();
+    let (id, reactivado) = match existente {
+        Some((id, Some(_))) => {
+            db.execute(
+                r#"UPDATE productos SET
+                    codigo_tipo = ?, nombre = ?, descripcion = ?, categoria_id = ?,
+                    precio_costo = ?, precio_venta = ?,
+                    stock_actual = ?, stock_minimo = ?, proveedor_id = ?, foto_url = ?,
+                    search_text = ?, activo = 1, deleted_at = NULL, updated_at = ?
+                   WHERE id = ?"#,
+                rusqlite::params![
+                    codigo_tipo, producto.nombre, producto.descripcion, producto.categoria_id,
+                    producto.precio_costo, producto.precio_venta,
+                    producto.stock_actual, producto.stock_minimo, producto.proveedor_id,
+                    producto.foto_url, search_text, now, id
+                ],
+            ).map_err(|e| e.to_string())?;
+            (id, true)
+        }
+        Some((_, None)) => {
+            return Err(format!("Ya existe un producto con el código {}", codigo));
+        }
+        None => {
+            db.execute(
+                r#"INSERT INTO productos
+                   (codigo, codigo_tipo, nombre, descripcion, categoria_id,
+                    precio_costo, precio_venta,
+                    stock_actual, stock_minimo, proveedor_id, foto_url, search_text,
+                    created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                rusqlite::params![
+                    codigo, codigo_tipo, producto.nombre, producto.descripcion, producto.categoria_id,
+                    producto.precio_costo, producto.precio_venta,
+                    producto.stock_actual, producto.stock_minimo, producto.proveedor_id,
+                    producto.foto_url, search_text, creado_utc, now
+                ],
+            ).map_err(|e| e.to_string())?;
+            (db.last_insert_rowid(), false)
+        }
+    };
 
     // Bitácora
+    let desc = if reactivado {
+        format!("Producto creado: {} ({}) — se reactivó el registro eliminado #{}", producto.nombre, codigo, id)
+    } else {
+        format!("Producto creado: {} ({})", producto.nombre, codigo)
+    };
     let _ = db.execute(
         r#"INSERT INTO audit_log (usuario_id, accion, tabla_afectada, registro_id, descripcion_legible, origen)
            VALUES (?, 'PRODUCTO_CREADO', 'productos', ?, ?, 'POS')"#,
-        rusqlite::params![
-            usuario_id, id,
-            format!("Producto creado: {} ({})", producto.nombre, codigo)
-        ],
+        rusqlite::params![usuario_id, id, desc],
     );
 
     // Devolver el producto completo
@@ -312,6 +376,7 @@ pub fn actualizar_producto(
     usuario_id: i64,
     state: State<'_, AppState>,
 ) -> Result<bool, String> {
+    validar_stock(producto.stock_minimo, "Stock mínimo")?;
     let db = state.db.lock().unwrap();
 
     // Obtener precio anterior para detectar cambios
@@ -334,7 +399,7 @@ pub fn actualizar_producto(
         producto.descripcion.as_deref().unwrap_or("")
     ));
 
-    let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let now = ahora_local();
 
     db.execute(
         r#"UPDATE productos SET
@@ -387,8 +452,11 @@ pub fn actualizar_producto(
 /// No hace DELETE físico para no romper integridad con ventas anteriores
 /// (venta_detalle.producto_id → productos.id). En su lugar:
 ///   - `activo = 0` → desaparece de listados y de búsqueda en el POS
-///   - `deleted_at = datetime('now')` → marca tombstone para sync remoto
-///   - `updated_at` se bumpea automáticamente vía trigger
+///   - `deleted_at` = ahora (hora local) → marca tombstone para sync remoto
+///   - `updated_at` = el mismo momento (hora local, como todo el sync)
+///
+/// Si después se da de alta otro producto con el mismo código, se reactiva
+/// este registro (ver `crear_producto_core`).
 ///
 /// El registro queda en la BD para mantener consistencia histórica.
 #[tauri::command]
@@ -406,7 +474,7 @@ pub fn eliminar_producto(
         |row| row.get(0),
     ).map_err(|e| format!("Producto no encontrado: {}", e))?;
 
-    let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let now = ahora_local();
 
     let n = db.execute(
         "UPDATE productos SET activo = 0, deleted_at = ?, updated_at = ? WHERE id = ?",
@@ -437,6 +505,8 @@ pub fn eliminar_producto(
 ///
 /// Registra en bitácora con datos viejos→nuevos para que pueda auditarse el
 /// movimiento (quién, cuándo, qué cantidad y por qué motivo).
+///
+/// El nuevo stock no puede ser negativo ni NaN/infinito.
 #[tauri::command]
 pub fn ajustar_stock(
     producto_id: i64,
@@ -445,19 +515,29 @@ pub fn ajustar_stock(
     usuario_id: i64,
     state: State<'_, AppState>,
 ) -> Result<bool, String> {
+    let db = state.db.lock().unwrap();
+    ajustar_stock_core(&db, producto_id, nuevo_stock, &motivo, usuario_id, &ahora_local())
+}
+
+/// Núcleo de `ajustar_stock`. `now` (hora local) se usa para updated_at.
+pub(crate) fn ajustar_stock_core(
+    db: &Connection,
+    producto_id: i64,
+    nuevo_stock: f64,
+    motivo: &str,
+    usuario_id: i64,
+    now: &str,
+) -> Result<bool, String> {
     if motivo.trim().is_empty() {
         return Err("El motivo es obligatorio".to_string());
     }
-
-    let db = state.db.lock().unwrap();
+    validar_stock(nuevo_stock, "Stock")?;
 
     let (nombre, stock_anterior): (String, f64) = db.query_row(
         "SELECT nombre, stock_actual FROM productos WHERE id = ?",
         rusqlite::params![producto_id],
         |row| Ok((row.get(0)?, row.get(1)?)),
     ).map_err(|e| format!("Producto no encontrado: {}", e))?;
-
-    let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
     db.execute(
         "UPDATE productos SET stock_actual = ?, updated_at = ? WHERE id = ?",
@@ -784,7 +864,7 @@ pub fn actualizar_config_negocio(
     db.execute(
         "UPDATE config_negocio SET nombre = ?, direccion = ?, telefono = ?, rfc = ?,
          mensaje_pie = ?, respaldo_auto_activo = ?, respaldo_auto_hora = ?,
-         impresora_termica = ?, updated_at = datetime('now') WHERE id = 1",
+         impresora_termica = ?, updated_at = datetime('now','localtime') WHERE id = 1",
         rusqlite::params![
             datos.nombre, datos.direccion, datos.telefono, datos.rfc, datos.mensaje_pie,
             if datos.respaldo_auto_activo { 1 } else { 0 },

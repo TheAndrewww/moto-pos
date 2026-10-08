@@ -3,22 +3,15 @@
 // El sync worker NO necesita conocer el schema de cada tabla: convierte la fila
 // completa a un objeto JSON con los nombres de columnas. El servidor remoto
 // tiene columnas equivalentes y usa estos objetos directamente.
+//
+// Sync v2: además de la fila se manda `__refs` = {uuid_fila: {columna_fk:
+// uuid_referenciado | null}} para el padre y cada hijo. Los ids enteros
+// solo significan algo en este equipo; el servidor traduce por uuid.
 
 use rusqlite::{Connection, Result as SqlResult, types::ValueRef};
 use serde_json::{Map, Value};
 
-/// Tablas que sincronizan como "agregado": la fila padre lleva sus hijos.
-/// `(tabla_padre, &[(tabla_hijo, columna_fk)])`.
-pub const AGGREGATES: &[(&str, &[(&str, &str)])] = &[
-    ("ventas",         &[("venta_detalle",        "venta_id")]),
-    ("presupuestos",   &[("presupuesto_detalle",  "presupuesto_id")]),
-    ("ordenes_pedido", &[("orden_pedido_detalle", "orden_id")]),
-    ("recepciones",    &[("recepcion_detalle",    "recepcion_id")]),
-    ("cortes",         &[("corte_denominaciones", "corte_id"),
-                         ("corte_vendedores",     "corte_id")]),
-    ("devoluciones",   &[("devolucion_detalle",   "devolucion_id")]),
-    ("transferencias", &[("transferencia_detalle","transferencia_id")]),
-];
+use super::fk;
 
 /// Serializa una fila de cualquier tabla a JSON usando metadata del prepare.
 pub fn fila_a_json(conn: &Connection, tabla: &str, uuid: &str) -> SqlResult<Option<Value>> {
@@ -42,7 +35,7 @@ pub fn hijos_a_json(
     fk_columna: &str,
     parent_id: i64,
 ) -> SqlResult<Vec<Value>> {
-    let sql = format!("SELECT * FROM {} WHERE {} = ?", tabla_hijo, fk_columna);
+    let sql = format!("SELECT * FROM {} WHERE {} = ? ORDER BY id", tabla_hijo, fk_columna);
     let mut stmt = conn.prepare(&sql)?;
     let col_names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
     let mut rows = stmt.query([parent_id])?;
@@ -57,29 +50,36 @@ pub fn hijos_a_json(
     Ok(lista)
 }
 
-/// Construye el payload completo para una fila (incluyendo hijos si es agregado).
+/// Construye el payload completo para una fila (incluyendo hijos si es
+/// agregado) con sus referencias por uuid en `__refs`.
 pub fn construir_payload(conn: &Connection, tabla: &str, uuid: &str) -> SqlResult<Option<Value>> {
-    let Some(fila) = fila_a_json(conn, tabla, uuid)? else { return Ok(None); };
+    let Some(Value::Object(mut obj)) = fila_a_json(conn, tabla, uuid)? else { return Ok(None); };
 
-    // Si es agregado, agregar array "children" con sus hijos.
-    if let Some((_, hijos_defs)) = AGGREGATES.iter().find(|(p, _)| *p == tabla) {
-        let parent_id = fila.get("id")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
+    let mut refs = Map::new();
+    refs.insert(uuid.to_string(), Value::Object(fk::refs_de_fila(conn, tabla, &obj)));
+
+    // Si es agregado, agregar "__children" con sus hijos.
+    let hijos_defs = fk::hijos_de(tabla);
+    if !hijos_defs.is_empty() {
+        let parent_id = obj.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
 
         let mut children = Map::new();
-        for (tabla_hijo, fk) in *hijos_defs {
-            let hijos = hijos_a_json(conn, tabla_hijo, fk, parent_id)?;
+        for (tabla_hijo, columna_fk) in hijos_defs {
+            let hijos = hijos_a_json(conn, tabla_hijo, columna_fk, parent_id)?;
+            for h in &hijos {
+                if let Some(ho) = h.as_object() {
+                    if let Some(hu) = ho.get("uuid").and_then(|v| v.as_str()) {
+                        refs.insert(hu.to_string(), Value::Object(fk::refs_de_fila(conn, tabla_hijo, ho)));
+                    }
+                }
+            }
             children.insert(tabla_hijo.to_string(), Value::Array(hijos));
         }
-
-        if let Value::Object(mut obj) = fila {
-            obj.insert("__children".to_string(), Value::Object(children));
-            return Ok(Some(Value::Object(obj)));
-        }
+        obj.insert("__children".to_string(), Value::Object(children));
     }
 
-    Ok(Some(fila))
+    obj.insert("__refs".to_string(), Value::Object(refs));
+    Ok(Some(Value::Object(obj)))
 }
 
 fn valor_sqlite_a_json(v: ValueRef) -> Value {

@@ -22,6 +22,9 @@ export interface ItemCarrito {
   precioFinal: number;
   subtotal: number;
   autorizadoPor: number | null;
+  /** Solo web: token firmado de `autorizar_descuento` (el servidor lo exige
+   *  para descuentos arriba del límite del vendedor). En escritorio, null. */
+  autorizacionToken: string | null;
 }
 
 export interface Cliente {
@@ -115,7 +118,9 @@ interface VentaState {
   agregarProducto: (producto: Producto) => void;
   quitarProducto: (index: number) => void;
   cambiarCantidad: (index: number, cantidad: number) => void;
-  aplicarDescuento: (index: number, porcentaje: number, autorizadoPor?: number | null) => void;
+  aplicarDescuento: (index: number, porcentaje: number, autorizadoPor?: number | null, autorizacionToken?: string | null) => void;
+  /** Re-precia los carritos con los precios vigentes (tras PRECIO_CAMBIO). */
+  refrescarPrecios: (productos: Producto[]) => void;
   limpiarCarrito: () => void;
 
   // Cliente (pestaña activa)
@@ -257,6 +262,7 @@ export const useVentaStore = create<VentaState>((set, get) => {
           precioFinal,
           subtotal: precioFinal,
           autorizadoPor: null,
+          autorizacionToken: null,
         };
         return { ...t, items: [...t.items, newItem] };
       });
@@ -279,7 +285,7 @@ export const useVentaStore = create<VentaState>((set, get) => {
       return { ...t, items: newItems };
     }),
 
-    aplicarDescuento: (index, porcentaje, autorizadoPor = null) => updateActiva(t => {
+    aplicarDescuento: (index, porcentaje, autorizadoPor = null, autorizacionToken = null) => updateActiva(t => {
       const newItems = [...t.items];
       const item = { ...newItems[index] };
       item.descuentoPorcentaje = porcentaje;
@@ -287,6 +293,7 @@ export const useVentaStore = create<VentaState>((set, get) => {
       item.precioFinal = item.precioOriginal - item.descuentoMonto;
       item.subtotal = item.precioFinal * item.cantidad;
       item.autorizadoPor = autorizadoPor;
+      item.autorizacionToken = autorizacionToken;
       newItems[index] = item;
       return { ...t, items: newItems };
     }),
@@ -312,10 +319,38 @@ export const useVentaStore = create<VentaState>((set, get) => {
           descuentoMonto: descMonto,
           precioFinal,
           subtotal: precioFinal * item.cantidad,
+          // El % del cliente reemplaza cualquier descuento manual previo,
+          // así que la autorización de ese descuento ya no aplica.
+          autorizadoPor: null,
+          autorizacionToken: null,
         };
       });
       return { ...t, clienteSeleccionado: cliente, items };
     }),
+
+    refrescarPrecios: (productos) => {
+      const porId = new Map(productos.map(p => [p.id, p]));
+      set({
+        tabs: get().tabs.map(t => ({
+          ...t,
+          items: t.items.map(item => {
+            const p = porId.get(item.producto.id);
+            if (!p || p.precio_venta === item.precioOriginal) return item;
+            // Misma aritmética que agregarProducto/aplicarDescuento.
+            const descMonto = p.precio_venta * (item.descuentoPorcentaje / 100);
+            const precioFinal = p.precio_venta - descMonto;
+            return {
+              ...item,
+              producto: p,
+              precioOriginal: p.precio_venta,
+              descuentoMonto: descMonto,
+              precioFinal,
+              subtotal: precioFinal * item.cantidad,
+            };
+          }),
+        })),
+      });
+    },
 
     cargarClientes: async () => {
       try {
@@ -353,6 +388,8 @@ export const useVentaStore = create<VentaState>((set, get) => {
             precio_final: i.precioFinal,
             subtotal: i.subtotal,
             autorizado_por: i.autorizadoPor,
+            // El desktop ignora este campo (serde no rechaza desconocidos).
+            autorizacion_token: i.autorizacionToken,
           })),
           presupuesto_origen_id: activa.presupuestoOrigen?.id || null,
         };
@@ -415,6 +452,7 @@ export const useVentaStore = create<VentaState>((set, get) => {
           precioFinal,
           subtotal: precioFinal * i.cantidad,
           autorizadoPor: null,
+          autorizacionToken: null,
         };
       });
       const nueva: TabVenta = {

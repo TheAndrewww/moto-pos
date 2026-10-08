@@ -1,51 +1,26 @@
 // pages/Etiquetas.tsx — Generador de etiquetas de precio
 //
 // Imprime una etiqueta por hoja en una etiquetadora térmica (rollo continuo).
-// Tamaño por defecto: 39 × 30 mm. Configurable desde la UI.
+// Tamaño por defecto: 35 × 24 mm. Configurable desde la UI.
+// El QR y los tamaños salen de lib/imprimirEtiquetas (los mismos que la
+// impresión), así la vista previa es fiel a lo que sale en el rollo.
 
 import { useState, useEffect, useRef, useMemo } from 'react';
 import { useProductStore, type Producto } from '../store/productStore';
 import { Tag, Search, Printer, X, Trash2 } from 'lucide-react';
-import QRCode from 'qrcode';
 import {
   imprimirEtiquetas,
+  calcularLayoutEtiqueta,
+  qrSvg,
   ETIQUETA_ANCHO_DEFAULT_MM,
   ETIQUETA_ALTO_DEFAULT_MM,
 } from '../lib/imprimirEtiquetas';
-
-const QR_OPTS: QRCode.QRCodeToDataURLOptions = {
-  errorCorrectionLevel: 'M',
-  margin: 0,
-  width: 160,
-  color: { dark: '#000000', light: '#ffffff' },
-};
 
 // Defaults para etiquetadora térmica de rollo continuo. Re-exportados desde
 // el helper compartido para que Etiquetas y otras pantallas (Catálogo)
 // usen los mismos valores por defecto.
 const ANCHO_DEFAULT_MM = ETIQUETA_ANCHO_DEFAULT_MM;
 const ALTO_DEFAULT_MM = ETIQUETA_ALTO_DEFAULT_MM;
-
-function useQrCache(codigos: string[]) {
-  const [cache, setCache] = useState<Record<string, string>>({});
-  const key = useMemo(() => codigos.join('|'), [codigos]);
-  useEffect(() => {
-    let cancelado = false;
-    const faltantes = codigos.filter(c => !cache[c]);
-    if (faltantes.length === 0) return;
-    Promise.all(faltantes.map(async c => [c, await QRCode.toDataURL(c, QR_OPTS)] as const))
-      .then(pares => {
-        if (cancelado) return;
-        setCache(prev => {
-          const next = { ...prev };
-          for (const [c, url] of pares) next[c] = url;
-          return next;
-        });
-      });
-    return () => { cancelado = true; };
-  }, [key]);
-  return cache;
-}
 
 export default function Etiquetas() {
   const { productos, cargarTodo } = useProductStore();
@@ -85,23 +60,13 @@ export default function Etiquetas() {
     () => Array.from(new Set(seleccionados.map(s => s.producto.codigo))),
     [seleccionados],
   );
-  const qrCache = useQrCache(codigosUnicos);
-
-  // ─── Tamaños proporcionales al label (layout vertical) ───
-  // Layout: nombre arriba, QR en medio, código abajo.
-  // QR limitado por la dimensión más pequeña; debe dejar espacio para texto arriba/abajo.
-  const padMm = Math.max(0.5, Math.min(1.2, Math.min(anchoMm, altoMm) * 0.03));
-  const qrMm = Math.max(
-    10,
-    Math.min(
-      Math.floor(altoMm * 0.55),  // máx 55% del alto
-      Math.floor(anchoMm * 0.75), // máx 75% del ancho
-      22,                          // tope absoluto
-    ),
+  // Mismo SVG y mismos tamaños que la impresión → la vista previa es fiel.
+  // (Layout vertical: nombre arriba, QR en medio, código abajo.)
+  const qrPorCodigo = useMemo(
+    () => new Map(codigosUnicos.map(c => [c, qrSvg(c)] as const)),
+    [codigosUnicos],
   );
-  // Tamaños de fuente proporcionales al alto. Una sola línea cada uno.
-  const nombrePt = Math.max(6, Math.min(11, altoMm * 0.22));
-  const codigoPt = Math.max(5, Math.min(9, altoMm * 0.20));
+  const L = calcularLayoutEtiqueta(anchoMm, altoMm);
 
   // Imprimir usando el helper compartido — mismo motor que el flujo de
   // "imprimir tras crear producto" del Catálogo. Sin esto duplicaríamos
@@ -251,34 +216,33 @@ export default function Etiquetas() {
                   <div key={idx} style={{
                     width: `${anchoMm}mm`,
                     height: `${altoMm}mm`,
-                    padding: `${padMm}mm`,
+                    padding: `${L.padYMm}mm ${L.padXMm}mm`,
                     border: '1px dashed var(--color-border)',
                     borderRadius: 2,
                     display: 'flex', flexDirection: 'column',
                     alignItems: 'center', justifyContent: 'space-between',
-                    gap: `${padMm * 0.5}mm`,
+                    gap: `${L.gapMm}mm`,
                     background: '#fff', color: '#000',
                     boxSizing: 'border-box', overflow: 'hidden',
                     fontFamily: 'Arial, sans-serif', textAlign: 'center',
                   }}>
                     <div style={{
                       width: '100%',
-                      fontSize: `${nombrePt}pt`, fontWeight: 800,
+                      fontSize: `${L.nombrePt}pt`, fontWeight: 700,
                       lineHeight: 1.05,
                       overflow: 'hidden', display: '-webkit-box',
                       WebkitLineClamp: 2, WebkitBoxOrient: 'vertical',
                       wordBreak: 'break-word',
                     }}>{p.nombre}</div>
-                    {qrCache[p.codigo] ? (
-                      <img src={qrCache[p.codigo]} alt={p.codigo}
-                        style={{ width: `${qrMm}mm`, height: `${qrMm}mm`, flexShrink: 0, display: 'block' }} />
-                    ) : (
-                      <div style={{ width: `${qrMm}mm`, height: `${qrMm}mm`, flexShrink: 0, background: '#f0f0f0' }} />
-                    )}
+                    {/* SVG generado por qrSvg: sin texto del usuario ni ids → seguro en innerHTML */}
+                    <div
+                      style={{ width: `${L.qrMm}mm`, height: `${L.qrMm}mm`, flexShrink: 0 }}
+                      dangerouslySetInnerHTML={{ __html: qrPorCodigo.get(p.codigo) ?? '' }}
+                    />
                     <div style={{
                       width: '100%',
-                      fontSize: `${codigoPt}pt`, color: '#000',
-                      fontFamily: 'monospace', fontWeight: 700,
+                      fontSize: `${L.codigoPt}pt`, lineHeight: 1.15, color: '#000',
+                      fontFamily: "'Courier New', Consolas, monospace", fontWeight: 700,
                       whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
                     }}>
                       {p.codigo}
