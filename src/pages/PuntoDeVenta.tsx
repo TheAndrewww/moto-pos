@@ -2,12 +2,14 @@
 // Carrito + escaneo + búsqueda + cobro
 
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { useProductStore } from '../store/productStore';
+import { useProductStore, type Producto } from '../store/productStore';
 import { useVentaStore, useVentaActiva, type MetodoPago } from '../store/ventaStore';
 import { useAuthStore } from '../store/authStore';
 import { Search, X, Minus, Plus, Trash2, CreditCard, Banknote, ArrowRightLeft, CheckCircle2, User, Percent, Lock, Plus as PlusIcon, Printer, FileText, Save, ShoppingCart } from 'lucide-react';
 import { invoke, isTauri } from '../lib/invokeCompat';
 import { imprimirTicket, type ConfigNegocio, type TicketData } from '../utils/ticket';
+import { resolverCodigoEscaneado } from '../lib/codigoEscaneado';
+import ElegirProductoEscaneado from '../components/ElegirProductoEscaneado';
 
 export default function PuntoDeVenta() {
   const { productos, cargarTodo, busqueda, setBusqueda, productosFiltrados } = useProductStore();
@@ -27,6 +29,8 @@ export default function PuntoDeVenta() {
   const [showCobro, setShowCobro] = useState(false);
   const [showMobileTabs, setShowMobileTabs] = useState(false);
   const [showBusqueda, setShowBusqueda] = useState(false);
+  // Escaneo que contiene varios códigos del inventario: se pregunta cuál es.
+  const [eleccionEscaneo, setEleccionEscaneo] = useState<{ escaneado: string; candidatos: Producto[] } | null>(null);
   const [showDescuento, setShowDescuento] = useState<number | null>(null); // index del item
   const [descPorcentaje, setDescPorcentaje] = useState('');
   const [showPinAuth, setShowPinAuth] = useState(false);
@@ -70,18 +74,30 @@ export default function PuntoDeVenta() {
     }
   }, [showCobro, showBusqueda, ventaExitosa, items]);
 
-  // Manejar escaneo (código de barras vía HID)
+  // Manejar escaneo (código de barras vía HID). Además del código exacto
+  // reconoce el guion leído como apóstrofo (CDI'023) y los códigos del
+  // inventario que vienen dentro de un código largo de proveedor (Alessia).
   const handleScan = useCallback((e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === 'Enter') {
-      const code = (e.target as HTMLInputElement).value.trim();
-      if (!code) return;
-      const prod = productos.find(p => p.codigo === code);
-      if (prod) {
+      const raw = (e.target as HTMLInputElement).value;
+      if (!raw.trim()) return;
+      // El lector teclea más rápido que la búsqueda en vivo (150 ms): sin esto
+      // la lista de búsqueda se abría DESPUÉS del Enter con lo escaneado.
+      if (debounceRef.current) clearTimeout(debounceRef.current);
+      setLocalSearch('');
+      const r = resolverCodigoEscaneado(raw, productos);
+      if (r.tipo === 'producto') {
         // Se permite vender sin stock (queda en negativo)
-        agregarProducto(prod);
+        agregarProducto(r.producto);
+        setShowBusqueda(false);
+        setBusqueda('');
+      } else if (r.tipo === 'varios') {
+        setShowBusqueda(false);
+        setBusqueda('');
+        setEleccionEscaneo({ escaneado: raw.trim(), candidatos: r.candidatos });
       } else {
         // Producto no encontrado — mostrar búsqueda
-        setBusqueda(code);
+        setBusqueda(r.texto);
         setShowBusqueda(true);
       }
       (e.target as HTMLInputElement).value = '';
@@ -331,6 +347,21 @@ export default function PuntoDeVenta() {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
+      {eleccionEscaneo && (
+        <ElegirProductoEscaneado
+          escaneado={eleccionEscaneo.escaneado}
+          candidatos={eleccionEscaneo.candidatos}
+          onElegir={(p) => {
+            agregarProducto(p);
+            setEleccionEscaneo(null);
+            setTimeout(() => scanRef.current?.focus(), 50);
+          }}
+          onCancelar={() => {
+            setEleccionEscaneo(null);
+            setTimeout(() => scanRef.current?.focus(), 50);
+          }}
+        />
+      )}
       {/* ─── Barra de pestañas ─── */}
       <div className="pos-tabs-scroll" style={{
         display: 'flex', alignItems: 'center', gap: 2,

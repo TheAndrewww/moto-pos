@@ -322,14 +322,28 @@ pub async fn producto_por_codigo(
     Path(codigo): Path<String>,
 ) -> Result<Json<ProductoApi>, ApiError> {
     let db = state.db.clone();
-    let r = tokio::task::spawn_blocking(move || -> Result<ProductoApi, String> {
+    // Código exacto, guion leído como apóstrofo o código del inventario dentro
+    // de un código largo de proveedor (Alessia) — ver commands/codigo_escaneado.rs.
+    enum Busqueda { Encontrado(ProductoApi), Varios(Vec<String>), NoEncontrado }
+    let r = tokio::task::spawn_blocking(move || -> Result<Busqueda, String> {
+        use crate::commands::codigo_escaneado::{resolver, Resolucion};
         let db = db.lock().unwrap();
+        let id = match resolver(&db, &codigo)? {
+            Resolucion::Uno(id) => id,
+            Resolucion::Ninguno => return Ok(Busqueda::NoEncontrado),
+            Resolucion::Varios(ids) => {
+                let codigos = ids.iter().filter_map(|id| db.query_row(
+                    "SELECT codigo FROM productos WHERE id = ?", [id], |r| r.get::<_, String>(0),
+                ).ok()).collect();
+                return Ok(Busqueda::Varios(codigos));
+            }
+        };
         db.query_row(
             r#"SELECT p.id, p.codigo, p.nombre, p.stock_actual, p.precio_costo, p.precio_venta,
                       p.proveedor_id, pr.nombre
                FROM productos p LEFT JOIN proveedores pr ON pr.id = p.proveedor_id
-               WHERE p.codigo = ? AND p.activo = 1"#,
-            rusqlite::params![codigo],
+               WHERE p.id = ?"#,
+            rusqlite::params![id],
             |row| Ok(ProductoApi {
                 id: row.get(0)?,
                 codigo: row.get(1)?,
@@ -340,12 +354,16 @@ pub async fn producto_por_codigo(
                 proveedor_id: row.get(6)?,
                 proveedor_nombre: row.get(7)?,
             }),
-        ).map_err(|e| e.to_string())
+        ).map(Busqueda::Encontrado).map_err(|e| e.to_string())
     }).await.map_err(|e| ApiError::internal(e.to_string()))?;
 
     match r {
-        Ok(p) => Ok(Json(p)),
-        Err(_) => Err(ApiError::not_found("Producto no encontrado")),
+        Ok(Busqueda::Encontrado(p)) => Ok(Json(p)),
+        Ok(Busqueda::Varios(codigos)) => Err(ApiError::bad_request(format!(
+            "Ese código contiene varios productos ({}). Búscalo por nombre.",
+            codigos.join(", ")
+        ))),
+        Ok(Busqueda::NoEncontrado) | Err(_) => Err(ApiError::not_found("Producto no encontrado")),
     }
 }
 

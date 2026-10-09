@@ -4,6 +4,8 @@ import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { invoke } from '../lib/invokeCompat';
 import { useProductStore, type Producto } from '../store/productStore';
 import { useAuthStore } from '../store/authStore';
+import { resolverCodigoEscaneado } from '../lib/codigoEscaneado';
+import ElegirProductoEscaneado from '../components/ElegirProductoEscaneado';
 import {
   TruckIcon, Plus, Search, Eye, RefreshCw, Trash2, PackagePlus,
   ArrowLeft, Minus, PlusIcon, ClipboardList, X, QrCode
@@ -109,6 +111,8 @@ export default function Recepcion() {
     const [error, setError] = useState('');
     const [flash, setFlash] = useState<{ nombre: string; cantidad: number } | null>(null);
     const [buscarTexto, setBuscarTexto] = useState('');
+    // Escaneo que contiene varios códigos del inventario: se pregunta cuál es.
+    const [eleccionEscaneo, setEleccionEscaneo] = useState<{ escaneado: string; candidatos: Producto[] } | null>(null);
     const [showCartMobile, setShowCartMobile] = useState(false);
     const scanRef = useRef<HTMLInputElement>(null);
 
@@ -225,6 +229,21 @@ export default function Recepcion() {
 
     return (
       <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
+        {eleccionEscaneo && (
+          <ElegirProductoEscaneado
+            escaneado={eleccionEscaneo.escaneado}
+            candidatos={eleccionEscaneo.candidatos}
+            onElegir={(p) => {
+              agregarProducto(p);
+              setEleccionEscaneo(null);
+              setTimeout(() => scanRef.current?.focus(), 50);
+            }}
+            onCancelar={() => {
+              setEleccionEscaneo(null);
+              setTimeout(() => scanRef.current?.focus(), 50);
+            }}
+          />
+        )}
         <div className="recepcion-subheader" style={{
           padding: '10px 20px', borderBottom: '1px solid var(--color-border)',
           background: 'var(--color-surface)', display: 'flex', alignItems: 'center', gap: 10,
@@ -263,12 +282,17 @@ export default function Recepcion() {
                       if (e.key === 'Enter') {
                         const code = buscarTexto.trim();
                         if (!code) return;
-                        const prod = productos.find(p => p.codigo === code);
-                        if (prod) {
-                          agregarProducto(prod);
+                        // Código exacto, guion leído como apóstrofo o código del
+                        // inventario dentro de un código largo de proveedor (Alessia).
+                        const r = resolverCodigoEscaneado(buscarTexto, productos);
+                        if (r.tipo === 'producto') {
+                          agregarProducto(r.producto);
+                          setBuscarTexto('');
+                        } else if (r.tipo === 'varios') {
+                          setEleccionEscaneo({ escaneado: code, candidatos: r.candidatos });
                           setBuscarTexto('');
                         } else {
-                          setError(`Código no encontrado: ${code}`);
+                          setError(`Código no encontrado: ${r.texto}`);
                           setTimeout(() => setError(''), 2500);
                         }
                       }

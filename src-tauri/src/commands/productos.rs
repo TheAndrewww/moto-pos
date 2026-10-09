@@ -176,13 +176,20 @@ pub fn listar_productos(state: State<'_, AppState>) -> Vec<Producto> {
     .collect()
 }
 
-/// Obtener producto por código (para escaneo)
+/// Obtener producto por código (para escaneo). Además del código exacto
+/// reconoce el guion leído como apóstrofo y el código del inventario dentro de
+/// un código largo de proveedor (ver codigo_escaneado.rs). Si lo escaneado
+/// contiene varios códigos posibles devuelve None (la pantalla pregunta).
 #[tauri::command]
 pub fn obtener_producto_por_codigo(
     codigo: String,
     state: State<'_, AppState>,
 ) -> Option<Producto> {
     let db = state.db.lock().unwrap();
+    let id = match super::codigo_escaneado::resolver(&db, &codigo).ok()? {
+        super::codigo_escaneado::Resolucion::Uno(id) => id,
+        _ => return None,
+    };
     db.query_row(
         r#"
         SELECT p.id, p.codigo, p.codigo_tipo, p.nombre, p.descripcion,
@@ -192,9 +199,9 @@ pub fn obtener_producto_por_codigo(
         FROM productos p
         LEFT JOIN categorias c ON c.id = p.categoria_id
         LEFT JOIN proveedores pr ON pr.id = p.proveedor_id
-        WHERE p.codigo = ? AND p.activo = 1
+        WHERE p.id = ?
         "#,
-        rusqlite::params![codigo],
+        rusqlite::params![id],
         |row| {
             Ok(Producto {
                 id: row.get(0)?,
