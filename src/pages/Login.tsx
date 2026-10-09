@@ -181,7 +181,7 @@ export default function Login() {
 
         {/* Footer */}
         <p style={{ color: 'var(--color-text-dim)', fontSize: 11 }}>
-          v0.1.0 — Fase 1 MVP
+          v{__APP_VERSION__}
         </p>
       </div>
     </div>
