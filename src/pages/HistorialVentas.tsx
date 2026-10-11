@@ -1,4 +1,5 @@
 // pages/HistorialVentas.tsx — Historial de ventas + anulación + devoluciones parciales
+// + eliminar venta de prueba (solo escritorio, solo usuarios con el permiso individual)
 
 import React, { useState, useEffect } from 'react';
 import { invoke, isTauri } from '../lib/invokeCompat';
@@ -11,7 +12,7 @@ import {
   DevolucionResumen,
 } from '../store/historialStore';
 import {
-  ScrollText, Search, RefreshCw, X, Ban, Undo2, CheckCircle2, Printer,
+  ScrollText, Search, RefreshCw, X, Ban, Undo2, CheckCircle2, Printer, Trash2,
 } from 'lucide-react';
 import { imprimirTicket, type ConfigNegocio } from '../utils/ticket';
 
@@ -105,6 +106,10 @@ export default function HistorialVentas() {
   const [ventaSeleccionada, setVentaSeleccionada] = useState<VentaDetalleCompleto | null>(null);
   const [modalAnular, setModalAnular] = useState(false);
   const [modalDevolver, setModalDevolver] = useState(false);
+  const [modalEliminar, setModalEliminar] = useState(false);
+  // Eliminar ventas de prueba: solo en el escritorio y solo usuarios con el
+  // permiso individual (Daniela Bravo). La web nunca lo recibe.
+  const puedeEliminarVentas = isTauri() && !!usuario?.puede_eliminar_ventas;
 
   // Carga una página específica. El conteo total se actualiza solo cuando
   // cambia el filtro (no al cambiar página) — pasar `recontar=true` para
@@ -323,6 +328,8 @@ export default function HistorialVentas() {
                             highlightTerm={articuloBuscado}
                             onAnular={(detalle) => { setVentaSeleccionada(detalle); setModalAnular(true); }}
                             onDevolver={(detalle) => { setVentaSeleccionada(detalle); setModalDevolver(true); }}
+                            puedeEliminarVentas={puedeEliminarVentas}
+                            onEliminar={(detalle) => { setVentaSeleccionada(detalle); setModalEliminar(true); }}
                           />
                         </td>
                       </tr>
@@ -437,6 +444,35 @@ export default function HistorialVentas() {
         />
       )}
 
+      {/* Modal eliminar venta de prueba */}
+      {ventaSeleccionada && modalEliminar && puedeEliminarVentas && (
+        <ModalEliminarVenta
+          venta={ventaSeleccionada}
+          usuarioId={usuario!.id}
+          onClose={() => setModalEliminar(false)}
+          onSuccess={(r) => {
+            setModalEliminar(false);
+            setVentaSeleccionada(null);
+            cargar();
+            const corte = r.corte_ajustado_id != null
+              ? `Corte ajustado: #${r.corte_ajustado_id}.`
+              : 'Estaba en el período abierto: no había corte que ajustar.';
+            const otros = r.cortes_ajustados.filter(id => id !== r.corte_ajustado_id);
+            alert(
+              `Venta ${r.folio} eliminada.\n` +
+              (r.anulada
+                ? 'Estaba anulada: el inventario ya se había regresado.\n'
+                : `Piezas regresadas al inventario: ${r.piezas_regresadas}.\n`) +
+              `${corte}\n` +
+              (otros.length > 0 ? `Cortes ajustados por retiros: ${otros.map(id => `#${id}`).join(', ')}.\n` : '') +
+              (r.devoluciones_eliminadas > 0 ? `Devoluciones eliminadas: ${r.devoluciones_eliminadas}.\n` : '') +
+              (r.movimientos_eliminados > 0 ? `Retiros de caja eliminados: ${r.movimientos_eliminados}.\n` : '') +
+              'No queda rastro en la bitácora.'
+            );
+          }}
+        />
+      )}
+
       {/* Modal devolver */}
       {ventaSeleccionada && modalDevolver && (
         <ModalDevolverVenta
@@ -458,12 +494,15 @@ export default function HistorialVentas() {
 // ─── Componente In-line: Detalle de venta ───────────────────
 
 function DetalleVentaInline({
-  ventaId, highlightTerm, onAnular, onDevolver,
+  ventaId, highlightTerm, onAnular, onDevolver, puedeEliminarVentas = false, onEliminar,
 }: {
   ventaId: number;
   highlightTerm?: string;
   onAnular: (v: VentaDetalleCompleto) => void;
   onDevolver: (v: VentaDetalleCompleto) => void;
+  /** Escritorio + usuario con el permiso individual de eliminar ventas de prueba. */
+  puedeEliminarVentas?: boolean;
+  onEliminar?: (v: VentaDetalleCompleto) => void;
 }) {
   const { obtenerDetalleCached } = useHistorialStore();
   const infoCaja = useCortesStore(s => s.infoCaja);
@@ -493,6 +532,10 @@ function DetalleVentaInline({
   const anulableHoy = !venta.anulada && esHoy && venta.total_devuelto === 0;
   // Web: solo ventas de la caja web. Escritorio: solo las de la tienda.
   const puedeAnular = anulableHoy && anulableEnEsteEquipo(venta as ConCaja);
+  // Eliminar venta de prueba: cualquier estado (anulada, con devoluciones,
+  // de otro día), pero solo de la caja de la tienda: la caja web tiene su
+  // dinero y sus cortes en el servidor.
+  const puedeEliminar = puedeEliminarVentas && !!onEliminar && cajaDe(venta as ConCaja) === 'principal';
 
   // Función para verificar si un item coincide con el término de búsqueda
   const itemCoincide = (it: VentaDetalleItem): boolean => {
@@ -590,6 +633,15 @@ function DetalleVentaInline({
           {puedeAnular && (
             <button className="btn btn-danger btn-sm" onClick={() => onAnular(venta)}>
               <Ban size={14} /> Anular venta
+            </button>
+          )}
+          {puedeEliminar && (
+            <button
+              className="btn btn-danger btn-sm"
+              onClick={() => onEliminar!(venta)}
+              title="Borra por completo una venta hecha como prueba"
+            >
+              <Trash2 size={14} /> Eliminar venta de prueba
             </button>
           )}
           {((anulableHoy && !puedeAnular) || (devolvible && devolucionEnOtraCaja)) && (
@@ -738,6 +790,130 @@ function ModalAnularVenta({
           disabled={procesando || !motivo.trim() || (!esAdmin && pin.length !== 4)}
         >
           {procesando ? 'Anulando...' : 'Confirmar anulación'}
+        </button>
+      </div>
+    </ModalWrapper>
+  );
+}
+
+// ─── Modal: Eliminar venta de prueba ──────────────────────
+
+/** Lo que regresa `eliminar_venta` (src-tauri/src/commands/eliminar_ventas.rs). */
+interface VentaEliminada {
+  venta_id: number;
+  folio: string;
+  total: number;
+  metodo_pago: string;
+  anulada: boolean;
+  piezas_regresadas: number;
+  corte_ajustado_id: number | null;
+  cortes_ajustados: number[];
+  devoluciones_eliminadas: number;
+  movimientos_eliminados: number;
+  folio_reutilizable: boolean;
+}
+
+function ModalEliminarVenta({
+  venta, usuarioId, onClose, onSuccess,
+}: {
+  venta: VentaDetalleCompleto;
+  usuarioId: number;
+  onClose: () => void;
+  onSuccess: (r: VentaEliminada) => void;
+}) {
+  const [pin, setPin] = useState('');
+  const [procesando, setProcesando] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const piezas = venta.items.reduce((s, i) => s + i.cantidad_disponible, 0);
+
+  const confirmar = async () => {
+    if (pin.length !== 4) return;
+    setProcesando(true);
+    setError(null);
+    try {
+      const r = await invoke<VentaEliminada>('eliminar_venta', {
+        ventaId: venta.id, usuarioId, pin,
+      });
+      onSuccess(r);
+    } catch (e: any) {
+      setError(String(e));
+      setPin('');
+      setProcesando(false);
+    }
+  };
+
+  return (
+    <ModalWrapper onClose={procesando ? () => {} : onClose} maxWidth={480}>
+      <div style={modalHeaderStyle}>
+        <h3 style={{
+          margin: 0, fontSize: 16, fontWeight: 700, color: 'var(--color-danger)',
+          display: 'flex', alignItems: 'center', gap: 6,
+        }}>
+          <Trash2 size={16} />
+          Eliminar venta de prueba {venta.folio}
+        </h3>
+        <button className="btn btn-ghost btn-sm" onClick={onClose} disabled={procesando}><X size={16} /></button>
+      </div>
+
+      <div style={{ padding: 20, display: 'flex', flexDirection: 'column', gap: 14 }}>
+        <div style={{
+          padding: 12, borderRadius: 6, background: 'var(--color-danger-soft)',
+          border: '1px solid rgba(220,38,38,0.25)', fontSize: 12, lineHeight: 1.5,
+        }}>
+          <strong>Úsalo solo para ventas de prueba.</strong> Se hace como si la venta nunca hubiera pasado:
+          <ul style={{ margin: '6px 0 0', paddingLeft: 18, listStyle: 'disc', display: 'flex', flexDirection: 'column', gap: 3 }}>
+            <li>
+              Se borra la venta ({fmt(venta.total)} en {venta.metodo_pago}), sus productos, sus devoluciones
+              y los retiros de caja que se hicieron por ella, aquí y en la web.
+            </li>
+            <li>
+              {venta.anulada
+                ? 'Está anulada: el inventario ya se había regresado y no se vuelve a tocar.'
+                : `Las piezas regresan al inventario (${piezas} pieza${piezas === 1 ? '' : 's'}).`}
+            </li>
+            <li>
+              La caja y el corte se ajustan como si no hubiera existido: si un corte ya la contó, se le
+              resta y su diferencia se recalcula (lo contado y el fondo no cambian).
+            </li>
+            <li><strong>No se puede deshacer.</strong></li>
+            <li>También se borran sus renglones de la bitácora: no queda ningún rastro, aquí ni en la web.</li>
+          </ul>
+        </div>
+
+        <div>
+          <label style={labelStyle}>Tu PIN para confirmar *</label>
+          <input
+            type="password"
+            inputMode="numeric"
+            maxLength={4}
+            value={pin}
+            onChange={(e) => { setPin(e.target.value.replace(/\D/g, '')); setError(null); }}
+            onKeyDown={(e) => { if (e.key === 'Enter') confirmar(); }}
+            placeholder="••••"
+            className="input"
+            style={{ width: 120, letterSpacing: 4, textAlign: 'center', fontSize: 18 }}
+            autoFocus
+            disabled={procesando}
+          />
+        </div>
+
+        {error && (
+          <div style={{ fontSize: 12, color: 'var(--color-danger)', fontWeight: 600 }}>{error}</div>
+        )}
+      </div>
+
+      <div style={{
+        padding: '12px 20px', borderTop: '1px solid var(--color-border)',
+        display: 'flex', gap: 8, justifyContent: 'flex-end',
+      }}>
+        <button className="btn btn-ghost" onClick={onClose} disabled={procesando}>Cancelar</button>
+        <button
+          className="btn btn-danger"
+          onClick={confirmar}
+          disabled={procesando || pin.length !== 4}
+        >
+          <Trash2 size={14} />
+          {procesando ? 'Eliminando...' : 'Eliminar definitivamente'}
         </button>
       </div>
     </ModalWrapper>

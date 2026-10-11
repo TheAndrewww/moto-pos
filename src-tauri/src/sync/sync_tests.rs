@@ -1519,6 +1519,40 @@ fn migracion_015_sobre_copia_de_bd_dev() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// ─── Ventas de prueba eliminadas (cola de purgas) ─────────
+
+/// Una fila que se eliminó aquí ("Eliminar venta de prueba") y sigue en la
+/// cola de purgas no se vuelve a crear con lo que manda el servidor: ni en el
+/// pull, ni en la re-descarga. Cuando el servidor confirma la purga sale de
+/// la cola (y el servidor ya no la tiene); la guardia era lo único que la
+/// frenaba.
+#[test]
+fn fila_en_la_cola_de_purgas_no_se_vuelve_a_crear() {
+    let mut db = nueva_db();
+    let v = web(8100);
+    let m = web(8101);
+    db.execute(
+        "INSERT INTO sync_purgas_pendientes (tabla, uuid) VALUES ('ventas', ?1), ('movimientos_caja', ?2)",
+        [&v, &m],
+    ).unwrap();
+    let venta = cambio_venta_web(&v, "V-W81", "2026-10-06 10:00:00", 50.0);
+    let mov = mov_web(&m, "web", Some("principal"), 20.0, "2026-10-06 10:00:00");
+
+    let r = aplicar(&mut db, &[venta.clone(), mov.clone()]);
+    assert_eq!((r.aplicados, r.omitidos, r.aparcados), (0, 2, 0));
+    let r = aplicar_lote_con(&mut db, &[venta.clone(), mov.clone()], Modo::Replay, AHORA).unwrap();
+    assert_eq!(r.aplicados, 0, "la re-descarga tampoco");
+    assert_eq!(i64_de(&db, &format!("SELECT COUNT(*) FROM ventas WHERE uuid = '{v}'")), 0);
+    assert_eq!(i64_de(&db, &format!("SELECT COUNT(*) FROM movimientos_caja WHERE uuid = '{m}'")), 0);
+    assert_eq!(i64_de(&db, "SELECT COUNT(*) FROM venta_detalle"), 0);
+    assert_eq!(i64_de(&db, "SELECT COUNT(*) FROM sync_inbox"), 0, "no se queda esperando en la bandeja");
+    assert_eq!(bandera(&db), 0);
+
+    db.execute("DELETE FROM sync_purgas_pendientes", []).unwrap();
+    let r = aplicar(&mut db, &[venta]);
+    assert_eq!(r.aplicados, 1);
+}
+
 // ─── Contra un servidor simulado (HTTP real en 127.0.0.1) ─
 
 mod con_servidor_simulado {
@@ -1610,6 +1644,11 @@ mod con_servidor_simulado {
         m.anotar("fila", json!(q));
         Json(m.fila.clone())
     }
+    async fn purgar(State(m): State<Mock>, Json(b): Json<Value>) -> Json<Value> {
+        let n = b["filas"].as_array().map(|a| a.len()).unwrap_or(0);
+        m.anotar("purgar", b);
+        Json(json!({ "borrados": n }))
+    }
 
     async fn push(State(m): State<Mock>, Json(b): Json<Value>) -> Json<Value> {
         m.entrar().await;
@@ -1659,6 +1698,7 @@ mod con_servidor_simulado {
                 .route("/sync/refs", post(refs))
                 .route("/sync/pull", get(pull))
                 .route("/sync/fila", get(fila))
+                .route("/sync/purgar", post(purgar))
                 .with_state(m),
         )
         .await
@@ -2586,6 +2626,142 @@ mod con_servidor_simulado {
         assert_eq!(estado(&db), ("999 / 120".to_string(), None), "precio web y la venta de aquí");
         let conn = db.lock().unwrap();
         assert_eq!(i64_de(&conn, "SELECT COUNT(*) FROM sync_inbox"), 0);
+        assert_eq!(outbox::contar_pendientes(&conn).unwrap(), 0);
+        assert_eq!(bandera(&conn), 0);
+    }
+
+    // ─── Ventas de prueba eliminadas: cola de purgas ──────
+
+    fn purgas_en_cola(db: &Arc<Mutex<Connection>>) -> i64 {
+        i64_de(&db.lock().unwrap(), "SELECT COUNT(*) FROM sync_purgas_pendientes")
+    }
+
+    /// El ciclo manda la cola a POST /sync/purgar DESPUÉS del push (los
+    /// ajustes de existencia/cortes ya subieron) y ANTES del pull, y la vacía
+    /// cuando el servidor confirma. Con la cola vacía no llama.
+    #[tokio::test]
+    async fn purga_va_despues_del_push_y_antes_del_pull_y_vacia_la_cola() {
+        use crate::sync::worker::forzar_ciclo_con_espera;
+        use std::time::Duration;
+        let m = Mock::default();
+        let url = servidor_v2(m.clone()).await;
+        let db = nueva_db();
+        configurar(&db, &url);
+        db.execute(
+            "INSERT INTO sync_purgas_pendientes (tabla, uuid) VALUES \
+             ('ventas', ?1), ('devoluciones', ?2), ('movimientos_caja', ?3)",
+            [hex(9001), hex(9002), hex(9003)],
+        ).unwrap();
+        db.execute("UPDATE productos SET stock_actual = 1002 WHERE id = 1", []).unwrap();
+        let device = state::leer(&db).unwrap().unwrap().device_uuid;
+        let db = Arc::new(Mutex::new(db));
+
+        forzar_ciclo_con_espera(db.clone(), Duration::from_secs(20)).await.unwrap();
+        assert_eq!(m.de("purgar"), vec![json!({
+            "device_uuid": device,
+            "filas": [
+                { "tabla": "ventas", "uuid": hex(9001) },
+                { "tabla": "devoluciones", "uuid": hex(9002) },
+                { "tabla": "movimientos_caja", "uuid": hex(9003) },
+            ],
+        })]);
+        let orden: Vec<String> = m.llamadas.lock().unwrap().iter().map(|(r, _)| r.clone()).collect();
+        let pos = |r: &str| orden.iter().position(|x| x == r).unwrap_or_else(|| panic!("falta {r}: {orden:?}"));
+        assert!(pos("push") < pos("purgar") && pos("purgar") < pos("pull"), "{orden:?}");
+        assert_eq!(purgas_en_cola(&db), 0);
+
+        forzar_ciclo_con_espera(db.clone(), Duration::from_secs(20)).await.unwrap();
+        assert_eq!(m.de("purgar").len(), 1, "con la cola vacía no se llama");
+    }
+
+    /// Servidor sin /sync/purgar (404, 405 o la página de la SPA): no es
+    /// error y la cola se queda para el siguiente ciclo. Sin red o con un
+    /// error del servidor: Err y la cola también se queda.
+    #[tokio::test]
+    async fn servidor_sin_purgar_conserva_la_cola() {
+        let db = nueva_db();
+        db.execute("INSERT INTO sync_purgas_pendientes (tabla, uuid) VALUES ('ventas', ?1)", [hex(9100)]).unwrap();
+        let db = Arc::new(Mutex::new(db));
+        let urls = [
+            servidor_viejo().await,
+            servir(Router::new().route("/sync/purgar", post(|| async { StatusCode::NOT_FOUND }))).await,
+            servir(Router::new().route("/sync/purgar", post(|| async { StatusCode::METHOD_NOT_ALLOWED }))).await,
+        ];
+        for url in urls {
+            let client = RemoteClient::new(&url, "token").unwrap();
+            assert_eq!(crate::sync::worker::purgar(&db, &client, &cfg("dev-1")).await, Ok(0), "{url}");
+            assert_eq!(purgas_en_cola(&db), 1);
+        }
+        let url_500 = servir(Router::new().route("/sync/purgar", post(|| async { StatusCode::INTERNAL_SERVER_ERROR }))).await;
+        for client in [RemoteClient::new(&url_500, "token").unwrap(), RemoteClient::new("http://127.0.0.1:9", "token").unwrap()] {
+            assert!(crate::sync::worker::purgar(&db, &client, &cfg("dev-1")).await.is_err());
+            assert_eq!(purgas_en_cola(&db), 1);
+        }
+    }
+
+    /// De punta a punta: la venta sube, se elimina como venta de prueba y el
+    /// siguiente ciclo sube la existencia (nunca un DELETE ni bitácora) y
+    /// purga en el servidor la venta y su renglón de bitácora.
+    #[tokio::test]
+    async fn eliminar_venta_de_prueba_y_purgarla_en_el_servidor() {
+        use crate::commands::eliminar_ventas::eliminar_venta_core;
+        use crate::commands::ventas::{crear_venta_core, ItemVenta, NuevaVenta};
+        use crate::sync::worker::forzar_ciclo_con_espera;
+        use std::time::Duration;
+        let m = Mock::default();
+        let url = servidor_v2(m.clone()).await;
+        let db = nueva_db();
+        configurar(&db, &url);
+        db.execute(
+            "UPDATE usuarios SET pin = ?1, puede_eliminar_ventas = 1 WHERE id = 1",
+            [bcrypt::hash("4321", 4).unwrap()],
+        ).unwrap();
+        let v = crear_venta_core(&db, NuevaVenta {
+            usuario_id: 1, cliente_id: None, subtotal: 200.0, descuento: 0.0, total: 200.0,
+            metodo_pago: "efectivo".into(), monto_recibido: 200.0, cambio: 0.0,
+            items: vec![ItemVenta {
+                producto_id: 1, cantidad: 2.0, precio_original: 100.0, descuento_porcentaje: 0.0,
+                descuento_monto: 0.0, precio_final: 100.0, subtotal: 200.0, autorizado_por: None,
+            }],
+            presupuesto_origen_id: None,
+        }, "2026-10-06 10:00:00").unwrap();
+        let uuid_v = uuid_de(&db, "ventas", v.id);
+        let uuid_bitacora: String = db
+            .query_row(
+                "SELECT uuid FROM audit_log WHERE tabla_afectada = 'ventas' AND registro_id = ?",
+                [v.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let db = Arc::new(Mutex::new(db));
+
+        forzar_ciclo_con_espera(db.clone(), Duration::from_secs(20)).await.unwrap();
+        assert!(m.de("push")[0]["cambios"].as_array().unwrap().iter().any(|c| c["data"]["uuid"] == json!(uuid_v)));
+
+        {
+            let c = db.lock().unwrap();
+            let r = eliminar_venta_core(&c, v.id, 1, "4321", "2026-10-06 11:00:00").unwrap();
+            assert_eq!(r.piezas_regresadas, 2.0);
+            assert_eq!(i64_de(&c, "SELECT CAST(stock_actual AS INTEGER) FROM productos WHERE id = 1"), 1000);
+        }
+        forzar_ciclo_con_espera(db.clone(), Duration::from_secs(20)).await.unwrap();
+
+        let pushes = m.de("push");
+        assert_eq!(pushes.len(), 2);
+        let cambios = pushes[1]["cambios"].as_array().unwrap();
+        let tablas: Vec<&str> = cambios.iter().map(|c| c["tabla"].as_str().unwrap()).collect();
+        assert!(tablas.contains(&"productos"), "{tablas:?}");
+        assert!(!tablas.contains(&"ventas") && !tablas.contains(&"audit_log"), "{tablas:?}");
+        assert!(cambios.iter().all(|c| c["operacion"] != json!("DELETE")));
+        let prod = cambios.iter().find(|c| c["tabla"] == json!("productos")).unwrap();
+        assert_eq!(prod["data"]["stock_actual"], json!(1000.0));
+        assert_eq!(m.de("purgar").len(), 1);
+        assert_eq!(
+            m.de("purgar")[0]["filas"],
+            json!([{ "tabla": "ventas", "uuid": uuid_v }, { "tabla": "audit_log", "uuid": uuid_bitacora }])
+        );
+        assert_eq!(purgas_en_cola(&db), 0);
+        let conn = db.lock().unwrap();
         assert_eq!(outbox::contar_pendientes(&conn).unwrap(), 0);
         assert_eq!(bandera(&conn), 0);
     }

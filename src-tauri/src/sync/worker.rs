@@ -9,10 +9,17 @@
 //      rechazo 'remoto_mas_nuevo' pide la versión del servidor (bandeja).
 //      Un producto con código renombrado aquí ('-W'/'-D' + 8 del uuid) sube
 //      con el código que tiene en el servidor (sin el sufijo).
-//   3. Jala cambios del remoto desde last_pull_cursor mientras haya más
-//      (máx. MAX_TANDAS_PULL tandas por ciclo).
-//   4. Reintenta la bandeja de cambios recibidos que no se pudieron aplicar.
-//   5. Tareas únicas del sync v2 (mapa de ids, reparación, re-descarga).
+//   3. Purgas: filas que aquí se eliminaron (ventas de prueba) se borran en
+//      el servidor (POST /sync/purgar, ≤ BATCH_PURGA por llamada). Va
+//      DESPUÉS del push (los ajustes de existencia, cortes y presupuesto ya
+//      subieron y el presupuesto ya no apunta a la venta) y ANTES del pull.
+//      Un servidor sin el endpoint (404/405/HTML) no es error: la cola se
+//      queda y se reintenta en el siguiente ciclo.
+//   4. Jala cambios del remoto desde last_pull_cursor mientras haya más
+//      (máx. MAX_TANDAS_PULL tandas por ciclo). Una fila que sigue en la
+//      cola de purgas nunca se vuelve a crear (apply.rs).
+//   5. Reintenta la bandeja de cambios recibidos que no se pudieron aplicar.
+//   6. Tareas únicas del sync v2 (mapa de ids, reparación, re-descarga).
 //
 // Un solo ciclo a la vez (`CICLO`): el periódico, el de "Forzar
 // sincronización" y la reparación manual nunca corren juntos (dos ciclos
@@ -36,13 +43,16 @@ use std::time::Duration;
 use rusqlite::Connection;
 use serde_json::{json, Value};
 
-use super::{client::{RemoteClient, PushBody, CambioOut, PROTO}, outbox, state, apply, payload, inbox, tareas, fk, base};
+use super::{client::{RemoteClient, PushBody, CambioOut, Respuesta, PROTO}, outbox, state, apply, payload, inbox, tareas, fk, base};
 
 const INTERVALO: Duration = Duration::from_secs(30);
 const BATCH_PUSH: i64 = 100;
 const BATCH_PULL_LIMITE_DIAS_CLEANUP: i64 = 7;
 /// Tandas de pull por ciclo cuando el servidor dice `hay_mas`.
 const MAX_TANDAS_PULL: usize = 10;
+/// Filas por llamada a POST /sync/purgar y llamadas máximas por ciclo.
+const BATCH_PURGA: i64 = 500;
+const MAX_TANDAS_PURGA: usize = 10;
 /// Espera antes de reintentar una tarea única que el servidor aún no
 /// soporta o que falló (segundos).
 const ESPERA_TAREAS_SEG: i64 = 15 * 60;
@@ -129,20 +139,25 @@ async fn ciclo(db: &Arc<Mutex<Connection>>) -> Result<(), String> {
         log::warn!("sync push error: {}", e);
     }
 
-    // 3. Pull nuevos
+    // 3. Purgas (ventas de prueba eliminadas aquí)
+    if let Err(e) = purgar(db, &client, &cfg).await {
+        log::warn!("sync purga error: {}", e);
+    }
+
+    // 4. Pull nuevos
     if let Err(e) = pull(db, &client, &cfg).await {
         log::warn!("sync pull error: {}", e);
     }
 
-    // 4. Bandeja de entrada
+    // 5. Bandeja de entrada
     if let Err(e) = inbox::reintentar(db, &client).await {
         log::warn!("sync inbox error: {}", e);
     }
 
-    // 5. Tareas únicas
+    // 6. Tareas únicas
     tareas_unicas(db, &client, &cfg).await;
 
-    // 6. Limpieza periódica del outbox
+    // 7. Limpieza periódica del outbox
     {
         let conn = db.lock().map_err(|e| e.to_string())?;
         let _ = outbox::limpiar_antiguos(&conn, BATCH_PULL_LIMITE_DIAS_CLEANUP);
@@ -456,6 +471,47 @@ pub(super) async fn push(
         }
     }
     Ok(())
+}
+
+/// Manda al servidor las purgas pendientes (filas eliminadas aquí por
+/// "Eliminar venta de prueba") y quita de la cola las que confirmó. Devuelve
+/// cuántas se confirmaron. Servidor sin el endpoint → Ok(0) y la cola se
+/// queda (sin llenar el log); error de red o del servidor → Err y la cola
+/// también se queda.
+pub(super) async fn purgar(
+    db: &Arc<Mutex<Connection>>,
+    client: &RemoteClient,
+    cfg: &state::SyncConfig,
+) -> Result<usize, String> {
+    let mut confirmadas = 0usize;
+    for _ in 0..MAX_TANDAS_PURGA {
+        let filas = {
+            let conn = db.lock().map_err(|e| e.to_string())?;
+            state::purgas_pendientes(&conn, BATCH_PURGA).map_err(|e| e.to_string())?
+        };
+        if filas.is_empty() {
+            break;
+        }
+        let pares: Vec<(String, String)> = filas.iter().map(|(_, t, u)| (t.clone(), u.clone())).collect();
+        match client.purgar(&cfg.device_uuid, &pares).await? {
+            Respuesta::Ok(r) => {
+                let ids: Vec<i64> = filas.iter().map(|(id, _, _)| *id).collect();
+                let conn = db.lock().map_err(|e| e.to_string())?;
+                let n = state::quitar_purgas(&conn, &ids).map_err(|e| e.to_string())?;
+                confirmadas += n;
+                log::info!("sync purga: {} filas confirmadas ({} borradas en el servidor)", n, r.borrados);
+                if (filas.len() as i64) < BATCH_PURGA {
+                    break;
+                }
+            }
+            Respuesta::NoSoportado => {
+                log::debug!("sync: el servidor aún no soporta /sync/purgar; se reintenta en el siguiente ciclo");
+                break;
+            }
+            Respuesta::Rechazado(v) => return Err(format!("purgar rechazado: {}", v)),
+        }
+    }
+    Ok(confirmadas)
 }
 
 pub(super) async fn pull(

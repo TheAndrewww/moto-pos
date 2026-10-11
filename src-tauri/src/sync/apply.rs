@@ -46,6 +46,8 @@
 //     NULL que manda el servidor.
 //   - Productos: la fila aplicada queda como base de la fusión de 3 vías
 //     (sync_base, ver base.rs).
+//   - Una fila que sigue en `sync_purgas_pendientes` (venta de prueba
+//     eliminada aquí que el servidor aún no purga) nunca se vuelve a crear.
 
 use std::collections::HashMap;
 
@@ -270,6 +272,12 @@ fn aplicar_uno(
     }
     if tabla == "stock_sucursal" {
         return Ok(Resultado::Omitido("stock_sucursal fuera de sync"));
+    }
+    // Fila eliminada aquí ("Eliminar venta de prueba") que el servidor aún no
+    // purga: no se vuelve a crear (ni en el pull, ni en la re-descarga, ni en
+    // la bandeja).
+    if super::state::hay_purga_pendiente(tx, tabla, uuid) {
+        return Ok(Resultado::Omitido("eliminada aquí; falta purgarla en el servidor"));
     }
     // Cadena de cortes/aperturas: un solo escritor (este equipo).
     if fk::TABLAS_CAJA_NUNCA.contains(&tabla) {

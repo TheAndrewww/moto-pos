@@ -11,6 +11,8 @@
 //   POST /sync/reparar { device_uuid, simulacion?, revertir_lote? } → reporte
 //   POST /sync/refs   { tabla, uuids } → { uuid: {columna: uuid | null} }
 //   GET  /sync/fila?tabla=&uuid= → un cambio con la forma del pull v2
+//   POST /sync/purgar { device_uuid, filas: [{tabla, uuid}] } → { borrados, … }
+//                     (borrado definitivo de ventas de prueba; ver su sección)
 //
 // IDENTIDAD: cada base numera sus filas por su cuenta; las FK enteras solo
 // significan algo del lado que las escribió. En el push v2 se traducen a ids
@@ -1547,6 +1549,200 @@ pub async fn procesar_id_map(pool: &PgPool, body: &IdMapBody) -> ApiResult<Value
         "invalidos": invalidos,
         "desconocidos": desconocidos,
     }))
+}
+
+// -----------------------------------------------------------------------------
+// POST /sync/purgar — borrado DEFINITIVO de lo que el escritorio eliminó
+// -----------------------------------------------------------------------------
+//
+// "Eliminar venta de prueba" (escritorio, solo el usuario autorizado): la
+// venta desaparece como si nunca hubiera existido. El escritorio la borra de
+// su base SIN encolar DELETEs (un DELETE del push es borrado lógico y la
+// venta seguiría contando aquí) y anota cada fila en su cola de purgas, que
+// manda aquí. Se borran de verdad la fila, sus hijos y su rastro en el sync
+// (sync_cursor, estado/pendientes de FK, huellas, celdas web, mapa de ids),
+// para que ningún pull la vuelva a mandar.
+//
+// Bitácora: por pedido expreso del dueño (son ventas de PRUEBA y no deben
+// dejar rastro), también se borran sus líneas: las que el escritorio manda por
+// uuid (tabla 'audit_log') y, por si alguna no la tenía el escritorio, las que
+// aquí apuntan a una venta/devolución/movimiento purgado (tabla_afectada +
+// registro_id). El stock y los cortes ajustados llegan por el push normal.
+
+/// Tablas que se pueden purgar: la venta, sus devoluciones, los movimientos
+/// de caja que se hicieron por ella y sus líneas de bitácora. Sus hijos
+/// (venta_detalle, devolucion_detalle) se borran con el padre. Cualquier otra
+/// tabla se rechaza (toda la llamada, sin borrar nada).
+const TABLAS_PURGABLES: &[&str] = &["ventas", "devoluciones", "movimientos_caja", "audit_log"];
+const MAX_FILAS_PURGA: usize = 500;
+
+/// Tablas del sync que llevan rastro por (tabla, uuid de la fila).
+const RASTRO_SYNC: &[(&str, &str)] = &[
+    ("sync_cursor", "uuid"),
+    ("sync_fk_estado", "uuid"),
+    ("sync_fk_pendiente", "fila_uuid"),
+    ("sync_push_aplicado", "uuid"),
+    ("sync_fk_celda_web", "uuid"),
+    ("sync_id_map", "uuid"),
+];
+
+#[derive(Debug, Deserialize)]
+pub struct PurgarBody {
+    pub device_uuid: String,
+    pub filas: Vec<FilaPurga>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FilaPurga {
+    pub tabla: String,
+    pub uuid: String,
+}
+
+pub async fn purgar(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<PurgarBody>,
+) -> ApiResult<Json<Value>> {
+    autenticar_sync(&headers, &state).await?;
+    procesar_purgar(&state.pool, &body).await.map(Json)
+}
+
+/// Borra las filas pedidas en UNA transacción. Idempotente: una fila que ya
+/// no existe cuenta como hecha (su rastro en el sync se limpia igual).
+/// Devuelve `{borrados, hijos_borrados, recibidos, por_tabla}`; `borrados`
+/// cuenta solo las filas padre que existían.
+pub async fn procesar_purgar(pool: &PgPool, body: &PurgarBody) -> ApiResult<Value> {
+    if body.device_uuid.trim().is_empty() {
+        return Err(ApiError::BadRequest("falta device_uuid".into()));
+    }
+    if body.filas.len() > MAX_FILAS_PURGA {
+        return Err(ApiError::BadRequest(format!("máximo {MAX_FILAS_PURGA} filas por llamada")));
+    }
+    // Todo se valida antes de tocar nada.
+    let mut por_tabla: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
+    for f in &body.filas {
+        let Some(tabla) = TABLAS_PURGABLES.iter().copied().find(|t| *t == f.tabla) else {
+            return Err(ApiError::BadRequest(format!("tabla no purgable: {}", f.tabla)));
+        };
+        let uuid = f.uuid.trim();
+        if uuid.is_empty() {
+            return Err(ApiError::BadRequest(format!("fila de {tabla} sin uuid")));
+        }
+        let lista = por_tabla.entry(tabla).or_default();
+        if !lista.iter().any(|u| u == uuid) {
+            lista.push(uuid.to_string());
+        }
+    }
+    let recibidos: usize = por_tabla.values().map(|v| v.len()).sum();
+
+    let mut conteo: BTreeMap<&'static str, u64> = BTreeMap::new();
+    let mut borrados: u64 = 0;
+    let mut hijos_borrados: u64 = 0;
+    if recibidos > 0 {
+        let mut tx = pool.begin().await?;
+        // Compartido contra la reparación de FK (que toma el exclusivo), igual
+        // que el push.
+        sqlx::query("SELECT pg_advisory_xact_lock_shared($1)")
+            .bind(sync_fk::LLAVE_REPARACION)
+            .execute(&mut *tx)
+            .await?;
+        let mut ventas_borradas: Vec<i64> = Vec::new();
+        for (tabla, uuids) in &por_tabla {
+            // Ids de aquí, bloqueados: un push de la misma fila espera.
+            let ids: Vec<i64> = sqlx::query_scalar(&format!(
+                "SELECT id FROM {tabla} WHERE uuid = ANY($1) ORDER BY id FOR UPDATE"
+            ))
+            .bind(uuids)
+            .fetch_all(&mut *tx)
+            .await?;
+            for (hijo, fk) in hijos_de(tabla) {
+                let us: Vec<String> = if ids.is_empty() {
+                    Vec::new()
+                } else {
+                    sqlx::query_scalar(&format!("DELETE FROM {hijo} WHERE {fk} = ANY($1) RETURNING uuid"))
+                        .bind(&ids)
+                        .fetch_all(&mut *tx)
+                        .await?
+                };
+                borrar_rastro_sync(&mut tx, hijo, &us).await?;
+                *conteo.entry(hijo).or_default() += us.len() as u64;
+                hijos_borrados += us.len() as u64;
+            }
+            let n = sqlx::query(&format!("DELETE FROM {tabla} WHERE uuid = ANY($1)"))
+                .bind(uuids)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+            borrar_rastro_sync(&mut tx, tabla, uuids).await?;
+            *conteo.entry(tabla).or_default() += n;
+            borrados += n;
+            if *tabla == "ventas" {
+                ventas_borradas.extend(ids.iter().copied());
+            }
+            // Líneas de bitácora que aquí apuntan a lo purgado.
+            if *tabla != "audit_log" && !ids.is_empty() {
+                let us: Vec<String> = sqlx::query_scalar(
+                    "DELETE FROM audit_log WHERE tabla_afectada = $1 AND registro_id = ANY($2) RETURNING uuid",
+                )
+                .bind(*tabla)
+                .bind(&ids)
+                .fetch_all(&mut *tx)
+                .await?;
+                borrar_rastro_sync(&mut tx, "audit_log", &us).await?;
+                *conteo.entry("audit_log").or_default() += us.len() as u64;
+            }
+        }
+        // Devoluciones que siguen apuntando a una venta borrada (hechas en la
+        // web y que el escritorio aún no tenía): no se tocan, solo se avisa.
+        if !ventas_borradas.is_empty() {
+            let huerfanas: Vec<String> =
+                sqlx::query_scalar("SELECT uuid FROM devoluciones WHERE venta_id = ANY($1) ORDER BY id")
+                    .bind(&ventas_borradas)
+                    .fetch_all(&mut *tx)
+                    .await?;
+            if !huerfanas.is_empty() {
+                tracing::warn!(
+                    "purgar: {} devolución(es) apuntan a una venta purgada y no se pidieron: {:?}",
+                    huerfanas.len(),
+                    huerfanas
+                );
+            }
+        }
+        tx.commit().await?;
+    }
+    tracing::info!(
+        "purgar ({}): {} fila(s) pedidas, {} borradas, {} hijos: {:?}",
+        body.device_uuid,
+        recibidos,
+        borrados,
+        hijos_borrados,
+        conteo
+    );
+    Ok(json!({
+        "borrados": borrados,
+        "hijos_borrados": hijos_borrados,
+        "recibidos": recibidos,
+        "por_tabla": conteo,
+    }))
+}
+
+/// Quita el rastro del sync de unas filas.
+async fn borrar_rastro_sync(
+    tx: &mut Transaction<'_, Postgres>,
+    tabla: &str,
+    uuids: &[String],
+) -> ApiResult<()> {
+    if uuids.is_empty() {
+        return Ok(());
+    }
+    for (t, col) in RASTRO_SYNC {
+        sqlx::query(&format!("DELETE FROM {t} WHERE tabla = $1 AND {col} = ANY($2)"))
+            .bind(tabla)
+            .bind(uuids)
+            .execute(&mut **tx)
+            .await?;
+    }
+    Ok(())
 }
 
 // -----------------------------------------------------------------------------

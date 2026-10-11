@@ -189,3 +189,40 @@ pub fn actualizar_replay_cursor(conn: &Connection, cursor: &str) -> SqlResult<()
     )?;
     Ok(())
 }
+
+// ─── Purgas pendientes (ventas de prueba eliminadas) ──────
+//
+// `sync_purgas_pendientes` (migración 017): filas borradas aquí por
+// "Eliminar venta de prueba" que falta borrar en el servidor. El worker las
+// manda a POST /sync/purgar en cada ciclo y las quita al confirmar el
+// servidor; mientras sigan aquí, el pull nunca las vuelve a crear.
+
+/// Hasta `limite` purgas pendientes: (id, tabla, uuid), las más viejas primero.
+pub fn purgas_pendientes(conn: &Connection, limite: i64) -> SqlResult<Vec<(i64, String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, tabla, uuid FROM sync_purgas_pendientes ORDER BY id LIMIT ?",
+    )?;
+    let filas = stmt.query_map([limite], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    filas.collect()
+}
+
+/// Quita de la cola las purgas que el servidor ya confirmó.
+pub fn quitar_purgas(conn: &Connection, ids: &[i64]) -> SqlResult<usize> {
+    let mut n = 0;
+    for id in ids {
+        n += conn.execute("DELETE FROM sync_purgas_pendientes WHERE id = ?", [id])?;
+    }
+    Ok(n)
+}
+
+/// ¿Esta fila se eliminó aquí y falta purgarla en el servidor? (Si la tabla
+/// no existe o la consulta falla: no.)
+pub fn hay_purga_pendiente(conn: &Connection, tabla: &str, uuid: &str) -> bool {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sync_purgas_pendientes WHERE tabla = ? AND uuid = ?)",
+        [tabla, uuid],
+        |r| r.get::<_, i64>(0),
+    )
+    .map(|n| n != 0)
+    .unwrap_or(false)
+}

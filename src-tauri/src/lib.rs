@@ -70,6 +70,7 @@ use commands::reportes::{
     obtener_ventas_por_metodo, obtener_ventas_por_dia,
 };
 use commands::auditoria_caja::auditar_caja;
+use commands::eliminar_ventas::eliminar_venta;
 use db::connection::init_database;
 use std::sync::{Arc, Mutex};
 use tauri::Manager;
@@ -205,6 +206,8 @@ pub fn run() {
             buscar_ventas,
             contar_ventas,
             obtener_detalle_venta,
+            // Eliminar venta de prueba (solo usuarios con permiso individual)
+            eliminar_venta,
             // Devoluciones
             crear_devolucion,
             listar_devoluciones,

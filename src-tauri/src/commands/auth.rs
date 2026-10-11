@@ -23,6 +23,10 @@ pub struct UsuarioSesion {
     pub es_admin: bool,
     pub sesion_id: i64,
     pub permisos: Vec<Permiso>,
+    /// Permiso individual (no de rol) para eliminar ventas de prueba
+    /// (migración 017: solo Daniela Bravo). La web nunca lo manda.
+    #[serde(default)]
+    pub puede_eliminar_ventas: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -47,7 +51,11 @@ pub fn login_pin(
     state: State<'_, AppState>,
 ) -> LoginResult {
     let db = state.db.lock().unwrap();
+    login_pin_core(&db, &pin)
+}
 
+/// Núcleo de `login_pin` (para pruebas).
+pub(crate) fn login_pin_core(db: &Connection, pin: &str) -> LoginResult {
     // Verificar que el PIN no esté vacío y sea numérico
     if pin.len() != 4 || !pin.chars().all(|c| c.is_ascii_digit()) {
         return LoginResult {
@@ -62,7 +70,8 @@ pub fn login_pin(
     let mut stmt = db.prepare(
         r#"
         SELECT u.id, u.nombre_completo, u.nombre_usuario, u.pin, u.rol_id,
-               r.nombre as rol_nombre, r.es_admin
+               r.nombre as rol_nombre, r.es_admin,
+               COALESCE(u.puede_eliminar_ventas, 0)
         FROM usuarios u
         JOIN roles r ON r.id = u.rol_id
         WHERE u.activo = 1
@@ -78,12 +87,13 @@ pub fn login_pin(
             row.get::<_, i64>(4)?,
             row.get::<_, String>(5)?,
             row.get::<_, bool>(6)?,
+            row.get::<_, bool>(7)?,
         ))
     }).unwrap().filter_map(|r| r.ok()).collect();
 
     // Verificar PIN contra bcrypt
-    for (id, nombre_completo, nombre_usuario, pin_hash, rol_id, rol_nombre, es_admin) in usuarios {
-        let pin_valido = bcrypt::verify(&pin, &pin_hash).unwrap_or(false);
+    for (id, nombre_completo, nombre_usuario, pin_hash, rol_id, rol_nombre, es_admin, puede_eliminar_ventas) in usuarios {
+        let pin_valido = bcrypt::verify(pin, &pin_hash).unwrap_or(false);
         if pin_valido {
             // Actualizar último login. updated_at no se toca aquí: lo pone el
             // trigger trg_usuarios_bump_updated, en hora local (migración 015).
@@ -100,7 +110,7 @@ pub fn login_pin(
             ).map(|_| db.last_insert_rowid()).unwrap_or(0);
 
             // Cargar permisos
-            let permisos = cargar_permisos(&db, rol_id);
+            let permisos = cargar_permisos(db, rol_id);
 
             // Registrar en bitácora
             let _ = db.execute(
@@ -123,6 +133,7 @@ pub fn login_pin(
                     es_admin,
                     sesion_id,
                     permisos,
+                    puede_eliminar_ventas,
                 }),
                 error: None,
             };
@@ -144,11 +155,16 @@ pub fn login_password(
     state: State<'_, AppState>,
 ) -> LoginResult {
     let db = state.db.lock().unwrap();
+    login_password_core(&db, &nombre_usuario, &password)
+}
 
+/// Núcleo de `login_password` (para pruebas).
+pub(crate) fn login_password_core(db: &Connection, nombre_usuario: &str, password: &str) -> LoginResult {
     let result = db.query_row(
         r#"
         SELECT u.id, u.nombre_completo, u.nombre_usuario, u.password_hash, u.rol_id,
-               r.nombre as rol_nombre, r.es_admin
+               r.nombre as rol_nombre, r.es_admin,
+               COALESCE(u.puede_eliminar_ventas, 0)
         FROM usuarios u
         JOIN roles r ON r.id = u.rol_id
         WHERE u.nombre_usuario = ? AND u.activo = 1
@@ -163,13 +179,14 @@ pub fn login_password(
                 row.get::<_, i64>(4)?,
                 row.get::<_, String>(5)?,
                 row.get::<_, bool>(6)?,
+                row.get::<_, bool>(7)?,
             ))
         },
     );
 
     match result {
-        Ok((id, nombre_completo, nombre_usuario_db, password_hash, rol_id, rol_nombre, es_admin)) => {
-            let password_valido = bcrypt::verify(&password, &password_hash).unwrap_or(false);
+        Ok((id, nombre_completo, nombre_usuario_db, password_hash, rol_id, rol_nombre, es_admin, puede_eliminar_ventas)) => {
+            let password_valido = bcrypt::verify(password, &password_hash).unwrap_or(false);
             if !password_valido {
                 return LoginResult {
                     ok: false,
@@ -189,7 +206,7 @@ pub fn login_password(
                 rusqlite::params![id],
             ).map(|_| db.last_insert_rowid()).unwrap_or(0);
 
-            let permisos = cargar_permisos(&db, rol_id);
+            let permisos = cargar_permisos(db, rol_id);
 
             let _ = db.execute(
                 r#"INSERT INTO audit_log (usuario_id, accion, tabla_afectada, registro_id, descripcion_legible, origen)
@@ -211,6 +228,7 @@ pub fn login_password(
                     es_admin,
                     sesion_id,
                     permisos,
+                    puede_eliminar_ventas,
                 }),
                 error: None,
             }

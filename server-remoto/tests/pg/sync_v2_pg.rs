@@ -13,8 +13,9 @@
 // migraciones del servidor) y de ahí una BD por prueba, que se borra al
 // terminar. La base se borra cuando ya no queda ninguna prueba usándola.
 // Las pruebas de la ronda 2 (SPEC2 R1) están en sync_v2_ronda2_pg.rs, las
-// de la ronda 3 (SPEC3 S) en sync_v2_ronda3_pg.rs y las de la ronda 4
-// (SPEC4 S) en sync_v2_ronda4_pg.rs.
+// de la ronda 3 (SPEC3 S) en sync_v2_ronda3_pg.rs, las de la ronda 4
+// (SPEC4 S) en sync_v2_ronda4_pg.rs y las de POST /sync/purgar (eliminar
+// venta de prueba) en sync_purgar_pg.rs.
 
 use super::*;
 use crate::sync_fk;
@@ -32,6 +33,8 @@ mod ronda2;
 mod ronda3;
 #[path = "sync_v2_ronda4_pg.rs"]
 mod ronda4;
+#[path = "sync_purgar_pg.rs"]
+mod purga;
 
 /// Escritorio real de la tienda (sync_cursor.origen_device en producción).
 const DEV: &str = "336d5ab58660c6335416c3cca39cf4d9";
@@ -949,6 +952,7 @@ fn app(pool: PgPool) -> axum::Router {
         .route("/sync/reparar", post(reparar))
         .route("/sync/refs", post(refs))
         .route("/sync/fila", get(fila))
+        .route("/sync/purgar", post(purgar))
         .with_state(state)
 }
 
@@ -1018,6 +1022,8 @@ async fn g_autorizacion_sync() {
 
     let pull_url = "/sync/pull?cursor=999999999&sucursal_id=1&proto=2&device_uuid=x";
     let push_body = json!({"device_uuid": DEV, "sucursal_id": 1, "proto": 2, "cambios": []});
+    // Purga de una venta que no existe: con un token web nunca llega a la BD.
+    let purgar_body = json!({"device_uuid": DEV, "filas": [{"tabla": "ventas", "uuid": hex32()}]});
     for t in [&web_vendedor, &web_admin, &web_device_sin_dev, &web_pin_admin, &panel_inactivo, &panel_otro_email] {
         let t = t.as_str();
         assert_eq!(llamar(&a, "GET", pull_url, Some(t), None).await.0, StatusCode::FORBIDDEN);
@@ -1026,7 +1032,9 @@ async fn g_autorizacion_sync() {
         assert_eq!(llamar(&a, "POST", "/sync/reparar", Some(t), Some(json!({"device_uuid": DEV, "simulacion": true}))).await.0, StatusCode::FORBIDDEN);
         assert_eq!(llamar(&a, "POST", "/sync/refs", Some(t), Some(json!({"tabla": "ventas", "uuids": []}))).await.0, StatusCode::FORBIDDEN);
         assert_eq!(llamar(&a, "GET", "/sync/fila?tabla=ventas&uuid=x", Some(t), None).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(llamar(&a, "POST", "/sync/purgar", Some(t), Some(purgar_body.clone())).await.0, StatusCode::FORBIDDEN);
     }
+    assert_eq!(llamar(&a, "POST", "/sync/purgar", None, Some(purgar_body.clone())).await.0, StatusCode::UNAUTHORIZED);
     assert_eq!(llamar(&a, "GET", pull_url, None, None).await.0, StatusCode::UNAUTHORIZED);
     assert_eq!(llamar(&a, "GET", pull_url, Some("basura"), None).await.0, StatusCode::UNAUTHORIZED);
 
@@ -1044,6 +1052,20 @@ async fn g_autorizacion_sync() {
     assert_eq!((st, r), (StatusCode::OK, json!({})));
     let (st, _) = llamar(&a, "GET", "/sync/fila?tabla=ventas&uuid=x", Some(&token_escritorio), None).await;
     assert_eq!(st, StatusCode::OK);
+    // Purga: el escritorio sí entra (lo que no existe cuenta como hecho);
+    // una tabla fuera de la lista → 400.
+    let (st, r) = llamar(&a, "POST", "/sync/purgar", Some(&token_escritorio), Some(purgar_body)).await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!((r["borrados"].clone(), r["recibidos"].clone()), (json!(0), json!(1)), "{r}");
+    let (st, r) = llamar(
+        &a,
+        "POST",
+        "/sync/purgar",
+        Some(&token_escritorio),
+        Some(json!({"device_uuid": DEV, "filas": [{"tabla": "productos", "uuid": hex32()}]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{r}");
     // Reparación sin mapa: la verificación falla → 409 con el reporte.
     let (st, r) = llamar(&a, "POST", "/sync/reparar", Some(&token_escritorio), Some(json!({"device_uuid": DEV}))).await;
     assert_eq!(st, StatusCode::CONFLICT, "{r}");

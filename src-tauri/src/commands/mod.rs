@@ -18,8 +18,11 @@ pub mod exportar;
 pub mod reportes;
 pub mod auditoria_caja;
 pub mod codigo_escaneado;
+pub mod eliminar_ventas;
 
 #[cfg(test)]
 mod caja_tests;
 #[cfg(test)]
 mod stock_tests;
+#[cfg(test)]
+mod eliminar_ventas_tests;

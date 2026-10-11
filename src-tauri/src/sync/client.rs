@@ -4,8 +4,8 @@
 // productos, `base`, y recibe `marcas` (la marca guardada en el servidor de
 // cada fila aceptada); el pull manda `device_uuid` y `proto=2` y recibe
 // `caja_v2_desde`. Los endpoints nuevos (/sync/id-map,
-// /sync/reparar, /sync/refs, /sync/fila) pueden no existir en un servidor
-// viejo: 404/405 (o la página de la SPA en vez de JSON) = "el servidor aún
+// /sync/reparar, /sync/refs, /sync/fila, /sync/purgar) pueden no existir en
+// un servidor viejo: 404/405 (o la página de la SPA en vez de JSON) = "el servidor aún
 // no se actualiza" → `Respuesta::NoSoportado`, se reintenta más tarde sin
 // llenar el log de errores.
 
@@ -115,6 +115,15 @@ pub struct IdMapResp {
     /// uuids que el servidor no tiene (puede venir como lista o como número).
     #[serde(default)]
     pub desconocidos: Value,
+}
+
+/// Respuesta de POST /sync/purgar.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct PurgaResp {
+    /// Filas que el servidor borró (las que ya no existían cuentan como
+    /// hechas, pero no se suman aquí).
+    #[serde(default)]
+    pub borrados: i64,
 }
 
 pub struct RemoteClient {
@@ -255,6 +264,30 @@ impl RemoteClient {
                 }
             }
         }
+    }
+
+    /// POST /sync/purgar — borra en el servidor filas que aquí se eliminaron
+    /// (ventas de prueba: ventas, devoluciones, movimientos_caja; el servidor
+    /// borra también sus partidas). Idempotente: una fila que ya no existe
+    /// cuenta como hecha. La bitácora del servidor no se toca.
+    pub async fn purgar(
+        &self,
+        device_uuid: &str,
+        filas: &[(String, String)],
+    ) -> Result<Respuesta<PurgaResp>, String> {
+        let body = serde_json::json!({
+            "device_uuid": device_uuid,
+            "filas": filas.iter()
+                .map(|(tabla, uuid)| serde_json::json!({ "tabla": tabla, "uuid": uuid }))
+                .collect::<Vec<_>>(),
+        });
+        let r = self.http.post(format!("{}/sync/purgar", self.base))
+            .bearer_auth(&self.token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("purgar red: {}", e))?;
+        self.leer_json("purgar", r).await
     }
 
     /// Lee una respuesta JSON de un endpoint nuevo. 404/405 o un cuerpo que

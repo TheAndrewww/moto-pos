@@ -70,6 +70,9 @@ export interface UsuarioSesion {
   es_admin: boolean;
   sesion_id: number;
   permisos: Permiso[];
+  /** Permiso individual (no de rol) para eliminar ventas de prueba. Solo lo
+   *  manda el escritorio (Daniela Bravo); en la web nunca viene → falso. */
+  puede_eliminar_ventas?: boolean;
 }
 
 interface AuthState {

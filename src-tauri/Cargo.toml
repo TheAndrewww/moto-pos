@@ -1,6 +1,6 @@
 [package]
 name = "pos"
-version = "0.1.42"
+version = "0.1.43"
 description = "POS Moto Refaccionaria"
 authors = ["Moto Refaccionaria"]
 edition = "2021"

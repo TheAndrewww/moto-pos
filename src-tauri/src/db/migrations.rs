@@ -22,6 +22,7 @@ const MIGRATIONS: &[MigrationFn] = &[
     migracion_014_permisos_sin_duplicados,
     migracion_015_sync_v2,
     migracion_016_vendedor_ve_inventario,
+    migracion_017_eliminar_ventas,
 ];
 
 pub fn aplicar_migraciones(conn: &Connection) -> Result<()> {
@@ -1152,5 +1153,46 @@ fn migracion_016_vendedor_ve_inventario(conn: &Connection) -> Result<()> {
          ON CONFLICT(rol_id, modulo, accion) DO UPDATE SET permitido = 1",
         [],
     )?;
+    Ok(())
+}
+
+// ─── Migración 017 ────────────────────────────────────────
+// Permiso individual para ELIMINAR ventas de prueba.
+//
+// Por pedido del dueño (2026-10-10): una venta de prueba eliminada desaparece
+// del historial, reportes y web, con el inventario y la caja ajustados como si
+// no hubiera ocurrido. La bitácora conserva sus líneas y suma una que deja
+// constancia de la eliminación. Solo lo puede hacer Daniela Bravo, y hay otros
+// usuarios con rol dueño, así que es un permiso por USUARIO. La columna no
+// existe en el servidor (el sync la ignora): la opción vive en el escritorio.
+//
+// `sync_purgas_pendientes`: filas ya borradas aquí que falta borrar en el
+// servidor (POST /sync/purgar). Se reintentan en cada ciclo hasta que el
+// servidor confirma, así una eliminación sin internet también llega.
+fn migracion_017_eliminar_ventas(conn: &Connection) -> Result<()> {
+    if !columna_existe(conn, "usuarios", "puede_eliminar_ventas") {
+        conn.execute(
+            "ALTER TABLE usuarios ADD COLUMN puede_eliminar_ventas INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    // Daniela Bravo (usuario "Dani"). Con la bandera de supresión: no hace
+    // falta empujar la fila ni mover su updated_at.
+    conn.execute("INSERT OR IGNORE INTO sync_suppress_flag (id) VALUES (1)", [])?;
+    conn.execute(
+        "UPDATE usuarios SET puede_eliminar_ventas = 1 \
+          WHERE uuid = 'c088a77266563a58935e396a1cb55d27'",
+        [],
+    )?;
+    conn.execute("DELETE FROM sync_suppress_flag", [])?;
+    conn.execute_batch(r#"
+        CREATE TABLE IF NOT EXISTS sync_purgas_pendientes (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            tabla      TEXT NOT NULL,
+            uuid       TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+            UNIQUE(tabla, uuid)
+        );
+    "#)?;
     Ok(())
 }
