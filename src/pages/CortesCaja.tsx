@@ -113,9 +113,10 @@ export default function CortesCaja({
 
   const esAdmin = usuario?.es_admin ?? false;
 
-  // ¿Se hacen cortes en este equipo? Siempre en escritorio. En la web solo con
-  // caja propia (modo individual): la caja de la tienda la corta el escritorio.
-  const cortesAqui = isTauri() || (infoCaja?.cortes_en_este_equipo ?? false);
+  // ¿Se hacen cortes en este equipo? Siempre: en la web también la caja de la
+  // tienda (para cerrar cuando el POS de escritorio no está; el servidor deja
+  // los movimientos equivalentes para que el escritorio cuadre).
+  const cortesAqui = true;
 
   useEffect(() => {
     cargarMovimientosPendientes();
@@ -198,7 +199,7 @@ export default function CortesCaja({
 
       {/* Web en modo espejo: esta pantalla muestra la caja de la tienda, que
           se corta y se abre en el POS de escritorio. */}
-      {!isTauri() && infoCaja && !infoCaja.cortes_en_este_equipo && (
+      {!isTauri() && infoCaja && !cortesAqui && !infoCaja.cortes_en_este_equipo && (
         <AvisoCajaDeLaTienda escritorioRecibeWeb={infoCaja.escritorio_recibe_web} refresco={refrescoAviso} />
       )}
 

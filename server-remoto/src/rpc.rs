@@ -1621,12 +1621,24 @@ async fn solicitar_eliminar_venta(state: &AppState, claims: &Claims, args: &Valu
     .execute(&state.pool)
     .await?;
 
+    // Se borra ya aquí (la web y su corte dejan de contarla); la solicitud se
+    // queda para que el escritorio la aplique completa (stock, cortes) al
+    // sincronizar.
+    crate::sync::procesar_purgar(
+        &state.pool,
+        &crate::sync::PurgarBody {
+            device_uuid: crate::sync::DEVICE_PURGA_WEB.into(),
+            filas: vec![crate::sync::FilaPurga { tabla: "ventas".into(), uuid: venta_uuid.clone() }],
+        },
+    )
+    .await?;
+
     Ok(json!({
         "ok": true,
         "folio": folio,
         "mensaje": format!(
-            "La venta {folio} se eliminará en cuanto el POS de escritorio sincronice \
-             (unos segundos si está encendido y con internet)."
+            "La venta {folio} se eliminó de la web. El POS de escritorio la quitará \
+             (y regresará el inventario) en cuanto sincronice."
         ),
     }))
 }
@@ -4205,8 +4217,9 @@ async fn crear_corte(
     struct A { datos: caja::NuevoCorte }
     let a: A = serde_json::from_value(args)
         .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
+    // También la caja de la tienda (pedido del dueño: hacer el cierre desde la
+    // web cuando el POS de escritorio no está). Ver crear_corte_core.
     let caja_equipo = caja::caja_de(&state.pool, claims).await?;
-    exigir_caja_web(caja_equipo)?;
     let sesion = usuario_de_sesion(state, claims).await?;
     if let Some(uid) = a.datos.usuario_id {
         avisar_usuario_distinto("crear_corte", uid, &sesion);

@@ -843,9 +843,11 @@ pub async fn crear_corte_core(
     datos: NuevoCorte,
     ahora: &str,
 ) -> Result<CorteCreado, ApiError> {
-    if caja != Caja::Web {
-        return Err(mal(MSG_PRINCIPAL_SOLO_ESCRITORIO));
-    }
+    // La caja de la tienda también se puede cortar aquí (cuando el POS de
+    // escritorio no está). Ese corte NO baja al escritorio (su cadena de
+    // cortes es suya), así que al final se registran como movimientos de caja
+    // lo que salió del cajón y la diferencia: el escritorio sí los recibe y
+    // con ellos su siguiente corte cuadra con lo que de verdad quedó.
     if datos.tipo != "PARCIAL" && datos.tipo != "DIA" {
         return Err(mal("Tipo de corte inválido"));
     }
@@ -1048,6 +1050,34 @@ pub async fn crear_corte_core(
             Some(corte_id), ahora,
         )
         .await?;
+    }
+
+    // Caja de la tienda cortada desde la web: el escritorio no recibe este
+    // corte, pero sí los movimientos web de la caja de la tienda. Se dejan los
+    // equivalentes (ligados a este corte y con su fecha: aquí no vuelven a
+    // contar) para que la cadena del escritorio llegue al mismo fondo:
+    //   - lo que se sacó del cajón al cerrar (contado − fondo que queda), si
+    //     no salió ya como el retiro de turno de arriba;
+    //   - la diferencia contra lo esperado (faltante = retiro, sobrante = entrada).
+    if caja == Caja::Principal {
+        let sacado = round2(contado - fondo_siguiente - retiro_validado.as_ref().map(|r| r.0).unwrap_or(0.0));
+        if sacado > EPS {
+            insertar_movimiento(
+                &mut *conn, caja, "RETIRO", usuario_id, sacado,
+                &format!("Efectivo retirado en el corte web #{corte_id}"),
+                None, Some(corte_id), ahora,
+            )
+            .await?;
+        }
+        if diferencia.abs() > EPS {
+            let (tipo, que) = if diferencia > 0.0 { ("ENTRADA", "Sobrante") } else { ("RETIRO", "Faltante") };
+            insertar_movimiento(
+                &mut *conn, caja, tipo, usuario_id, round2(diferencia.abs()),
+                &format!("{que} del corte web #{corte_id}"),
+                None, Some(corte_id), ahora,
+            )
+            .await?;
+        }
     }
 
     let accion = if datos.tipo == "DIA" { "CORTE_DIA" } else { "CORTE_PARCIAL" };

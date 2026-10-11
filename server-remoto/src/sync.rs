@@ -1586,6 +1586,9 @@ const RASTRO_SYNC: &[(&str, &str)] = &[
     ("sync_id_map", "uuid"),
 ];
 
+/// device_uuid de la purga inmediata que hace la web al pedir eliminar una venta.
+pub const DEVICE_PURGA_WEB: &str = "web-solicitud";
+
 #[derive(Debug, Deserialize)]
 pub struct PurgarBody {
     pub device_uuid: String,
@@ -1678,11 +1681,14 @@ pub async fn procesar_purgar(pool: &PgPool, body: &PurgarBody) -> ApiResult<Valu
             borrados += n;
             if *tabla == "ventas" {
                 ventas_borradas.extend(ids.iter().copied());
-                // Si la eliminación la pidió la web, la solicitud ya se cumplió.
-                sqlx::query("DELETE FROM solicitudes_eliminar_venta WHERE venta_uuid = ANY($1)")
-                    .bind(uuids)
-                    .execute(&mut *tx)
-                    .await?;
+                // Purga del escritorio: si la pidió la web, ya se cumplió. La
+                // purga inmediata de la web conserva la solicitud.
+                if body.device_uuid != DEVICE_PURGA_WEB {
+                    sqlx::query("DELETE FROM solicitudes_eliminar_venta WHERE venta_uuid = ANY($1)")
+                        .bind(uuids)
+                        .execute(&mut *tx)
+                        .await?;
+                }
             }
             // Líneas de bitácora que aquí apuntan a lo purgado.
             if *tabla != "audit_log" && !ids.is_empty() {
@@ -1747,13 +1753,8 @@ pub async fn solicitudes(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     autenticar_sync(&headers, &state).await?;
-    // Solicitudes cuya venta ya no existe aquí (ya se purgó): cumplidas.
-    sqlx::query(
-        "DELETE FROM solicitudes_eliminar_venta s \
-          WHERE NOT EXISTS (SELECT 1 FROM ventas v WHERE v.uuid = s.venta_uuid)",
-    )
-    .execute(&state.pool)
-    .await?;
+    // La web ya purgó la venta aquí; la solicitud sigue hasta que el
+    // escritorio diga que la aplicó.
     let filas = sqlx::query(
         "SELECT uuid, venta_uuid, venta_folio, solicitado_por_uuid \
            FROM solicitudes_eliminar_venta WHERE estado = 'pendiente' ORDER BY id LIMIT 100",
