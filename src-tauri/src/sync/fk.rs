@@ -14,10 +14,11 @@ use rusqlite::{Connection, OptionalExtension};
 use serde_json::{Map, Value};
 
 /// Tablas de dinero cuyo historial es SOLO del escritorio: nunca se importan
-/// del servidor (la cadena de cortes/aperturas de la caja principal tiene un
-/// único escritor).
+/// del servidor. Los cortes no están: los que hace la web en la caja
+/// principal sí bajan (con sus hijos, solo inserción; ver apply.rs). Los
+/// hijos sueltos nunca: solo llegan colgados de su corte.
 pub const TABLAS_CAJA_NUNCA: &[&str] = &[
-    "cortes", "corte_denominaciones", "corte_vendedores", "aperturas_caja",
+    "corte_denominaciones", "corte_vendedores", "aperturas_caja",
 ];
 
 /// Tablas transaccionales donde el escritorio es la autoridad de sus propias

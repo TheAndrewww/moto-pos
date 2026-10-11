@@ -23,6 +23,7 @@ const MIGRATIONS: &[MigrationFn] = &[
     migracion_015_sync_v2,
     migracion_016_vendedor_ve_inventario,
     migracion_017_eliminar_ventas,
+    migracion_018_cortes_web,
 ];
 
 pub fn aplicar_migraciones(conn: &Connection) -> Result<()> {
@@ -1194,5 +1195,40 @@ fn migracion_017_eliminar_ventas(conn: &Connection) -> Result<()> {
             UNIQUE(tabla, uuid)
         );
     "#)?;
+    Ok(())
+}
+
+/// v0.1.46: los cortes que la web hace en la caja principal bajan al
+/// escritorio (sync/apply.rs). El corte web #333 (2026-10-11) es anterior: la
+/// versión pasada ya se saltó su renglón del pull, así que se pide otra vez
+/// por la bandeja (inbox::reintentar lo trae con /sync/fila y lo aplica como
+/// cualquier pull). Su movimiento "Faltante del corte web #333" se quita: la
+/// diferencia de un corte vive en el corte, no como movimiento, y casi la
+/// mitad salía de una venta de prueba que luego se eliminó (el servidor lo
+/// borra en su migración 015). En otra PC o BD de pruebas no hace nada.
+fn migracion_018_cortes_web(conn: &Connection) -> Result<()> {
+    const CORTE_WEB_333: &str = "01a12bc4-72ff-77f3-af1a-3062b1b11983";
+    const FALTANTE_333: &str = "01a12bc4-7315-77d1-8127-a504dee2d05b";
+    conn.execute(
+        "INSERT OR IGNORE INTO sync_inbox (tabla, uuid, motivo, error, proximo_intento) \
+         SELECT 'cortes', ?1, 'error', 'corte web previo a v0.1.46', datetime('now','localtime') \
+          WHERE EXISTS (SELECT 1 FROM sync_state WHERE id = 1 AND activo = 1) \
+            AND NOT EXISTS (SELECT 1 FROM cortes WHERE uuid = ?1)",
+        [CORTE_WEB_333],
+    )?;
+    conn.execute("INSERT OR IGNORE INTO sync_suppress_flag (id) VALUES (1)", [])?;
+    conn.execute(
+        "DELETE FROM movimientos_caja WHERE uuid = ?1 AND origen = 'web'",
+        [FALTANTE_333],
+    )?;
+    conn.execute(
+        "DELETE FROM sync_outbox WHERE tabla = 'movimientos_caja' AND uuid = ?1",
+        [FALTANTE_333],
+    )?;
+    conn.execute(
+        "DELETE FROM sync_inbox WHERE tabla = 'movimientos_caja' AND uuid = ?1",
+        [FALTANTE_333],
+    )?;
+    conn.execute("DELETE FROM sync_suppress_flag", [])?;
     Ok(())
 }

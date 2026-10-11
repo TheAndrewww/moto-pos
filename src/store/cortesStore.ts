@@ -119,6 +119,8 @@ export interface CorteResumen {
   diferencia: number;
   nota_diferencia: string | null;
   fondo_siguiente: number;
+  /** 'desktop' | 'web' (corte de la caja de la tienda hecho desde la web). */
+  origen?: string;
 }
 
 export interface DenominacionDetalle {

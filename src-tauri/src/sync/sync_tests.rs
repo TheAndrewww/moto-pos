@@ -491,6 +491,8 @@ fn bandera_se_limpia_al_iniciar_la_conexion() {
 
 // ─── Política de caja ─────────────────────────────────────
 
+/// Sin cadena de caja en esta PC (ni cortes ni aperturas) tampoco baja el
+/// corte web de la caja principal (ver corte_web_* abajo).
 #[test]
 fn cortes_y_aperturas_del_servidor_nunca_se_guardan() {
     let mut db = nueva_db();
@@ -520,6 +522,205 @@ fn cortes_y_aperturas_del_servidor_nunca_se_guardan() {
         "INSERT INTO aperturas_caja (usuario_id, fondo_declarado, fecha) VALUES (1, 500, '2026-10-06 08:00:00')",
         [],
     ).unwrap();
+}
+
+// ─── Cortes web de la caja principal (v0.1.46) ───────────
+
+const FIN_WEB: &str = "2026-10-06 10:20:57";
+
+/// Corte web de la caja principal como lo manda el servidor: sigue la cadena
+/// desde el corte del 5 de octubre a las 18:00 (fondo 1000).
+fn corte_web(uuid: &str, fin: &str, contado: f64, fondo_siguiente: f64) -> Value {
+    json!({
+        "__tabla": "cortes", "__operacion": "UPSERT",
+        "__data": { "id": 333, "tipo": "PARCIAL", "usuario_id": 3,
+                    "fecha_inicio": "2026-10-05 18:00:00", "fecha_fin": fin, "created_at": fin,
+                    "fondo_inicial": 1000.0, "total_ventas_efectivo": 500.0, "total_ventas": 500.0,
+                    "num_transacciones": 1, "efectivo_esperado": 1500.0,
+                    "efectivo_contado": contado, "diferencia": contado - 1500.0,
+                    "fondo_siguiente": fondo_siguiente, "nota_diferencia": null, "sucursal_id": 1,
+                    "origen": "web", "caja": "principal", "uuid": uuid, "updated_at": fin },
+        "__children": { "corte_denominaciones": [], "corte_vendedores": [] },
+        "__refs": { uuid: { "usuario_id": U_NANCY } },
+    })
+}
+
+/// Movimiento que el servidor dejó ligado al corte web (con su fecha).
+fn mov_del_corte(uuid: &str, corte_uuid: &str, monto: f64) -> Value {
+    let mut c = mov_web(uuid, "web", Some("principal"), monto, FIN_WEB);
+    c["__data"]["fecha"] = json!(FIN_WEB);
+    c["__data"]["corte_id"] = json!(333);
+    c["__refs"][uuid]["corte_id"] = json!(corte_uuid);
+    c
+}
+
+/// Cadena del 5 de octubre (corte 18:00, fondo 1000) + venta web espejo de
+/// 500 a las 20:00 que el corte web contará.
+fn cadena_con_venta_web() -> Connection {
+    let mut db = nueva_db();
+    pc_nueva_con_su_primer_corte(&db);
+    let r = aplicar(&mut db, &[cambio_venta_web(&web(700), "W-1", "2026-10-05 20:00:00", 500.0)]);
+    assert_eq!(r.aplicados, 1, "{r:?}");
+    assert_eq!(esperado_a_las(&db, "2026-10-06 10:00:00"), 1500.0);
+    db
+}
+
+fn corte_local(db: &Connection, uuid: &str) -> Option<i64> {
+    db.query_row("SELECT id FROM cortes WHERE uuid = ?", [uuid], |r| r.get(0)).optional().unwrap()
+}
+
+fn corte_y_registro(db: &Connection, uuid: &str) -> (Option<i64>, Option<String>) {
+    db.query_row(
+        "SELECT corte_id, registrado_at FROM movimientos_caja WHERE uuid = ?",
+        [uuid],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    ).unwrap()
+}
+
+/// El caso de producción (corte web #333): los movimientos del corte llegan
+/// en un pull anterior al del corte, y entre los dos el escritorio abrió caja
+/// con un ajuste. Al bajar el corte: aparece en la lista, la cadena sigue
+/// desde él con su fondo, los movimientos quedan ligados y el esperado no
+/// cambia (ningún peso cuenta dos veces).
+#[test]
+fn corte_web_llega_despues_de_sus_movimientos() {
+    use crate::commands::cortes::{crear_apertura_core, listar_cortes_core, ultimo_corte, NuevaApertura};
+    let mut db = cadena_con_venta_web();
+    let c = web(333);
+    let (retiro, faltante) = (web(334), web(335));
+    // Pull 1: el retiro de turno (300) y el faltante (100) de v0.1.45.
+    let r = aplicar_lote_con(&mut db, &[mov_del_corte(&retiro, &c, 300.0), mov_del_corte(&faltante, &c, 100.0)],
+        Modo::Normal, "2026-10-06 10:21:30").unwrap();
+    assert_eq!(r.aplicados, 2, "{r:?}");
+    assert_eq!(corte_y_registro(&db, &retiro), (None, None));
+    assert_eq!(esperado_a_las(&db, "2026-10-06 10:23:00"), 1100.0, "1000 + 500 − 300 − 100");
+    // Apertura con 900 de más.
+    crear_apertura_core(&db, NuevaApertura { usuario_id: 1, fondo_declarado: 2000.0, nota: Some("sobraban".into()) },
+        "2026-10-06 10:23:34").unwrap();
+    assert_eq!(esperado_a_las(&db, "2026-10-06 12:00:00"), 2000.0);
+    limpiar_outbox(&db);
+
+    // Pull 2: el corte.
+    let r = aplicar_lote_con(&mut db, &[corte_web(&c, FIN_WEB, 1400.0, 1100.0)], Modo::Normal, "2026-10-06 10:30:00").unwrap();
+    assert_eq!(r.aplicados, 1, "{r:?}");
+    let id = corte_local(&db, &c).expect("el corte web bajó");
+    let u = ultimo_corte(&db).unwrap();
+    assert_eq!((u.fin.as_str(), u.fondo_siguiente), (FIN_WEB, 1100.0));
+    assert_eq!(corte_y_registro(&db, &retiro), (Some(id), None));
+    assert_eq!(corte_y_registro(&db, &faltante), (Some(id), None));
+    let p = crate::commands::cortes::calcular_periodo(&db, "2026-10-06 12:00:00").unwrap();
+    assert_eq!((p.fecha_inicio.as_str(), p.fondo_inicial), (FIN_WEB, 1100.0));
+    assert_eq!((p.total_ventas_efectivo, p.total_entradas_efectivo, p.total_retiros_efectivo), (0.0, 900.0, 0.0));
+    assert_eq!(p.efectivo_esperado, 2000.0, "mismo esperado que antes de bajar el corte");
+    let l = listar_cortes_core(&db, 5).unwrap();
+    assert_eq!((l[0].id, l[0].origen.as_str(), l[0].usuario_nombre.as_str()), (id, "web", "Nancy"));
+    // Nada sube al servidor y nada queda en la bandeja.
+    assert_eq!(i64_de(&db, "SELECT COUNT(*) FROM sync_outbox WHERE synced_at IS NULL"), 0);
+    assert_eq!(i64_de(&db, "SELECT COUNT(*) FROM sync_inbox"), 0);
+    assert_eq!(bandera(&db), 0);
+    let a = crate::commands::auditoria_caja::auditar(&db, 3650).unwrap();
+    assert_eq!(a.resumen.movimientos_huerfanos_count, 0);
+    assert_eq!(a.resumen.movimientos_desalineados_count, 0);
+    assert_eq!(a.resumen.ventas_sin_corte_count, 0);
+    // Solo inserción: el servidor ya no lo reescribe.
+    let mut otra = corte_web(&c, FIN_WEB, 9999.0, 1.0);
+    otra["__data"]["updated_at"] = json!("2026-10-06 11:00:00");
+    let r = aplicar(&mut db, &[otra]);
+    assert_eq!(r.omitidos, 1);
+    assert_eq!(i64_de(&db, &format!("SELECT CAST(efectivo_contado AS INTEGER) FROM cortes WHERE id = {id}")), 1400);
+}
+
+/// Corte y movimientos en el mismo lote (el corte se aplica primero): los
+/// movimientos se ligan por su referencia y no se re-acomodan al período
+/// abierto aunque su fecha ya esté cubierta.
+#[test]
+fn corte_web_y_sus_movimientos_en_el_mismo_lote() {
+    let mut db = cadena_con_venta_web();
+    let c = web(333);
+    let m = web(334);
+    let r = aplicar_lote_con(&mut db, &[mov_del_corte(&m, &c, 300.0), corte_web(&c, FIN_WEB, 1500.0, 1200.0)],
+        Modo::Normal, "2026-10-06 10:21:30").unwrap();
+    assert_eq!(r.aplicados, 2, "{r:?}");
+    let id = corte_local(&db, &c).unwrap();
+    assert_eq!(corte_y_registro(&db, &m), (Some(id), None));
+    assert_eq!(esperado_a_las(&db, "2026-10-06 12:00:00"), 1200.0);
+}
+
+/// Venta web espejo con fecha dentro del corte web que llega a esta PC
+/// después del corte: el corte web ya la contó, no se re-acomoda.
+#[test]
+fn venta_web_dentro_de_un_corte_web_no_se_reacomoda() {
+    let mut db = cadena_con_venta_web();
+    let c = web(333);
+    aplicar_lote_con(&mut db, &[corte_web(&c, FIN_WEB, 1500.0, 1200.0)], Modo::Normal, "2026-10-06 10:21:30").unwrap();
+    let v = web(701);
+    let r = aplicar(&mut db, &[cambio_venta_web(&v, "W-2", "2026-10-06 09:00:00", 80.0)]);
+    assert_eq!(r.aplicados, 1, "{r:?}");
+    assert_eq!(opt_txt(&db, &format!("SELECT registrado_at FROM ventas WHERE uuid = '{v}'")), None);
+    assert_eq!(esperado_a_las(&db, "2026-10-06 12:00:00"), 1200.0);
+    // Una que cae después del corte web sí cuenta (por su fecha).
+    let r = aplicar(&mut db, &[cambio_venta_web(&web(702), "W-3", "2026-10-06 11:00:00", 50.0)]);
+    assert_eq!(r.aplicados, 1, "{r:?}");
+    assert_eq!(esperado_a_las(&db, "2026-10-06 12:00:00"), 1250.0);
+}
+
+/// Si este escritorio ya cortó después del fin del corte web, ese corte no
+/// entra (traslaparía la cadena); tampoco el de la caja web ni uno del
+/// escritorio que viniera del servidor.
+#[test]
+fn corte_web_que_el_escritorio_ya_corto_no_entra() {
+    let mut db = cadena_con_venta_web();
+    corte_principal(&db, "2026-10-06 11:00:00");
+    let c = web(333);
+    let r = aplicar(&mut db, &[corte_web(&c, FIN_WEB, 1500.0, 1200.0)]);
+    assert_eq!(r.omitidos, 1, "{r:?}");
+    assert_eq!(corte_local(&db, &c), None);
+    let mut db = cadena_con_venta_web();
+    let mut caja_web = corte_web(&web(340), FIN_WEB, 1500.0, 1200.0);
+    caja_web["__data"]["caja"] = json!("web");
+    let mut del_escritorio = corte_web(&hex(341), FIN_WEB, 1500.0, 1200.0);
+    del_escritorio["__data"]["origen"] = json!("desktop");
+    del_escritorio["__refs"] = json!({ hex(341): { "usuario_id": U_NANCY } });
+    let r = aplicar(&mut db, &[caja_web, del_escritorio]);
+    assert_eq!(r.omitidos, 2, "{r:?}");
+    assert_eq!(i64_de(&db, "SELECT COUNT(*) FROM cortes"), 1);
+}
+
+const CORTE_WEB_333: &str = "01a12bc4-72ff-77f3-af1a-3062b1b11983";
+const FALTANTE_333: &str = "01a12bc4-7315-77d1-8127-a504dee2d05b";
+
+/// Migración 018: borra el movimiento "Faltante del corte web #333" (sin
+/// subirlo) y pide el corte por la bandeja solo con el sync activo y si aún
+/// no está aquí.
+#[test]
+fn migracion_018_pide_el_corte_333_y_quita_su_faltante() {
+    let mut db = nueva_db();
+    let r = aplicar(&mut db, &[mov_del_corte(FALTANTE_333, CORTE_WEB_333, 1610.0),
+                               mov_del_corte(&web(334), CORTE_WEB_333, 359.0)]);
+    assert_eq!(r.aplicados, 2, "{r:?}");
+    let correr = |db: &Connection| {
+        db.execute_batch("PRAGMA user_version = 17").unwrap();
+        aplicar_migraciones(db).unwrap();
+    };
+    correr(&db);
+    assert_eq!(i64_de(&db, "PRAGMA user_version"), 18);
+    assert_eq!(i64_de(&db, &format!("SELECT COUNT(*) FROM movimientos_caja WHERE uuid = '{FALTANTE_333}'")), 0);
+    assert_eq!(i64_de(&db, "SELECT COUNT(*) FROM movimientos_caja"), 1, "el retiro de turno se queda");
+    assert_eq!(inbox_motivo(&db, "cortes", CORTE_WEB_333), None, "sync inactivo: no se pide");
+    assert_eq!(i64_de(&db, "SELECT COUNT(*) FROM sync_outbox WHERE synced_at IS NULL"), 0);
+    assert_eq!(bandera(&db), 0);
+    db.execute("UPDATE sync_state SET activo = 1 WHERE id = 1", []).unwrap();
+    correr(&db);
+    assert_eq!(inbox_motivo(&db, "cortes", CORTE_WEB_333).as_deref(), Some("error"));
+    // Ya importado: no se vuelve a pedir.
+    db.execute("DELETE FROM sync_inbox", []).unwrap();
+    db.execute(
+        "INSERT INTO cortes (tipo, usuario_id, fecha_inicio, fecha_fin, uuid, origen) \
+         VALUES ('PARCIAL', 1, '2026-10-05 18:00:00', '2026-10-06 10:20:57', ?1, 'web')",
+        [CORTE_WEB_333],
+    ).unwrap();
+    correr(&db);
+    assert_eq!(inbox_motivo(&db, "cortes", CORTE_WEB_333), None);
 }
 
 fn mov_web(uuid: &str, origen: &str, caja: Option<&str>, monto: f64, upd: &str) -> Value {
@@ -2290,6 +2491,9 @@ mod con_servidor_simulado {
         bajar_a_v14(&db);
         aplicar_migraciones(&db).unwrap();
         db.execute_batch(SEED_DATA).unwrap();
+        // La 018 pide el corte web #333 por la bandeja (no es lo que se prueba aquí).
+        assert_eq!(inbox_motivo(&db, "cortes", CORTE_WEB_333).as_deref(), Some("error"));
+        db.execute("DELETE FROM sync_inbox WHERE tabla = 'cortes'", []).unwrap();
 
         let (motivo, payload): (String, Option<String>) = db.query_row(
             "SELECT motivo, payload FROM sync_inbox WHERE tabla = 'productos' AND uuid = ?1", [P_BALATA],

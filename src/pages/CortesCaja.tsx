@@ -114,8 +114,8 @@ export default function CortesCaja({
   const esAdmin = usuario?.es_admin ?? false;
 
   // ¿Se hacen cortes en este equipo? Siempre: en la web también la caja de la
-  // tienda (para cerrar cuando el POS de escritorio no está; el servidor deja
-  // los movimientos equivalentes para que el escritorio cuadre).
+  // tienda (para cerrar cuando el POS de escritorio no está; ese corte baja
+  // al escritorio y su cadena sigue desde él).
   const cortesAqui = true;
 
   useEffect(() => {
@@ -147,12 +147,16 @@ export default function CortesCaja({
     await cargarCortes(50);
   }, []);
 
-  // El módulo vive montado aunque esté oculto: al volver a mostrarse, el
-  // aviso de la caja de la tienda se recalcula (ventas web, entradas/retiros
-  // o un corte del escritorio pudieron cambiarlo mientras tanto).
+  // El módulo vive montado aunque esté oculto: al volver a mostrarse se
+  // recargan los cortes y movimientos (un corte hecho en la web pudo bajar
+  // por sync mientras tanto) y se recalcula el aviso de la caja de la tienda.
   const visibleAntes = useRef(visible);
   useEffect(() => {
-    if (visible && !visibleAntes.current) setRefrescoAviso(n => n + 1);
+    if (visible && !visibleAntes.current) {
+      setRefrescoAviso(n => n + 1);
+      cargarMovimientosPendientes();
+      cargarCortes(50);
+    }
     visibleAntes.current = visible;
   }, [visible]);
 
@@ -836,6 +840,15 @@ function TarjetaCorte({ corte }: { corte: CorteResumen }) {
           }}>
             {esDia ? 'Cierre del día' : 'Corte de turno'}
           </span>
+
+          {corte.origen === 'web' && (
+            <span style={{
+              fontSize: 10, fontWeight: 700, padding: '2px 8px', borderRadius: 6,
+              background: 'rgba(6,182,212,0.12)', color: '#0891b2', textTransform: 'uppercase',
+            }}>
+              Hecho en la web
+            </span>
+          )}
 
           <span style={{ fontSize: 13, color: 'var(--color-text-muted)', flex: 1 }}>
             {fmtFecha(corte.created_at)} · {fmtHora(corte.created_at)} · {corte.usuario_nombre}

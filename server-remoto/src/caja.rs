@@ -8,12 +8,13 @@
 //
 // Cada venta, movimiento, corte y apertura dice en `caja` a qué cajón
 // pertenece (migración 010):
-//   - 'principal' = el cajón físico de la tienda. Su cadena (cortes y
-//     aperturas) tiene UN solo escritor: el POS de escritorio. Los equipos web
-//     en modo espejo venden, registran entradas/retiros y devoluciones con ese
+//   - 'principal' = el cajón físico de la tienda. Sus aperturas las escribe
+//     SOLO el POS de escritorio. Sus cortes también, salvo cuando se corta
+//     desde la web porque el escritorio no está (v0.1.45): ese corte baja al
+//     escritorio (v0.1.46) y su cadena sigue desde él. Los equipos web en
+//     modo espejo venden, registran entradas/retiros y devoluciones con ese
 //     dinero (origen 'web', caja 'principal'); esas filas bajan al escritorio
-//     y cuentan en SU corte. Aquí solo se lee: vista previa, historial y
-//     auditoría "según lo sincronizado".
+//     y cuentan en SU corte.
 //   - 'web' = caja aparte de los equipos en modo individual (todos comparten
 //     la misma). Su cadena la escribe SOLO este servidor, con el mismo
 //     algoritmo que el escritorio.
@@ -299,6 +300,8 @@ pub struct CorteResumen {
     pub diferencia: f64,
     pub nota_diferencia: Option<String>,
     pub fondo_siguiente: f64,
+    /// 'desktop' o 'web' (corte de la caja de la tienda hecho desde la web).
+    pub origen: String,
 }
 
 #[derive(Serialize, Clone, Debug, Default)]
@@ -844,10 +847,9 @@ pub async fn crear_corte_core(
     ahora: &str,
 ) -> Result<CorteCreado, ApiError> {
     // La caja de la tienda también se puede cortar aquí (cuando el POS de
-    // escritorio no está). Ese corte NO baja al escritorio (su cadena de
-    // cortes es suya), así que al final se registran como movimientos de caja
-    // lo que salió del cajón y la diferencia: el escritorio sí los recibe y
-    // con ellos su siguiente corte cuadra con lo que de verdad quedó.
+    // escritorio no está). Ese corte baja al escritorio (solo inserción) y su
+    // período abierto sigue desde su fin con su fondo_siguiente; la
+    // diferencia vive en el corte, como en los del escritorio.
     if datos.tipo != "PARCIAL" && datos.tipo != "DIA" {
         return Err(mal("Tipo de corte inválido"));
     }
@@ -1050,34 +1052,6 @@ pub async fn crear_corte_core(
             Some(corte_id), ahora,
         )
         .await?;
-    }
-
-    // Caja de la tienda cortada desde la web: el escritorio no recibe este
-    // corte, pero sí los movimientos web de la caja de la tienda. Se dejan los
-    // equivalentes (ligados a este corte y con su fecha: aquí no vuelven a
-    // contar) para que la cadena del escritorio llegue al mismo fondo:
-    //   - lo que se sacó del cajón al cerrar (contado − fondo que queda), si
-    //     no salió ya como el retiro de turno de arriba;
-    //   - la diferencia contra lo esperado (faltante = retiro, sobrante = entrada).
-    if caja == Caja::Principal {
-        let sacado = round2(contado - fondo_siguiente - retiro_validado.as_ref().map(|r| r.0).unwrap_or(0.0));
-        if sacado > EPS {
-            insertar_movimiento(
-                &mut *conn, caja, "RETIRO", usuario_id, sacado,
-                &format!("Efectivo retirado en el corte web #{corte_id}"),
-                None, Some(corte_id), ahora,
-            )
-            .await?;
-        }
-        if diferencia.abs() > EPS {
-            let (tipo, que) = if diferencia > 0.0 { ("ENTRADA", "Sobrante") } else { ("RETIRO", "Faltante") };
-            insertar_movimiento(
-                &mut *conn, caja, tipo, usuario_id, round2(diferencia.abs()),
-                &format!("{que} del corte web #{corte_id}"),
-                None, Some(corte_id), ahora,
-            )
-            .await?;
-        }
     }
 
     let accion = if datos.tipo == "DIA" { "CORTE_DIA" } else { "CORTE_PARCIAL" };
@@ -1310,7 +1284,7 @@ const SELECT_CORTE_RESUMEN: &str =
             c.efectivo_esperado::float8 AS efectivo_esperado, \
             c.efectivo_contado::float8 AS efectivo_contado, \
             c.diferencia::float8 AS diferencia, c.nota_diferencia, \
-            c.fondo_siguiente::float8 AS fondo_siguiente \
+            c.fondo_siguiente::float8 AS fondo_siguiente, c.origen \
      FROM cortes c \
      LEFT JOIN usuarios u ON u.id = c.usuario_id";
 
@@ -1333,6 +1307,7 @@ fn corte_de_fila(r: &PgRow) -> CorteResumen {
         diferencia: r.get("diferencia"),
         nota_diferencia: r.get("nota_diferencia"),
         fondo_siguiente: r.get("fondo_siguiente"),
+        origen: r.get("origen"),
     }
 }
 

@@ -1007,9 +1007,8 @@ async fn la_cadena_de_la_tienda_es_de_solo_lectura_en_la_web() {
     let corte = json!({"datos": {"tipo": "PARCIAL", "usuario_id": c.dueno,
         "datos": {"efectivo_esperado": 0.0}, "efectivo_contado": 0.0, "fondo_siguiente": 0.0}});
     let apertura = json!({"datos": {"usuario_id": c.dueno, "fondo_declarado": 0.0}});
+    let _ = &corte;
     for tok in [&c.tok_dueno, &tok_espejo] {
-        let e = rpc(&c, tok, "crear_corte", corte.clone()).await.unwrap_err();
-        assert_eq!(msg(e), caja::MSG_PRINCIPAL_SOLO_ESCRITORIO);
         let e = rpc(&c, tok, "crear_apertura_caja", apertura.clone()).await.unwrap_err();
         assert_eq!(msg(e), caja::MSG_PRINCIPAL_SOLO_ESCRITORIO);
         // Lectura sí: vista previa, historial, aviso de cierre (siempre null).
@@ -1018,7 +1017,32 @@ async fn la_cadena_de_la_tienda_es_de_solo_lectura_en_la_web() {
         assert!(rpc(&c, tok, "listar_cortes", json!({"limite": 5})).await.unwrap().is_array());
         assert_eq!(rpc(&c, tok, "verificar_corte_dia_pendiente", json!({})).await.unwrap(), Value::Null);
     }
-    assert_eq!(cortes_tienda(&c).await, antes, "la web no escribe la cadena de la tienda");
+    assert_eq!(cortes_tienda(&c).await, antes, "la web no abre la caja de la tienda");
+
+    // Corte de la tienda desde la web (v0.1.45): se guarda como corte web y,
+    // desde v0.1.46, sin movimientos de cuadre (baja al escritorio y la
+    // diferencia vive en el corte). Solo el retiro de turno es movimiento.
+    let d = rpc(&c, &tok_espejo, "calcular_datos_corte", json!({})).await.unwrap();
+    let esperado = d["efectivo_esperado"].as_f64().unwrap();
+    let contado = (esperado + 37.0).max(0.0);
+    let corte_ok = json!({"datos": {"tipo": "PARCIAL", "usuario_id": c.dueno,
+        "datos": {"efectivo_esperado": esperado}, "efectivo_contado": contado,
+        "fondo_siguiente": 0.0, "nota_diferencia": "prueba",
+        "retiro": {"monto": 12.0, "concepto": "retiro de turno"}}});
+    let r = rpc(&c, &tok_espejo, "crear_corte", corte_ok).await.unwrap();
+    let id = r["id"].as_i64().unwrap();
+    let (origen, caja_c): (String, String) =
+        sqlx::query_as("SELECT origen, caja FROM cortes WHERE id = $1")
+            .bind(id).fetch_one(&c.st.pool).await.unwrap();
+    assert_eq!((origen.as_str(), caja_c.as_str()), ("web", "principal"));
+    let conceptos: Vec<String> = sqlx::query_scalar(
+        "SELECT concepto FROM movimientos_caja WHERE corte_id = $1 AND origen = 'web' \
+          AND (concepto = 'retiro de turno' OR concepto LIKE '%corte web #%') ORDER BY id",
+    )
+    .bind(id).fetch_all(&c.st.pool).await.unwrap();
+    assert_eq!(conceptos, vec!["retiro de turno".to_string()], "sin sacado ni sobrante/faltante");
+    let l = rpc(&c, &tok_espejo, "listar_cortes", json!({"limite": 1})).await.unwrap();
+    assert_eq!(l[0]["origen"], json!("web"));
 
     // Modo y caja de cada tipo de sesión.
     let m = rpc(&c, &c.tok_dueno, "obtener_modo_caja", json!({})).await.unwrap();

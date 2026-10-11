@@ -35,10 +35,14 @@
 // ─── CAJAS Y VENTAS QUE LLEGAN DE LA WEB (sync v2) ────────
 //
 // `caja` dice a qué cajón pertenece cada venta, movimiento, corte y apertura:
-//   - 'principal' = el cajón físico de la tienda. Su cadena de cortes y
-//     aperturas la escribe SOLO este escritorio. Las ventas y movimientos que
-//     la web hace en modo espejo (origen 'web', caja 'principal') llegan por
-//     sync y SÍ cuentan aquí: ese dinero está en este cajón.
+//   - 'principal' = el cajón físico de la tienda. Sus aperturas las escribe
+//     SOLO este escritorio. Sus cortes también, salvo los que se hacen desde
+//     la web (origen 'web', desde v0.1.46): esos bajan por sync (solo
+//     inserción, ver sync/apply.rs) y son un eslabón más de la cadena; el
+//     período abierto sigue desde su fin con su fondo_siguiente. Las ventas
+//     y movimientos que la web hace en modo espejo (origen 'web', caja
+//     'principal') llegan por sync y SÍ cuentan aquí: ese dinero está en
+//     este cajón.
 //   - 'web' = caja aparte de la web. Sus ventas se guardan aquí para historial
 //     e inventario, pero NUNCA cuentan en los cortes del escritorio.
 // Toda consulta de la cadena filtra caja = 'principal'.
@@ -76,7 +80,8 @@
 //
 // ─── SIN CORTES TODAVÍA (instalación nueva / PC nueva) ────
 //
-// Los cortes nunca bajan del servidor. En una PC nueva el primer pull trae
+// Los cortes del escritorio nunca bajan del servidor (los web solo si caen
+// después del inicio de la cadena de esta PC). En una PC nueva el primer pull trae
 // las ventas y movimientos web históricos de la caja 'principal'; si el
 // período abierto empezara en el origen, el primer corte los esperaría en
 // el cajón (faltante fantasma). Por eso, sin cortes, el período abierto
@@ -219,6 +224,8 @@ pub struct CorteResumen {
     pub diferencia: f64,
     pub nota_diferencia: Option<String>,
     pub fondo_siguiente: f64,
+    /// 'desktop' o 'web' (corte de la caja de la tienda hecho desde la web).
+    pub origen: String,
 }
 
 #[derive(Serialize)]
@@ -1064,7 +1071,7 @@ pub(crate) fn listar_cortes_core(db: &Connection, limite: i64) -> Result<Vec<Cor
                   c.total_ventas_transferencia, c.total_ventas, c.num_transacciones,
                   c.total_entradas_efectivo, c.total_retiros_efectivo,
                   c.efectivo_esperado, c.efectivo_contado, c.diferencia,
-                  c.nota_diferencia, c.fondo_siguiente
+                  c.nota_diferencia, c.fondo_siguiente, c.origen
            FROM cortes c
            LEFT JOIN usuarios u ON u.id = c.usuario_id
            WHERE c.deleted_at IS NULL AND c.caja = 'principal'
@@ -1091,6 +1098,7 @@ pub(crate) fn listar_cortes_core(db: &Connection, limite: i64) -> Result<Vec<Cor
             diferencia: row.get(14)?,
             nota_diferencia: row.get(15)?,
             fondo_siguiente: row.get(16)?,
+            origen: row.get(17)?,
         })
     }).map_err(|e| e.to_string())?
     .filter_map(|r| r.ok())
@@ -1261,7 +1269,7 @@ pub fn obtener_detalle_corte(
                   c.total_ventas_transferencia, c.total_ventas, c.num_transacciones,
                   c.total_entradas_efectivo, c.total_retiros_efectivo,
                   c.efectivo_esperado, c.efectivo_contado, c.diferencia,
-                  c.nota_diferencia, c.fondo_siguiente
+                  c.nota_diferencia, c.fondo_siguiente, c.origen
            FROM cortes c
            LEFT JOIN usuarios u ON u.id = c.usuario_id
            WHERE c.id = ?"#,
@@ -1284,6 +1292,7 @@ pub fn obtener_detalle_corte(
             diferencia: row.get(14)?,
             nota_diferencia: row.get(15)?,
             fondo_siguiente: row.get(16)?,
+            origen: row.get(17)?,
         }),
     ).map_err(|_| "Corte no encontrado".to_string())?;
 

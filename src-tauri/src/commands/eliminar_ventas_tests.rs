@@ -748,7 +748,7 @@ fn migracion_017_es_idempotente() {
         db.execute_batch("PRAGMA user_version = 16").unwrap();
         aplicar_migraciones(&db).unwrap();
     }
-    assert_eq!(i64_de(&db, "PRAGMA user_version"), 17);
+    assert!(i64_de(&db, "PRAGMA user_version") >= 17);
     assert_eq!(i64_de(&db, "SELECT COUNT(*) FROM usuarios WHERE puede_eliminar_ventas = 1"), 1);
     assert_eq!(i64_de(&db, "SELECT puede_eliminar_ventas FROM usuarios WHERE id = 2"), 1);
     assert_eq!(purgas(&db), vec![("ventas".to_string(), "abc".to_string())], "la cola no se borra");

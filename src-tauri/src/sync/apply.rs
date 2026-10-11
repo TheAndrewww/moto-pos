@@ -19,8 +19,11 @@
 //     guarda en la bandeja ('pendiente_local') y se reintenta tras el push.
 //     Si el servidor había rechazado ese cambio ('remoto_mas_nuevo') y aquí
 //     se aplica su versión, el renglón del outbox se da por resuelto.
-//   - Dinero: los cortes, sus hijos y las aperturas NUNCA se importan (la
-//     cadena de la caja principal tiene un solo escritor: este equipo). Los
+//   - Dinero: las aperturas y los cortes del escritorio NUNCA se importan.
+//     Los cortes que la web hace en la caja principal sí (con sus hijos,
+//     solo inserción) si terminan después del inicio del período abierto de
+//     esta PC: son un eslabón más de la cadena, y los movimientos sin corte
+//     de su intervalo se ligan a él (el servidor ya los contó ahí). Los
 //     movimientos de caja solo se insertan si son de la web y de la caja
 //     principal. Ventas/devoluciones/etc. hechas aquí nunca se modifican desde
 //     el servidor; solo se aplican las hechas en la web.
@@ -279,9 +282,9 @@ fn aplicar_uno(
     if super::state::hay_purga_pendiente(tx, tabla, uuid) {
         return Ok(Resultado::Omitido("eliminada aquí; falta purgarla en el servidor"));
     }
-    // Cadena de cortes/aperturas: un solo escritor (este equipo).
+    // Aperturas y cortes sueltos: un solo escritor (este equipo).
     if fk::TABLAS_CAJA_NUNCA.contains(&tabla) {
-        return Ok(Resultado::Omitido("caja: cortes/aperturas nunca se importan"));
+        return Ok(Resultado::Omitido("caja: aperturas nunca se importan"));
     }
     // 'Andrew Web' es un login solo del servidor.
     if tabla == "usuarios" && uuid.starts_with("web-admin-") {
@@ -315,6 +318,19 @@ fn aplicar_uno(
             }
             if texto(data, "origen") != Some("web") || texto(data, "caja") != Some("principal") {
                 return Ok(Resultado::Omitido("movimiento que no es web/principal"));
+            }
+        }
+        "cortes" => {
+            // Solo inserción: un corte ya guardado nunca se reescribe desde
+            // el servidor (ni sus hijos, tampoco en la re-descarga).
+            if existe {
+                return Ok(Resultado::Omitido("corte ya existe (solo inserción)"));
+            }
+            if !es_web || texto(data, "origen") != Some("web") || texto(data, "caja") != Some("principal") {
+                return Ok(Resultado::Omitido("caja: solo bajan los cortes web de la caja principal"));
+            }
+            if let Some(por) = corte_web_fuera_de_la_cadena(tx, data) {
+                return Ok(Resultado::Omitido(por));
             }
         }
         "audit_log" => {
@@ -465,6 +481,11 @@ fn aplicar_uno(
                 return Ok(r);
             }
         }
+    }
+
+    // ── Corte web nuevo: sus movimientos ──
+    if !existe && tabla == "cortes" {
+        ligar_movimientos_al_corte(tx, uuid)?;
     }
 
     // ── Venta/movimiento web que llegó tarde ──
@@ -894,6 +915,92 @@ pub(crate) fn fin_ultimo_corte_principal(conn: &Connection) -> Option<String> {
     .flatten()
 }
 
+/// Fin de un corte tal como lo calcula la cadena (FIN_CORTE_SQL):
+/// min(fecha_fin, created_at), normalizados.
+fn fin_de_corte(data: &Map<String, Value>) -> Option<String> {
+    let ff = texto(data, "fecha_fin").map(fk::normalizar_marca).filter(|m| !m.is_empty());
+    let ca = texto(data, "created_at").map(fk::normalizar_marca).filter(|m| !m.is_empty());
+    match (ff, ca) {
+        (Some(a), Some(b)) => Some(std::cmp::min(a, b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// Por qué un corte web de la caja principal NO entra a la cadena de esta
+/// PC (None = sí entra):
+///   - PC sin cadena (ni cortes ni aperturas): no hay de dónde seguir.
+///   - Termina en o antes del inicio del período abierto: ese tramo ya lo
+///     cortó este escritorio, o es historia previa a esta PC (una PC nueva
+///     que re-descarga desde el cursor 0). Importarlo traslaparía la cadena.
+fn corte_web_fuera_de_la_cadena(tx: &Transaction, data: &Map<String, Value>) -> Option<&'static str> {
+    let Some(fin) = fin_de_corte(data) else {
+        return Some("corte web sin fecha de fin");
+    };
+    let (inicio, _) = crate::commands::cortes::inicio_y_fondo(tx);
+    if inicio == crate::commands::cortes::INICIO_SIN_CORTES {
+        return Some("corte web: esta PC aún no tiene cadena de caja");
+    }
+    if fin <= fk::normalizar_marca(&inicio) {
+        return Some("corte web anterior al período abierto de esta PC");
+    }
+    None
+}
+
+/// Corte web recién insertado: los movimientos de la caja principal sin
+/// corte cuyo MOMENTO cae en su intervalo (inicio, fin] quedan ligados a él,
+/// igual que hace el servidor al crearlo (y `crear_corte_core` aquí). Ese
+/// dinero ya lo contó el corte web: ligados, ninguna suma de la cadena los
+/// vuelve a contar, aparecen en su detalle y la auditoría no los reporta
+/// como huérfanos. Corre con la bandera puesta: no sube al servidor (allá ya
+/// están ligados).
+fn ligar_movimientos_al_corte(tx: &Transaction, uuid: &str) -> Result<(), String> {
+    let f = crate::commands::cortes::FIN_CORTE_SQL;
+    let (id, inicio, fin): (i64, String, String) = tx
+        .query_row(
+            &format!(
+                "SELECT id, replace(substr(fecha_inicio,1,19),'T',' '), {f} FROM cortes WHERE uuid = ?"
+            ),
+            [uuid],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .map_err(sql_err)?;
+    let mo = crate::commands::cortes::MOMENTO_SQL;
+    let n = tx
+        .execute(
+            &format!(
+                "UPDATE movimientos_caja SET corte_id = ?1 \
+                  WHERE caja = 'principal' AND corte_id IS NULL AND deleted_at IS NULL \
+                    AND {mo} > ?2 AND {mo} <= ?3"
+            ),
+            rusqlite::params![id, inicio, fin],
+        )
+        .map_err(sql_err)?;
+    log::info!("sync apply: corte web {uuid} importado ({inicio} → {fin}); {n} movimiento(s) ligados");
+    Ok(())
+}
+
+/// ¿El corte de la caja principal que cubre `fecha` lo hizo la web? Ese
+/// corte lo calculó el servidor con todo lo que la web había registrado
+/// hasta su fin: una venta o movimiento web con fecha dentro de él ya contó
+/// ahí aunque llegue tarde a esta PC.
+fn cubierta_por_corte_web(tx: &Transaction, fecha: &str) -> bool {
+    let f = crate::commands::cortes::FIN_CORTE_SQL;
+    tx.query_row(
+        &format!(
+            "SELECT origen FROM cortes \
+              WHERE deleted_at IS NULL AND caja = 'principal' \
+                AND replace(substr(fecha_inicio,1,19),'T',' ') < ?1 AND {f} >= ?1 \
+              ORDER BY {f} ASC, id ASC LIMIT 1"
+        ),
+        [fecha],
+        |r| r.get::<_, String>(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .is_some_and(|o| o == "web")
+}
+
 /// Venta o movimiento web de la caja principal recién insertado cuya fecha
 /// ya quedó cubierta por un corte: se le pone `registrado_at` = max(ahora,
 /// fin del último corte + 1 s) para que cuente en el período abierto. Corre
@@ -929,6 +1036,9 @@ fn retimar_si_tardia(
     let limite = std::cmp::max(desde, origen);
     if fecha < limite {
         return Ok(()); // historia previa o anterior a esta caja: nunca se re-acomoda
+    }
+    if cubierta_por_corte_web(tx, &fecha) {
+        return Ok(()); // la contó el corte web que la cubre
     }
     let fin_mas_1 = NaiveDateTime::parse_from_str(&fin, "%Y-%m-%d %H:%M:%S")
         .map(|d| (d + ChronoDuration::seconds(1)).format("%Y-%m-%d %H:%M:%S").to_string())

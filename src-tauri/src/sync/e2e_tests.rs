@@ -1088,12 +1088,8 @@ async fn e2e_sync_v2_escenarios() {
             "efectivo_contado": esperado_w, "nota_diferencia": null, "fondo_siguiente": 0.0 } }))
         .await;
     chk!(inf, "e", cw.is_ok(), "corte de la caja web en el servidor: {cw:?}");
-    let ce = web
-        .rpc(&tok_espejo, "crear_corte", json!({ "datos": {
-            "tipo": "PARCIAL", "datos": { "efectivo_esperado": 0 }, "efectivo_contado": 0, "fondo_siguiente": 0 } }))
-        .await;
-    chk!(inf, "e", ce.as_ref().err().map(|e| e.starts_with("400") && e.contains("escritorio")).unwrap_or(false),
-         "corte de la caja principal desde la web se rechaza: {ce:?}");
+    // (El corte de la caja principal desde la web sí se permite desde v0.1.45 y
+    // baja al escritorio desde v0.1.46: lo cubren sync_tests::corte_web_*.)
     let uuids_web_caja: Vec<String> = pg
         .filas(&format!(
             "SELECT uuid FROM cortes WHERE uuid !~ {HEX32} AND id > 0 \
