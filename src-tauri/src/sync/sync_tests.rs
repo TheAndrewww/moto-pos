@@ -1445,7 +1445,7 @@ fn migracion_015_sobre_bd_con_datos() {
     aplicar_migraciones(&db).unwrap();
     db.execute_batch(SEED_DATA).unwrap();
 
-    assert_eq!(i64_de(&db, "PRAGMA user_version"), 15);
+    assert!(i64_de(&db, "PRAGMA user_version") >= 15, "migraciones aplicadas al menos hasta la 015");
     assert_eq!(bandera(&db), 0);
     let fila = |uuid: &str| -> (String, String) {
         db.query_row("SELECT origen, caja FROM ventas WHERE uuid = ?", [uuid], |r| Ok((r.get(0)?, r.get(1)?))).unwrap()
@@ -1500,7 +1500,7 @@ fn migracion_015_sobre_copia_de_bd_dev() {
     };
     let db = crate::db::connection::init_database(&ruta).expect("la BD de desarrollo debe abrir y migrar");
     eprintln!("copia dev: user_version {version_antes} → {}", i64_de(&db, "PRAGMA user_version"));
-    assert_eq!(i64_de(&db, "PRAGMA user_version"), 15);
+    assert!(i64_de(&db, "PRAGMA user_version") >= 15, "migraciones aplicadas al menos hasta la 015");
     for t in ["ventas", "cortes", "movimientos_caja", "aperturas_caja"] {
         assert_eq!(i64_de(&db, &format!("SELECT COUNT(*) FROM pragma_table_info('{t}') WHERE name IN ('origen', 'caja')")), 2, "{t}");
         assert_eq!(i64_de(&db, &format!("SELECT COUNT(*) FROM {t} WHERE caja <> 'principal' OR origen NOT IN ('desktop', 'web')")), 0, "{t}");

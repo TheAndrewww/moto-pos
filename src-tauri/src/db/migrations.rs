@@ -21,6 +21,7 @@ const MIGRATIONS: &[MigrationFn] = &[
     migracion_013_permisos_recepcion,
     migracion_014_permisos_sin_duplicados,
     migracion_015_sync_v2,
+    migracion_016_vendedor_ve_inventario,
 ];
 
 pub fn aplicar_migraciones(conn: &Connection) -> Result<()> {
@@ -1130,5 +1131,26 @@ fn migracion_015_sync_v2(conn: &Connection) -> Result<()> {
         )?;
     }
     conn.execute("DELETE FROM sync_suppress_flag", [])?;
+    Ok(())
+}
+
+// ─── Migración 016 ────────────────────────────────────────
+// Los empleados (rol vendedor) vuelven a ver las pestañas Inventario y
+// Etiquetas: el negocio quiere que consulten existencias y precios e impriman
+// etiquetas. Solo se enciende `inventario.ver`; crear, editar y eliminar
+// productos siguen apagados (migración 012), así que la pantalla de Inventario
+// queda de solo consulta para ellos (sin costos, sin ajustes, sin exportar).
+fn migracion_016_vendedor_ve_inventario(conn: &Connection) -> Result<()> {
+    // Instalación nueva: las migraciones corren antes de SEED_DATA y la tabla
+    // roles está vacía; SEED_DATA ya trae el permiso encendido.
+    let roles: i64 = conn.query_row("SELECT COUNT(*) FROM roles WHERE id = 2", [], |r| r.get(0))?;
+    if roles == 0 {
+        return Ok(());
+    }
+    conn.execute(
+        "INSERT INTO permisos (rol_id, modulo, accion, permitido) VALUES (2, 'inventario', 'ver', 1) \
+         ON CONFLICT(rol_id, modulo, accion) DO UPDATE SET permitido = 1",
+        [],
+    )?;
     Ok(())
 }

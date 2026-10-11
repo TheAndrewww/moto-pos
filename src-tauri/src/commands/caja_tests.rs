@@ -483,10 +483,36 @@ fn actualizacion_limpia_permisos_duplicados_existentes() {
         contar(&db, "SELECT permitido FROM permisos WHERE rol_id = 2 AND modulo = 'recepcion' AND accion = 'ver'"),
         1
     );
+    // Migración 016: el vendedor ve Inventario y Etiquetas (solo consulta).
     assert_eq!(
         contar(&db, "SELECT permitido FROM permisos WHERE rol_id = 2 AND modulo = 'inventario' AND accion = 'ver'"),
-        0
+        1
     );
+}
+
+#[test]
+fn vendedor_consulta_inventario_pero_no_lo_modifica() {
+    // Instalación nueva (seed) y actualización (migración 016) dejan igual al
+    // vendedor: ve Inventario/Etiquetas, sin crear, editar ni eliminar.
+    let nueva = nueva_db();
+    let permiso = |db: &Connection, accion: &str| contar(db, &format!(
+        "SELECT COALESCE(MAX(permitido), 0) FROM permisos WHERE rol_id = 2 AND modulo = 'inventario' AND accion = '{accion}'"
+    ));
+    assert_eq!(permiso(&nueva, "ver"), 1);
+    for accion in ["crear", "editar", "eliminar"] {
+        assert_eq!(permiso(&nueva, accion), 0, "instalación nueva: {accion}");
+    }
+
+    let vieja = nueva_db();
+    vieja.execute("UPDATE permisos SET permitido = 0 WHERE rol_id = 2 AND modulo = 'inventario'", []).unwrap();
+    vieja.execute_batch("PRAGMA user_version = 15;").unwrap();
+    aplicar_migraciones(&vieja).unwrap();
+    assert_eq!(permiso(&vieja, "ver"), 1);
+    for accion in ["crear", "editar", "eliminar"] {
+        assert_eq!(permiso(&vieja, accion), 0, "actualización: {accion}");
+    }
+    // El almacenista y el dueño no cambian.
+    assert_eq!(contar(&vieja, "SELECT permitido FROM permisos WHERE rol_id = 3 AND modulo = 'inventario' AND accion = 'editar'"), 1);
 }
 
 #[test]
