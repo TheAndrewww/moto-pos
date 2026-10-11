@@ -1678,6 +1678,11 @@ pub async fn procesar_purgar(pool: &PgPool, body: &PurgarBody) -> ApiResult<Valu
             borrados += n;
             if *tabla == "ventas" {
                 ventas_borradas.extend(ids.iter().copied());
+                // Si la eliminación la pidió la web, la solicitud ya se cumplió.
+                sqlx::query("DELETE FROM solicitudes_eliminar_venta WHERE venta_uuid = ANY($1)")
+                    .bind(uuids)
+                    .execute(&mut *tx)
+                    .await?;
             }
             // Líneas de bitácora que aquí apuntan a lo purgado.
             if *tabla != "audit_log" && !ids.is_empty() {
@@ -1724,6 +1729,91 @@ pub async fn procesar_purgar(pool: &PgPool, body: &PurgarBody) -> ApiResult<Valu
         "recibidos": recibidos,
         "por_tabla": conteo,
     }))
+}
+
+// -----------------------------------------------------------------------------
+// GET  /sync/solicitudes            — eliminaciones de prueba pedidas en la web
+// POST /sync/solicitudes/resultado  — el escritorio dice cómo le fue
+// -----------------------------------------------------------------------------
+//
+// La web solo PIDE eliminar una venta de prueba (rpc solicitar_eliminar_venta,
+// con el PIN del usuario autorizado ya verificado). El escritorio, dueño de
+// ventas, inventario y cortes, la aplica completa en su ciclo y la purga aquí
+// con /sync/purgar. Aplicada → la solicitud se BORRA (no queda rastro);
+// rechazada → se guarda el motivo para mostrarlo en la web.
+
+pub async fn solicitudes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    autenticar_sync(&headers, &state).await?;
+    // Solicitudes cuya venta ya no existe aquí (ya se purgó): cumplidas.
+    sqlx::query(
+        "DELETE FROM solicitudes_eliminar_venta s \
+          WHERE NOT EXISTS (SELECT 1 FROM ventas v WHERE v.uuid = s.venta_uuid)",
+    )
+    .execute(&state.pool)
+    .await?;
+    let filas = sqlx::query(
+        "SELECT uuid, venta_uuid, venta_folio, solicitado_por_uuid \
+           FROM solicitudes_eliminar_venta WHERE estado = 'pendiente' ORDER BY id LIMIT 100",
+    )
+    .fetch_all(&state.pool)
+    .await?;
+    let lista: Vec<Value> = filas
+        .iter()
+        .map(|r| {
+            json!({
+                "uuid": r.get::<String, _>("uuid"),
+                "venta_uuid": r.get::<String, _>("venta_uuid"),
+                "venta_folio": r.get::<Option<String>, _>("venta_folio"),
+                "solicitado_por_uuid": r.get::<String, _>("solicitado_por_uuid"),
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "solicitudes": lista })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ResultadosSolicitudes {
+    pub resultados: Vec<ResultadoSolicitud>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ResultadoSolicitud {
+    pub uuid: String,
+    pub aplicada: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+pub async fn resultado_solicitudes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ResultadosSolicitudes>,
+) -> ApiResult<Json<Value>> {
+    autenticar_sync(&headers, &state).await?;
+    let mut aplicadas = 0u64;
+    let mut rechazadas = 0u64;
+    for r in &body.resultados {
+        if r.aplicada {
+            aplicadas += sqlx::query("DELETE FROM solicitudes_eliminar_venta WHERE uuid = $1")
+                .bind(&r.uuid)
+                .execute(&state.pool)
+                .await?
+                .rows_affected();
+        } else {
+            rechazadas += sqlx::query(
+                "UPDATE solicitudes_eliminar_venta SET estado = 'rechazada', error = $2 WHERE uuid = $1",
+            )
+            .bind(&r.uuid)
+            .bind(r.error.as_deref().unwrap_or("El POS de escritorio no pudo eliminarla."))
+            .execute(&state.pool)
+            .await?
+            .rows_affected();
+        }
+    }
+    Ok(Json(json!({ "aplicadas": aplicadas, "rechazadas": rechazadas })))
 }
 
 /// Quita el rastro del sync de unas filas.

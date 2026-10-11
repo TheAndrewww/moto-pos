@@ -391,3 +391,94 @@ async fn p2_purga_rechaza_tablas_ajenas_y_lotes_invalidos() {
     assert_eq!(huella_bitacora_sin(p, &[]).await, resto, "cambió otra línea de la bitácora");
     c.cerrar().await;
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// p3) Eliminaciones pedidas desde la web: solo el escritorio las lee y las
+//     confirma; aplicada o purgada → desaparece; rechazada → queda el motivo.
+// ─────────────────────────────────────────────────────────────────────────
+#[tokio::test]
+async fn p3_solicitudes_de_eliminar_venta_de_la_web() {
+    let Some(c) = ctx("purga3").await else { return };
+    let p = &c.pool;
+    let hash = bcrypt::hash("clave-de-prueba", 4).unwrap();
+    sqlx::query("INSERT INTO admin_users (email, password_hash, nombre, sucursal_id) VALUES ('p3@prueba.local', $1, 'Prueba', 1)")
+        .bind(&hash)
+        .execute(p)
+        .await
+        .unwrap();
+    let a = app(p.clone());
+    let (st, login) = llamar(&a, "POST", "/auth/login", None, Some(json!({"email": "p3@prueba.local", "password": "clave-de-prueba"}))).await;
+    assert_eq!(st, StatusCode::OK, "{login}");
+    let tok = login["token"].as_str().unwrap().to_string();
+
+    let ts = ahora(p).await;
+    let (_, prod_uuid) = producto_existente(p, 100).await;
+    let (vu, du) = (hex32(), hex32());
+    venta_empujada(p, 99301, &vu, &du, &prod_uuid, &ts).await;
+    let (vu2, du2) = (hex32(), hex32());
+    venta_empujada(p, 99302, &vu2, &du2, &prod_uuid, &ts).await;
+    let fantasma = hex32();
+    for (venta, folio) in [(&vu, "V-P3-1"), (&vu2, "V-P3-2"), (&fantasma, "V-NO-EXISTE")] {
+        sqlx::query(
+            "INSERT INTO solicitudes_eliminar_venta (venta_uuid, venta_folio, solicitado_por_uuid) \
+             VALUES ($1, $2, 'c088a77266563a58935e396a1cb55d27')",
+        )
+        .bind(venta)
+        .bind(folio)
+        .execute(p)
+        .await
+        .unwrap();
+    }
+
+    // Un token web no las puede leer ni confirmar.
+    let web = crate::auth::emitir_token_con_device(SECRETO, 4, "Mariana", "device", 1, Some("web-dev-1".into()), chrono::Duration::days(7)).unwrap();
+    assert_eq!(llamar(&a, "GET", "/sync/solicitudes", Some(&web), None).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(
+        llamar(&a, "POST", "/sync/solicitudes/resultado", Some(&web), Some(json!({"resultados": []}))).await.0,
+        StatusCode::FORBIDDEN
+    );
+
+    // El escritorio las lee; la de una venta que ya no existe se descarta sola.
+    let (st, r) = llamar(&a, "GET", "/sync/solicitudes", Some(&tok), None).await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let lista = r["solicitudes"].as_array().unwrap().clone();
+    let ventas: Vec<&str> = lista.iter().map(|s| s["venta_uuid"].as_str().unwrap()).collect();
+    assert_eq!(ventas, vec![vu.as_str(), vu2.as_str()], "{r}");
+    assert_eq!(lista[0]["solicitado_por_uuid"], json!("c088a77266563a58935e396a1cb55d27"));
+    assert_eq!(entero(p, &format!("SELECT count(*) FROM solicitudes_eliminar_venta WHERE venta_uuid = '{fantasma}'")).await, 0);
+    let s1 = lista[0]["uuid"].as_str().unwrap().to_string();
+    let s2 = lista[1]["uuid"].as_str().unwrap().to_string();
+
+    // Rechazada: queda con el motivo y ya no se ofrece. Aplicada: se borra.
+    let (st, r) = llamar(
+        &a,
+        "POST",
+        "/sync/solicitudes/resultado",
+        Some(&tok),
+        Some(json!({"resultados": [
+            {"uuid": s1, "aplicada": false, "error": "motivo de prueba"},
+            {"uuid": s2, "aplicada": true}
+        ]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    assert_eq!((r["aplicadas"].clone(), r["rechazadas"].clone()), (json!(1), json!(1)), "{r}");
+    assert_eq!(
+        texto(p, &format!("SELECT estado || '|' || error FROM solicitudes_eliminar_venta WHERE uuid = '{s1}'")).await.as_deref(),
+        Some("rechazada|motivo de prueba")
+    );
+    assert_eq!(entero(p, &format!("SELECT count(*) FROM solicitudes_eliminar_venta WHERE uuid = '{s2}'")).await, 0);
+    let (_, r) = llamar(&a, "GET", "/sync/solicitudes", Some(&tok), None).await;
+    assert_eq!(r["solicitudes"], json!([]), "la rechazada ya no se ofrece");
+
+    // Otra vez pendiente y el escritorio la aplica: al purgar la venta, la
+    // solicitud desaparece aunque no llegue la confirmación.
+    sqlx::query("UPDATE solicitudes_eliminar_venta SET estado = 'pendiente', error = NULL WHERE uuid = $1")
+        .bind(&s1)
+        .execute(p)
+        .await
+        .unwrap();
+    procesar_purgar(p, &purga(vec![fila("ventas", &vu)])).await.unwrap();
+    assert_eq!(entero(p, &format!("SELECT count(*) FROM solicitudes_eliminar_venta WHERE uuid = '{s1}'")).await, 0);
+    c.cerrar().await;
+}

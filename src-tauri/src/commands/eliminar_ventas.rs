@@ -91,7 +91,69 @@ pub(crate) fn eliminar_venta_core(
 ) -> Result<VentaEliminada, String> {
     // Antes del BEGIN: bcrypt es lento y una negativa no abre transacción.
     autorizar(db, usuario_id, pin)?;
+    eliminar_venta_autorizada(db, venta_id, now)
+}
 
+/// Resultado de aplicar una eliminación pedida desde la web.
+#[derive(Debug)]
+pub(crate) enum ResultadoSolicitud {
+    /// Eliminada (o ya no existía porque se eliminó antes aquí).
+    Aplicada(Option<VentaEliminada>),
+    /// Todavía no se puede (la venta aún no baja a este equipo): se reintenta.
+    Pendiente(String),
+    /// No se aplicará; el motivo se muestra en la web.
+    Rechazada(String),
+}
+
+/// Aplica una "eliminar venta de prueba" pedida desde la web. El servidor ya
+/// verificó el PIN; aquí se vuelve a exigir que quien la pidió tenga el
+/// permiso individual en ESTE equipo.
+pub(crate) fn aplicar_solicitud_web(
+    db: &Connection,
+    venta_uuid: &str,
+    solicitado_por_uuid: &str,
+    now: &str,
+) -> ResultadoSolicitud {
+    let autorizado: Option<i64> = db
+        .query_row(
+            "SELECT id FROM usuarios WHERE uuid = ? AND activo = 1 AND deleted_at IS NULL \
+               AND puede_eliminar_ventas = 1",
+            [solicitado_por_uuid],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap_or(None);
+    if autorizado.is_none() {
+        return ResultadoSolicitud::Rechazada(
+            "Quien la pidió no tiene permiso para eliminar ventas en el POS de escritorio.".into(),
+        );
+    }
+    let venta_id: Option<i64> = db
+        .query_row("SELECT id FROM ventas WHERE uuid = ?", [venta_uuid], |r| r.get(0))
+        .optional()
+        .unwrap_or(None);
+    let Some(venta_id) = venta_id else {
+        let ya_eliminada: bool = db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sync_purgas_pendientes WHERE tabla = 'ventas' AND uuid = ?)",
+                [venta_uuid],
+                |r| r.get(0),
+            )
+            .unwrap_or(false);
+        return if ya_eliminada {
+            ResultadoSolicitud::Aplicada(None)
+        } else {
+            ResultadoSolicitud::Pendiente("la venta todavía no llega a este equipo".into())
+        };
+    };
+    match eliminar_venta_autorizada(db, venta_id, now) {
+        Ok(r) => ResultadoSolicitud::Aplicada(Some(r)),
+        Err(e) => ResultadoSolicitud::Rechazada(e),
+    }
+}
+
+/// La eliminación completa, ya autorizada, en UNA transacción.
+fn eliminar_venta_autorizada(db: &Connection, venta_id: i64, now: &str) -> Result<VentaEliminada, String> {
     db.execute_batch("BEGIN IMMEDIATE").map_err(|e| e.to_string())?;
     match eliminar_en_tx(db, venta_id, now) {
         Ok(r) => {

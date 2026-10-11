@@ -70,6 +70,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/sync/refs", post(sync::refs))
         .route("/sync/fila", get(sync::fila))
         .route("/sync/purgar", post(sync::purgar))
+        .route("/sync/solicitudes", get(sync::solicitudes))
+        .route("/sync/solicitudes/resultado", post(sync::resultado_solicitudes))
         // Panel web — catálogo
         .route("/api/dashboard", get(api::dashboard_resumen))
         .route("/api/sucursales", get(api::sucursales_list))

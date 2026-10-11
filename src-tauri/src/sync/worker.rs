@@ -18,8 +18,12 @@
 //   4. Jala cambios del remoto desde last_pull_cursor mientras haya más
 //      (máx. MAX_TANDAS_PULL tandas por ciclo). Una fila que sigue en la
 //      cola de purgas nunca se vuelve a crear (apply.rs).
-//   5. Reintenta la bandeja de cambios recibidos que no se pudieron aplicar.
-//   6. Tareas únicas del sync v2 (mapa de ids, reparación, re-descarga).
+//   5. Eliminaciones de ventas de prueba pedidas desde la web (GET
+//      /sync/solicitudes): se aplican aquí (dueño de ventas, inventario y
+//      cortes), se confirman al servidor y, si hubo alguna, se empujan ya el
+//      ajuste y la purga.
+//   6. Reintenta la bandeja de cambios recibidos que no se pudieron aplicar.
+//   7. Tareas únicas del sync v2 (mapa de ids, reparación, re-descarga).
 //
 // Un solo ciclo a la vez (`CICLO`): el periódico, el de "Forzar
 // sincronización" y la reparación manual nunca corren juntos (dos ciclos
@@ -149,15 +153,31 @@ async fn ciclo(db: &Arc<Mutex<Connection>>) -> Result<(), String> {
         log::warn!("sync pull error: {}", e);
     }
 
-    // 5. Bandeja de entrada
+    // 5. Eliminaciones de ventas de prueba pedidas desde la web (después del
+    //    pull: una venta hecha en la web ya bajó). Si se aplicó alguna, el
+    //    ajuste de existencias/corte y la purga suben en este mismo ciclo.
+    match solicitudes_web(db, &client).await {
+        Ok(n) if n > 0 => {
+            if let Err(e) = push(db, &client, &cfg).await {
+                log::warn!("sync push error: {}", e);
+            }
+            if let Err(e) = purgar(db, &client, &cfg).await {
+                log::warn!("sync purga error: {}", e);
+            }
+        }
+        Ok(_) => {}
+        Err(e) => log::warn!("sync solicitudes error: {}", e),
+    }
+
+    // 6. Bandeja de entrada
     if let Err(e) = inbox::reintentar(db, &client).await {
         log::warn!("sync inbox error: {}", e);
     }
 
-    // 6. Tareas únicas
+    // 7. Tareas únicas
     tareas_unicas(db, &client, &cfg).await;
 
-    // 7. Limpieza periódica del outbox
+    // 8. Limpieza periódica del outbox
     {
         let conn = db.lock().map_err(|e| e.to_string())?;
         let _ = outbox::limpiar_antiguos(&conn, BATCH_PULL_LIMITE_DIAS_CLEANUP);
@@ -471,6 +491,62 @@ pub(super) async fn push(
         }
     }
     Ok(())
+}
+
+/// Aplica las "eliminar venta de prueba" pedidas desde la web y le dice al
+/// servidor cómo le fue a cada una (aplicada → el servidor la borra;
+/// rechazada → guarda el motivo). Las que aún no se pueden (la venta no ha
+/// bajado) no se reportan y se reintentan en el siguiente ciclo. Devuelve
+/// cuántas se aplicaron. Servidor sin el endpoint → Ok(0).
+pub(super) async fn solicitudes_web(
+    db: &Arc<Mutex<Connection>>,
+    client: &RemoteClient,
+) -> Result<usize, String> {
+    use crate::commands::eliminar_ventas::{aplicar_solicitud_web, ResultadoSolicitud};
+    let lista = match client.solicitudes().await? {
+        Respuesta::Ok(r) => r.solicitudes,
+        Respuesta::NoSoportado => return Ok(0),
+        Respuesta::Rechazado(v) => return Err(format!("solicitudes rechazado: {}", v)),
+    };
+    if lista.is_empty() {
+        return Ok(0);
+    }
+    let mut resultados: Vec<(String, bool, Option<String>)> = Vec::new();
+    let mut aplicadas = 0usize;
+    {
+        let conn = db.lock().map_err(|e| e.to_string())?;
+        let ahora = crate::commands::cortes::ahora_local();
+        for s in &lista {
+            let folio = s.venta_folio.as_deref().unwrap_or(&s.venta_uuid);
+            match aplicar_solicitud_web(&conn, &s.venta_uuid, &s.solicitado_por_uuid, &ahora) {
+                ResultadoSolicitud::Aplicada(r) => {
+                    aplicadas += 1;
+                    match r {
+                        Some(r) => log::info!(
+                            "sync: venta de prueba {} eliminada a pedido de la web ({} piezas regresadas, corte {:?})",
+                            r.folio, r.piezas_regresadas, r.corte_ajustado_id
+                        ),
+                        None => log::info!("sync: la venta {} ya se había eliminado aquí", folio),
+                    }
+                    resultados.push((s.uuid.clone(), true, None));
+                }
+                ResultadoSolicitud::Pendiente(m) => {
+                    log::debug!("sync: eliminación de {} pendiente: {}", folio, m);
+                }
+                ResultadoSolicitud::Rechazada(m) => {
+                    log::warn!("sync: eliminación de {} rechazada: {}", folio, m);
+                    resultados.push((s.uuid.clone(), false, Some(m)));
+                }
+            }
+        }
+    }
+    if !resultados.is_empty() {
+        match client.resultado_solicitudes(&resultados).await? {
+            Respuesta::Ok(_) | Respuesta::NoSoportado => {}
+            Respuesta::Rechazado(v) => return Err(format!("resultado de solicitudes rechazado: {}", v)),
+        }
+    }
+    Ok(aplicadas)
 }
 
 /// Manda al servidor las purgas pendientes (filas eliminadas aquí por

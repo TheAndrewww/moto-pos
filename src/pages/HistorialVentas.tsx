@@ -109,7 +109,9 @@ export default function HistorialVentas() {
   const [modalEliminar, setModalEliminar] = useState(false);
   // Eliminar ventas de prueba: solo en el escritorio y solo usuarios con el
   // permiso individual (Daniela Bravo). La web nunca lo recibe.
-  const puedeEliminarVentas = isTauri() && !!usuario?.puede_eliminar_ventas;
+  // Escritorio: elimina al momento. Web: deja la eliminación pendiente y el POS
+  // de escritorio la aplica en su siguiente sincronización.
+  const puedeEliminarVentas = !!usuario?.puede_eliminar_ventas;
 
   // Carga una página específica. El conteo total se actualiza solo cuando
   // cambia el filtro (no al cambiar página) — pasar `recontar=true` para
@@ -450,6 +452,12 @@ export default function HistorialVentas() {
           venta={ventaSeleccionada}
           usuarioId={usuario!.id}
           onClose={() => setModalEliminar(false)}
+          onSolicitada={(mensaje) => {
+            setModalEliminar(false);
+            setVentaSeleccionada(null);
+            cargar();
+            alert(mensaje);
+          }}
           onSuccess={(r) => {
             setModalEliminar(false);
             setVentaSeleccionada(null);
@@ -535,7 +543,8 @@ function DetalleVentaInline({
   // Eliminar venta de prueba: cualquier estado (anulada, con devoluciones,
   // de otro día), pero solo de la caja de la tienda: la caja web tiene su
   // dinero y sus cortes en el servidor.
-  const puedeEliminar = puedeEliminarVentas && !!onEliminar && cajaDe(venta as ConCaja) === 'principal';
+  const puedeEliminar = puedeEliminarVentas && !!onEliminar && cajaDe(venta as ConCaja) === 'principal'
+    && !venta.eliminacion_pendiente;
 
   // Función para verificar si un item coincide con el término de búsqueda
   const itemCoincide = (it: VentaDetalleItem): boolean => {
@@ -583,6 +592,26 @@ function DetalleVentaInline({
           <strong>Venta anulada</strong>
           {venta.anulada_por_nombre && ` por ${venta.anulada_por_nombre}`}
           {venta.motivo_anulacion && ` — Motivo: ${venta.motivo_anulacion}`}
+        </div>
+      )}
+
+      {venta.eliminacion_pendiente && (
+        <div style={{
+          marginBottom: 12, padding: 10, borderRadius: 6,
+          background: 'rgba(245,158,11,0.1)', border: '1px solid rgba(245,158,11,0.35)',
+          fontSize: 12, color: 'var(--color-warning)',
+        }}>
+          <strong>Eliminación pendiente.</strong> Se aplicará en cuanto el POS de escritorio sincronice
+          (unos segundos si está encendido y con internet).
+        </div>
+      )}
+      {!venta.eliminacion_pendiente && venta.eliminacion_error && (
+        <div style={{
+          marginBottom: 12, padding: 10, borderRadius: 6,
+          background: 'var(--color-danger-soft)', border: '1px solid rgba(220,38,38,0.25)',
+          fontSize: 12, color: 'var(--color-danger)',
+        }}>
+          <strong>El POS de escritorio no pudo eliminarla:</strong> {venta.eliminacion_error}
         </div>
       )}
 
@@ -814,13 +843,17 @@ interface VentaEliminada {
 }
 
 function ModalEliminarVenta({
-  venta, usuarioId, onClose, onSuccess,
+  venta, usuarioId, onClose, onSuccess, onSolicitada,
 }: {
   venta: VentaDetalleCompleto;
   usuarioId: number;
   onClose: () => void;
+  /** Escritorio: eliminada al momento. */
   onSuccess: (r: VentaEliminada) => void;
+  /** Web: queda pendiente hasta que el POS de escritorio sincronice. */
+  onSolicitada: (mensaje: string) => void;
 }) {
+  const enWeb = !isTauri();
   const [pin, setPin] = useState('');
   const [procesando, setProcesando] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -831,10 +864,17 @@ function ModalEliminarVenta({
     setProcesando(true);
     setError(null);
     try {
-      const r = await invoke<VentaEliminada>('eliminar_venta', {
-        ventaId: venta.id, usuarioId, pin,
-      });
-      onSuccess(r);
+      if (enWeb) {
+        const r = await invoke<{ ok: boolean; mensaje: string }>('solicitar_eliminar_venta', {
+          ventaId: venta.id, pin,
+        });
+        onSolicitada(r.mensaje);
+      } else {
+        const r = await invoke<VentaEliminada>('eliminar_venta', {
+          ventaId: venta.id, usuarioId, pin,
+        });
+        onSuccess(r);
+      }
     } catch (e: any) {
       setError(String(e));
       setPin('');
@@ -876,6 +916,13 @@ function ModalEliminarVenta({
               resta y su diferencia se recalcula (lo contado y el fondo no cambian).
             </li>
             <li><strong>No se puede deshacer.</strong></li>
+            {enWeb && (
+              <li>
+                Desde la web la eliminación la aplica el POS de escritorio en su siguiente sincronización
+                (unos segundos si está encendido y con internet). Mientras tanto la venta se verá como
+                <em> eliminación pendiente</em>.
+              </li>
+            )}
             <li>También se borran sus renglones de la bitácora: no queda ningún rastro, aquí ni en la web.</li>
           </ul>
         </div>
@@ -913,7 +960,7 @@ function ModalEliminarVenta({
           disabled={procesando || pin.length !== 4}
         >
           <Trash2 size={14} />
-          {procesando ? 'Eliminando...' : 'Eliminar definitivamente'}
+          {procesando ? 'Eliminando...' : (enWeb ? 'Solicitar eliminación' : 'Eliminar definitivamente')}
         </button>
       </div>
     </ModalWrapper>

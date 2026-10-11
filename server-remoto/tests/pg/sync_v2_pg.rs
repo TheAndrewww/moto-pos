@@ -953,6 +953,8 @@ fn app(pool: PgPool) -> axum::Router {
         .route("/sync/refs", post(refs))
         .route("/sync/fila", get(fila))
         .route("/sync/purgar", post(purgar))
+        .route("/sync/solicitudes", get(solicitudes))
+        .route("/sync/solicitudes/resultado", post(resultado_solicitudes))
         .with_state(state)
 }
 

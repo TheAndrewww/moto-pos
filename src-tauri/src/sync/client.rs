@@ -126,6 +126,22 @@ pub struct PurgaResp {
     pub borrados: i64,
 }
 
+/// Una "eliminar venta de prueba" pedida desde la web (GET /sync/solicitudes).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct SolicitudWeb {
+    pub uuid: String,
+    pub venta_uuid: String,
+    #[serde(default)]
+    pub venta_folio: Option<String>,
+    pub solicitado_por_uuid: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct SolicitudesResp {
+    #[serde(default)]
+    pub solicitudes: Vec<SolicitudWeb>,
+}
+
 pub struct RemoteClient {
     base: String,
     token: String,
@@ -288,6 +304,36 @@ impl RemoteClient {
             .await
             .map_err(|e| format!("purgar red: {}", e))?;
         self.leer_json("purgar", r).await
+    }
+
+    /// GET /sync/solicitudes — eliminaciones de ventas de prueba pedidas en la
+    /// web (PIN del usuario autorizado ya verificado por el servidor).
+    pub async fn solicitudes(&self) -> Result<Respuesta<SolicitudesResp>, String> {
+        let r = self.http.get(format!("{}/sync/solicitudes", self.base))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|e| format!("solicitudes red: {}", e))?;
+        self.leer_json("solicitudes", r).await
+    }
+
+    /// POST /sync/solicitudes/resultado — (uuid, aplicada, motivo si no).
+    pub async fn resultado_solicitudes(
+        &self,
+        resultados: &[(String, bool, Option<String>)],
+    ) -> Result<Respuesta<Value>, String> {
+        let body = serde_json::json!({
+            "resultados": resultados.iter()
+                .map(|(uuid, aplicada, error)| serde_json::json!({ "uuid": uuid, "aplicada": aplicada, "error": error }))
+                .collect::<Vec<_>>(),
+        });
+        let r = self.http.post(format!("{}/sync/solicitudes/resultado", self.base))
+            .bearer_auth(&self.token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("resultado solicitudes red: {}", e))?;
+        self.leer_json("resultado solicitudes", r).await
     }
 
     /// Lee una respuesta JSON de un endpoint nuevo. 404/405 o un cuerpo que

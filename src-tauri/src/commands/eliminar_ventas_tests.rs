@@ -25,7 +25,7 @@ use super::cortes::{
     NuevoCorte, NuevoMovimiento,
 };
 use super::devoluciones::{crear_devolucion_core, ItemDevolucion, NuevaDevolucion};
-use super::eliminar_ventas::{eliminar_venta_core, VentaEliminada};
+use super::eliminar_ventas::{aplicar_solicitud_web, eliminar_venta_core, ResultadoSolicitud, VentaEliminada};
 use super::ventas::{anular_venta_core, crear_venta_core, ItemVenta, NuevaVenta};
 
 // ─── Utilidades ───────────────────────────────────────────
@@ -767,4 +767,42 @@ fn migracion_017_es_idempotente() {
         .optional()
         .unwrap();
     assert_eq!(col, Some(1));
+}
+
+
+// ─── Eliminación pedida desde la web ──────────────────────
+
+#[test]
+fn solicitud_de_la_web_la_aplica_el_escritorio_completa() {
+    let db = base();
+    abrir(&db, "2026-10-10 08:00:00", 2000.0);
+    let v = efectivo(&db, "2026-10-10 10:00:00", 500.0);
+    let uv = uuid_de(&db, "ventas", v);
+    assert_eq!(esperado(&db, "2026-10-10 12:00:00"), 2500.0);
+
+    // Quien la pidió debe tener el permiso individual AQUÍ.
+    let uuid_laura: String = db.query_row("SELECT uuid FROM usuarios WHERE id = ?", [LAURA], |r| r.get(0)).unwrap();
+    match aplicar_solicitud_web(&db, &uv, &uuid_laura, AHORA) {
+        ResultadoSolicitud::Rechazada(m) => assert!(m.contains("permiso"), "{m}"),
+        otro => panic!("debía rechazarse: {otro:?}"),
+    }
+    assert_eq!(i64_de(&db, &format!("SELECT COUNT(*) FROM ventas WHERE id = {v}")), 1);
+
+    // Daniela: se aplica igual que desde el escritorio (sin pedir PIN aquí:
+    // el servidor ya lo verificó).
+    match aplicar_solicitud_web(&db, &uv, UUID_DANI, AHORA) {
+        ResultadoSolicitud::Aplicada(Some(r)) => assert_eq!(r.piezas_regresadas, 1.0),
+        otro => panic!("debía aplicarse: {otro:?}"),
+    }
+    assert_eq!(i64_de(&db, &format!("SELECT COUNT(*) FROM ventas WHERE id = {v}")), 0);
+    assert_eq!(esperado(&db, "2026-10-10 12:00:00"), 2000.0);
+    assert_eq!(purgas_sin_bitacora(&db), vec![("ventas".to_string(), uv.clone())]);
+
+    // Repetida (la confirmación no llegó): ya se eliminó aquí → aplicada.
+    assert!(matches!(aplicar_solicitud_web(&db, &uv, UUID_DANI, AHORA), ResultadoSolicitud::Aplicada(None)));
+    // Una venta que todavía no baja a este equipo: se reintenta después.
+    assert!(matches!(
+        aplicar_solicitud_web(&db, "aun-no-llega-0000000000000000000", UUID_DANI, AHORA),
+        ResultadoSolicitud::Pendiente(_)
+    ));
 }

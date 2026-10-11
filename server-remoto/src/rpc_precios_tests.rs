@@ -1160,3 +1160,73 @@ async fn venta_de_pestana_vieja_rechazada_por_precio_o_descuento_pide_recargar()
         .unwrap();
     assert_eq!(r["total"].as_f64(), Some(100.0));
 }
+
+#[tokio::test]
+async fn eliminar_venta_de_prueba_desde_la_web_queda_pendiente() {
+    let Some(c) = ctx().await else { return };
+    let pid = producto(&c, 50.0, 10.0).await;
+    let (vid, _) = venta_escritorio(&c, pid, 1.0, 50.0).await;
+    let uuid_v: String = sqlx::query_scalar("SELECT uuid FROM ventas WHERE id = $1")
+        .bind(vid)
+        .fetch_one(&c.st.pool)
+        .await
+        .unwrap();
+    let permiso = |v: i32| {
+        let pool = c.st.pool.clone();
+        let id = c.dueno;
+        async move {
+            sqlx::query("UPDATE usuarios SET puede_eliminar_ventas = $1 WHERE id = $2")
+                .bind(v)
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+    };
+    let pedir = |pin: &'static str| rpc(&c, &c.tok_dueno, "solicitar_eliminar_venta", json!({"ventaId": vid, "pin": pin}));
+
+    // Dueño SIN el permiso individual: no.
+    permiso(0).await;
+    assert!(msg(pedir(PIN_DUENO).await.unwrap_err()).contains("No tienes permiso"));
+    // Con el permiso pero otro PIN: no.
+    permiso(1).await;
+    assert!(msg(pedir(PIN_VENDEDOR).await.unwrap_err()).contains("PIN incorrecto"));
+    // Con su PIN: queda pendiente y aquí no se borra nada.
+    let r = pedir(PIN_DUENO).await.unwrap();
+    assert_eq!(r["ok"], json!(true), "{r}");
+    assert!(r["mensaje"].as_str().unwrap().contains("POS de escritorio"), "{r}");
+    let estado: String = sqlx::query_scalar("SELECT estado FROM solicitudes_eliminar_venta WHERE venta_uuid = $1")
+        .bind(&uuid_v)
+        .fetch_one(&c.st.pool)
+        .await
+        .unwrap();
+    assert_eq!(estado, "pendiente");
+    assert_eq!(escalar_i64(&c, "SELECT count(*) FROM ventas WHERE id = $1", vid).await, 1);
+    let d = rpc(&c, &c.tok_dueno, "obtener_detalle_venta", json!({"ventaId": vid})).await.unwrap();
+    assert_eq!(d["eliminacion_pendiente"], json!(true), "{d}");
+    // Pedirla otra vez no la duplica.
+    pedir(PIN_DUENO).await.unwrap();
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM solicitudes_eliminar_venta WHERE venta_uuid = $1")
+        .bind(&uuid_v)
+        .fetch_one(&c.st.pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 1);
+    // Rechazada por el escritorio: el detalle muestra el motivo.
+    sqlx::query("UPDATE solicitudes_eliminar_venta SET estado = 'rechazada', error = 'motivo' WHERE venta_uuid = $1")
+        .bind(&uuid_v)
+        .execute(&c.st.pool)
+        .await
+        .unwrap();
+    let d = rpc(&c, &c.tok_dueno, "obtener_detalle_venta", json!({"ventaId": vid})).await.unwrap();
+    assert_eq!((d["eliminacion_pendiente"].clone(), d["eliminacion_error"].clone()), (json!(false), json!("motivo")));
+    // Venta de la caja web: no se ofrece.
+    sqlx::query("UPDATE ventas SET caja = 'web' WHERE id = $1").bind(vid).execute(&c.st.pool).await.unwrap();
+    assert!(msg(pedir(PIN_DUENO).await.unwrap_err()).contains("caja web"));
+    // El login trae el permiso.
+    let l = rpc_con(&c.st, "x", "login_pin", json!({"pin": PIN_DUENO})).await.unwrap();
+    assert_eq!(l["usuario"]["puede_eliminar_ventas"], json!(true), "{l}");
+
+    sqlx::query("DELETE FROM solicitudes_eliminar_venta WHERE venta_uuid = $1").bind(&uuid_v).execute(&c.st.pool).await.unwrap();
+    permiso(0).await;
+}

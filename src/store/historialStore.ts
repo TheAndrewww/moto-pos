@@ -55,6 +55,10 @@ export interface VentaDetalleCompleto {
   total_devuelto: number;
   caja?: string;
   origen?: string;
+  /** Web: eliminación de prueba pedida y aún no aplicada por el escritorio. */
+  eliminacion_pendiente?: boolean;
+  /** Web: motivo si el escritorio no pudo aplicarla. */
+  eliminacion_error?: string | null;
 }
 
 export interface FiltrosBusqueda {

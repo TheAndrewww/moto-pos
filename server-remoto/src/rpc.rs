@@ -37,6 +37,7 @@ const RPC_QUE_MUEVEN_CAJA: &[&str] = &[
     "crear_movimiento_caja",
     "crear_devolucion",
     "anular_venta",
+    "solicitar_eliminar_venta",
 ];
 
 /// Versión mínima del bundle web (invokeCompat la manda en cada RPC).
@@ -274,6 +275,7 @@ pub async fn dispatch(
         "buscar_ventas"                 => buscar_ventas(&state, &args).await?,
         "contar_ventas"                 => contar_ventas(&state, &args).await?,
         "obtener_detalle_venta"         => obtener_detalle_venta(&state, &args).await?,
+        "solicitar_eliminar_venta"      => solicitar_eliminar_venta(&state, &claims, &args).await?,
         "crear_venta"                   => crear_venta(&state, &claims, args)
                                                .await
                                                .map_err(|e| aviso_cliente_viejo_venta(e, &headers))?,
@@ -1562,6 +1564,73 @@ async fn contar_ventas(
     Ok(json!({ "total": total }))
 }
 
+/// "Eliminar venta de prueba" pedida desde la web: solo el usuario con el
+/// permiso individual (Daniela Bravo) y con SU PIN. Aquí no se borra nada: la
+/// venta, el inventario y los cortes los maneja el POS de escritorio, que toma
+/// la solicitud en su siguiente ciclo de sync (GET /sync/solicitudes), la
+/// aplica completa y purga aquí la venta (POST /sync/purgar).
+async fn solicitar_eliminar_venta(state: &AppState, claims: &Claims, args: &Value) -> Result<Value, ApiError> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct A {
+        venta_id: i64,
+        pin: String,
+    }
+    let a: A = serde_json::from_value(args.clone())
+        .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
+    let sesion = usuario_de_sesion(state, claims).await?;
+
+    let u = sqlx::query("SELECT uuid, pin, puede_eliminar_ventas FROM usuarios WHERE id = $1")
+        .bind(sesion.id)
+        .fetch_one(&state.pool)
+        .await?;
+    if u.get::<i32, _>("puede_eliminar_ventas") != 1 {
+        return Err(ApiError::BadRequest("No tienes permiso para eliminar ventas.".into()));
+    }
+    let hash: String = u.get("pin");
+    if !bcrypt::verify(&a.pin, &hash).unwrap_or(false) {
+        return Err(ApiError::BadRequest("PIN incorrecto.".into()));
+    }
+    let usuario_uuid: String = u.get("uuid");
+
+    let v = sqlx::query("SELECT uuid, folio, caja FROM ventas WHERE id = $1 AND deleted_at IS NULL")
+        .bind(a.venta_id)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let folio: String = v.get("folio");
+    if v.get::<String, _>("caja") != "principal" {
+        return Err(ApiError::BadRequest(format!(
+            "La venta {folio} es de la caja web: no se puede eliminar como venta de prueba."
+        )));
+    }
+    let venta_uuid: String = v.get("uuid");
+
+    // Una solicitud por venta; pedirla otra vez (p. ej. tras un rechazo) la
+    // vuelve a dejar pendiente.
+    sqlx::query(
+        "INSERT INTO solicitudes_eliminar_venta (venta_uuid, venta_folio, solicitado_por_uuid) \
+         VALUES ($1, $2, $3) \
+         ON CONFLICT (venta_uuid) DO UPDATE \
+            SET estado = 'pendiente', error = NULL, \
+                solicitado_por_uuid = EXCLUDED.solicitado_por_uuid, created_at = now()",
+    )
+    .bind(&venta_uuid)
+    .bind(&folio)
+    .bind(&usuario_uuid)
+    .execute(&state.pool)
+    .await?;
+
+    Ok(json!({
+        "ok": true,
+        "folio": folio,
+        "mensaje": format!(
+            "La venta {folio} se eliminará en cuanto el POS de escritorio sincronice \
+             (unos segundos si está encendido y con internet)."
+        ),
+    }))
+}
+
 async fn obtener_detalle_venta(state: &AppState, args: &Value) -> Result<Value, ApiError> {
     use rust_decimal::prelude::ToPrimitive;
     let a: VentaIdArg = serde_json::from_value(args.clone())
@@ -1581,11 +1650,13 @@ async fn obtener_detalle_venta(state: &AppState, args: &Value) -> Result<Value, 
                    AND EXISTS (SELECT 1 FROM devolucion_detalle dd
                                JOIN venta_detalle vdd ON vdd.id = dd.venta_detalle_id
                                WHERE dd.devolucion_id = dv.id AND vdd.venta_id = dv.venta_id))
-                 AS total_devuelto
+                 AS total_devuelto,
+               se.estado AS eliminacion_estado, se.error AS eliminacion_error
         FROM ventas v
         LEFT JOIN usuarios u ON u.id = v.usuario_id
         LEFT JOIN usuarios ua ON ua.id = v.anulada_por
         LEFT JOIN clientes c ON c.id = v.cliente_id
+        LEFT JOIN solicitudes_eliminar_venta se ON se.venta_uuid = v.uuid
         WHERE v.id = $1 AND v.deleted_at IS NULL
         "#,
     )
@@ -1665,6 +1736,10 @@ async fn obtener_detalle_venta(state: &AppState, args: &Value) -> Result<Value, 
         "total_devuelto":   v.get::<f64, _>("total_devuelto"),
         "caja":             v.get::<String, _>("caja"),
         "origen":           v.get::<String, _>("origen"),
+        // "Eliminar venta de prueba" pedida desde la web: pendiente hasta que
+        // el POS de escritorio la aplique; 'rechazada' trae el motivo.
+        "eliminacion_pendiente": v.get::<Option<String>, _>("eliminacion_estado").as_deref() == Some("pendiente"),
+        "eliminacion_error":     v.get::<Option<String>, _>("eliminacion_error"),
     }))
 }
 
@@ -2343,6 +2418,13 @@ async fn usuario_sesion_response(
     let es_admin = rol_es_admin(state, rol_id).await;
     let rol_nombre = rol_nombre_por_id(state, rol_id).await;
     let permisos = permisos_de_rol(state, rol_id).await;
+    // Permiso individual "eliminar venta de prueba" (migración 014).
+    let puede_eliminar_ventas: bool =
+        sqlx::query_scalar("SELECT puede_eliminar_ventas = 1 FROM usuarios WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&state.pool)
+            .await?
+            .unwrap_or(false);
 
     // Dispositivo real que mandó el frontend (vacío o el centinela = ninguno).
     let dispositivo = device_uuid.filter(|u| caja::es_dispositivo_real(u));
@@ -2378,6 +2460,7 @@ async fn usuario_sesion_response(
             "es_admin":        es_admin,
             "sesion_id":       chrono::Utc::now().timestamp(), // stateless: timestamp
             "permisos":        permisos,
+            "puede_eliminar_ventas": puede_eliminar_ventas,
         },
         // El frontend usa esta info para decidir si abrir el modal de bienvenida
         // y qué chip mostrar en el topbar. Si no hay device_uuid, queda
