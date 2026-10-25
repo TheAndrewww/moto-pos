@@ -26,3 +26,5 @@ mod caja_tests;
 mod stock_tests;
 #[cfg(test)]
 mod eliminar_ventas_tests;
+#[cfg(test)]
+mod proveedores_tests;

@@ -24,6 +24,7 @@ const MIGRATIONS: &[MigrationFn] = &[
     migracion_016_vendedor_ve_inventario,
     migracion_017_eliminar_ventas,
     migracion_018_cortes_web,
+    migracion_019_proveedor_sufca,
 ];
 
 pub fn aplicar_migraciones(conn: &Connection) -> Result<()> {
@@ -1230,5 +1231,20 @@ fn migracion_018_cortes_web(conn: &Connection) -> Result<()> {
         [FALTANTE_333],
     )?;
     conn.execute("DELETE FROM sync_suppress_flag", [])?;
+    Ok(())
+}
+
+// ─── Migración 019 ────────────────────────────────────────
+// Da de alta el proveedor SUFCA (artículos de ferretería), que el dueño pidió
+// y que no se podía capturar porque hasta ahora los proveedores solo nacían al
+// importar el catálogo. Se compara el nombre en mayúsculas igual que el
+// importador, para no duplicarlo si ya entró por una importación.
+fn migracion_019_proveedor_sufca(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "INSERT INTO proveedores (nombre, notas) \
+         SELECT 'SUFCA', 'Artículos de ferretería' \
+          WHERE NOT EXISTS (SELECT 1 FROM proveedores WHERE UPPER(TRIM(nombre)) = 'SUFCA')",
+        [],
+    )?;
     Ok(())
 }

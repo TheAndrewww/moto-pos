@@ -703,7 +703,9 @@ fn migracion_018_pide_el_corte_333_y_quita_su_faltante() {
         aplicar_migraciones(db).unwrap();
     };
     correr(&db);
-    assert_eq!(i64_de(&db, "PRAGMA user_version"), 18);
+    // ">= 18" y no "== 18": lo que importa es que la 018 ya corrió. Fijar el
+    // número exacto rompía esta prueba con cada migración nueva.
+    assert!(i64_de(&db, "PRAGMA user_version") >= 18, "la migración 018 debe haber corrido");
     assert_eq!(i64_de(&db, &format!("SELECT COUNT(*) FROM movimientos_caja WHERE uuid = '{FALTANTE_333}'")), 0);
     assert_eq!(i64_de(&db, "SELECT COUNT(*) FROM movimientos_caja"), 1, "el retiro de turno se queda");
     assert_eq!(inbox_motivo(&db, "cortes", CORTE_WEB_333), None, "sync inactivo: no se pide");
@@ -2167,13 +2169,15 @@ mod con_servidor_simulado {
     #[tokio::test]
     async fn push_quita_fks_de_filas_web_hasta_reparar() {
         let db = nueva_db();
-        db.execute("INSERT INTO proveedores (id, nombre, uuid) VALUES (1, 'Prov', ?1)", [hex(500)]).unwrap();
+        // id 90 y no 1: el 1 ya lo ocupa un proveedor de la semilla. Cualquier
+        // id sirve, aquí representa un id crudo del servidor.
+        db.execute("INSERT INTO proveedores (id, nombre, uuid) VALUES (90, 'Prov', ?1)", [hex(500)]).unwrap();
         // Producto web bajado por la versión vieja: categoria_id 2 = 'Accesorios'
         // en el SERVIDOR (aquí 2 es otra categoría).
         let pw = web(2000);
         db.execute(
             "INSERT INTO productos (id, codigo, nombre, categoria_id, proveedor_id, stock_actual, uuid, updated_at) \
-             VALUES (2, 'W1', 'Web', 2, 1, 5, ?1, '2026-10-06 09:00:00')",
+             VALUES (2, 'W1', 'Web', 2, 90, 5, ?1, '2026-10-06 09:00:00')",
             [&pw],
         ).unwrap();
         let (vw, hw, hd) = (web(2001), web(2002), hex(2003));

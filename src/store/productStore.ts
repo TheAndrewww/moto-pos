@@ -35,6 +35,24 @@ export interface Proveedor {
   telefono: string | null;
   email: string | null;
   notas: string | null;
+  activo?: boolean;
+}
+
+/**
+ * Proveedores para un menú de selección: esconde los desactivados en la página
+ * de Proveedores, pero deja visible el que ya está elegido — si un producto
+ * viejo apunta a un proveedor que se desactivó, su nombre debe seguir
+ * apareciendo en vez de dejar el campo en blanco.
+ *
+ * En el POS web `activo` llega sin valor (el RPC del servidor no lo manda), así
+ * que solo se esconde cuando dice false y nunca se vacía la lista por error.
+ */
+export function proveedoresParaSelect(
+  proveedores: Proveedor[],
+  seleccionado?: number | string | null,
+): Proveedor[] {
+  const id = seleccionado === '' || seleccionado == null ? null : Number(seleccionado);
+  return proveedores.filter(p => p.activo !== false || p.id === id);
 }
 
 export interface NuevoProducto {

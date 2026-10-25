@@ -9,6 +9,7 @@ import PuntoDeVenta from './PuntoDeVenta';
 import Catalogo from './Catalogo';
 import UsuariosPage from './Usuarios';
 import ClientesPage from './Clientes';
+import ProveedoresPage from './Proveedores';
 import Bitacora from './Bitacora';
 import Presupuestos from './Presupuestos';
 import RecepcionPage from './Recepcion';
@@ -23,10 +24,10 @@ import { useCortesStore, infoCajaDeRespuesta } from '../store/cortesStore';
 import {
   ShoppingCart, Package, BarChart3, LogOut, ClipboardList,
   TruckIcon, Tag, Users, ScrollText, DollarSign, History, Settings, UserPlus, TrendingUp,
-  Menu, X, Cloud,
+  Menu, X, Cloud, Building2,
 } from 'lucide-react';
 
-type Modulo = 'venta' | 'catalogo' | 'dashboard' | 'presupuestos' | 'recepcion' | 'pedidos' | 'etiquetas' | 'bitacora' | 'usuarios' | 'clientes' | 'cortes' | 'historial' | 'reportes' | 'ajustes' | 'sincronizacion';
+type Modulo = 'venta' | 'catalogo' | 'dashboard' | 'presupuestos' | 'recepcion' | 'pedidos' | 'etiquetas' | 'bitacora' | 'usuarios' | 'clientes' | 'proveedores' | 'cortes' | 'historial' | 'reportes' | 'ajustes' | 'sincronizacion';
 
 interface EstadisticasDia {
   total_ventas: number;
@@ -198,6 +199,9 @@ export default function Dashboard() {
     { id: 'historial', label: 'Historial Ventas', icon: <History size={18} />, key: 'F7', visible: tienePermiso('ventas', 'ver') },
     { id: 'bitacora', label: 'Bitácora', icon: <ScrollText size={18} />, key: 'F9', visible: esAdmin },
     { id: 'clientes', label: 'Clientes', icon: <UserPlus size={18} />, key: '', visible: tienePermiso('ventas', 'crear') },
+    // Solo en la PC (Tauri): el server-remoto no tiene los comandos de alta de
+    // proveedores, así que en el POS web el formulario fallaría.
+    { id: 'proveedores', label: 'Proveedores', icon: <Building2 size={18} />, key: '', visible: esAdmin && isTauri() },
     { id: 'usuarios', label: 'Usuarios', icon: <Users size={18} />, key: '', visible: esAdmin },
     { id: 'cortes', label: 'Cortes de Caja', icon: <DollarSign size={18} />, key: 'F11', visible: true },
     { id: 'reportes', label: 'Reportes', icon: <TrendingUp size={18} />, key: 'F10', visible: esAdmin },
@@ -460,6 +464,7 @@ export default function Dashboard() {
         {/* Módulos sin persistencia necesaria (renderizado condicional normal) */}
         {modulo === 'usuarios' && <UsuariosPage />}
         {modulo === 'clientes' && <ClientesPage />}
+        {modulo === 'proveedores' && <ProveedoresPage />}
         {modulo === 'dashboard' && (
           <DashboardHome stats={stats} fmt={fmt} stockBajo={stockBajoCount} onVerInventario={() => setModulo('catalogo')} />
         )}

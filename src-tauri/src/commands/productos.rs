@@ -718,6 +718,101 @@ pub fn listar_proveedores(state: State<'_, AppState>) -> Vec<Proveedor> {
     .collect()
 }
 
+// El importador de catálogo da de alta proveedores comparando el nombre en
+// mayúsculas (ver commands/importar.rs), así que aquí se usa el mismo criterio:
+// sin esto quedarían "Sufca" y "SUFCA" como dos proveedores distintos y las
+// compras del mismo negocio se partirían en dos.
+fn nombre_proveedor_ocupado(
+    db: &rusqlite::Connection,
+    nombre: &str,
+    excepto_id: Option<i64>,
+) -> Result<bool, String> {
+    db.query_row(
+        "SELECT COUNT(*) > 0 FROM proveedores \
+          WHERE UPPER(TRIM(nombre)) = UPPER(TRIM(?1)) AND id IS NOT ?2",
+        rusqlite::params![nombre, excepto_id],
+        |row| row.get(0),
+    ).map_err(|e| e.to_string())
+}
+
+pub fn crear_proveedor_core(
+    db: &rusqlite::Connection,
+    nombre: String,
+    contacto: Option<String>,
+    telefono: Option<String>,
+    email: Option<String>,
+    notas: Option<String>,
+) -> Result<Proveedor, String> {
+    let nombre = nombre.trim().to_string();
+    if nombre.is_empty() {
+        return Err("El nombre del proveedor es obligatorio".into());
+    }
+    if nombre_proveedor_ocupado(db, &nombre, None)? {
+        return Err(format!("Ya existe un proveedor llamado \"{nombre}\""));
+    }
+
+    db.execute(
+        "INSERT INTO proveedores (nombre, contacto, telefono, email, notas, activo) VALUES (?, ?, ?, ?, ?, 1)",
+        rusqlite::params![nombre, contacto, telefono, email, notas],
+    ).map_err(|e| e.to_string())?;
+
+    let id = db.last_insert_rowid();
+    Ok(Proveedor { id, nombre, contacto, telefono, email, notas, activo: true })
+}
+
+#[tauri::command]
+pub fn crear_proveedor(
+    nombre: String,
+    contacto: Option<String>,
+    telefono: Option<String>,
+    email: Option<String>,
+    notas: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<Proveedor, String> {
+    let db = state.db.lock().unwrap();
+    crear_proveedor_core(&db, nombre, contacto, telefono, email, notas)
+}
+
+pub fn actualizar_proveedor_core(
+    db: &rusqlite::Connection,
+    datos: ActualizarProveedor,
+) -> Result<bool, String> {
+    let nombre = datos.nombre.trim().to_string();
+    if nombre.is_empty() {
+        return Err("El nombre del proveedor es obligatorio".into());
+    }
+    if nombre_proveedor_ocupado(db, &nombre, Some(datos.id))? {
+        return Err(format!("Ya existe otro proveedor llamado \"{nombre}\""));
+    }
+
+    db.execute(
+        "UPDATE proveedores SET nombre = ?, contacto = ?, telefono = ?, email = ?, notas = ? WHERE id = ?",
+        rusqlite::params![
+            nombre, datos.contacto, datos.telefono, datos.email, datos.notas, datos.id
+        ],
+    ).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+#[tauri::command]
+pub fn actualizar_proveedor(
+    datos: ActualizarProveedor,
+    state: State<'_, AppState>,
+) -> Result<bool, String> {
+    let db = state.db.lock().unwrap();
+    actualizar_proveedor_core(&db, datos)
+}
+
+#[tauri::command]
+pub fn toggle_proveedor_activo(id: i64, state: State<'_, AppState>) -> Result<bool, String> {
+    let db = state.db.lock().unwrap();
+    db.execute(
+        "UPDATE proveedores SET activo = CASE activo WHEN 1 THEN 0 ELSE 1 END WHERE id = ?",
+        rusqlite::params![id],
+    ).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
 // ─── Comandos de Clientes ─────────────────────────────────
 
 #[tauri::command]

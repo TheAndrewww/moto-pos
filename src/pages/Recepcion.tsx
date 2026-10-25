@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { invoke } from '../lib/invokeCompat';
-import { useProductStore, type Producto } from '../store/productStore';
+import { useProductStore, proveedoresParaSelect, type Producto } from '../store/productStore';
 import { useAuthStore } from '../store/authStore';
 import { resolverCodigoEscaneado } from '../lib/codigoEscaneado';
 import ElegirProductoEscaneado from '../components/ElegirProductoEscaneado';
@@ -507,7 +507,8 @@ export default function Recepcion() {
                   onChange={e => setProveedorId(e.target.value ? Number(e.target.value) : '')}
                   disabled={!!ordenId}>
                   <option value="">Sin proveedor</option>
-                  {proveedores.map(p => <option key={p.id} value={p.id}>{p.nombre}</option>)}
+                  {proveedoresParaSelect(proveedores, proveedorId)
+                    .map(p => <option key={p.id} value={p.id}>{p.nombre}</option>)}
                 </select>
               </div>
 

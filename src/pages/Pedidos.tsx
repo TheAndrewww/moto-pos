@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useMemo } from 'react';
 import { invoke } from '../lib/invokeCompat';
-import { useProductStore, type Producto } from '../store/productStore';
+import { useProductStore, proveedoresParaSelect, type Producto } from '../store/productStore';
 import { useAuthStore } from '../store/authStore';
 import {
   ScrollText, Plus, X, Search, Eye, RefreshCw, Trash2,
@@ -189,7 +189,8 @@ export default function Pedidos() {
                     setProveedorId(nuevo);
                   }}>
                   <option value="">Seleccionar proveedor</option>
-                  {proveedores.map(p => <option key={p.id} value={p.id}>{p.nombre}</option>)}
+                  {proveedoresParaSelect(proveedores, proveedorId)
+                    .map(p => <option key={p.id} value={p.id}>{p.nombre}</option>)}
                 </select>
               </div>
               <div>

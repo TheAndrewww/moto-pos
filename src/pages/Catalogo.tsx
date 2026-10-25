@@ -2,7 +2,7 @@
 // Diseño modular con cards, filtros y formulario de alta/edición
 
 import { useState, useEffect, useRef } from 'react';
-import { useProductStore, type Producto, type NuevoProducto } from '../store/productStore';
+import { useProductStore, proveedoresParaSelect, type Producto, type NuevoProducto } from '../store/productStore';
 import { useAuthStore } from '../store/authStore';
 import { Package, Plus, Search, Edit2, X, AlertTriangle, Tag, Hash, LayoutGrid, List, Download, History, Trash2, SlidersHorizontal, Printer } from 'lucide-react';
 import { invoke } from '../lib/invokeCompat';
@@ -417,7 +417,8 @@ export default function Catalogo() {
                 <select className="input" value={form.proveedor_id}
                   onChange={e => setForm(f => ({ ...f, proveedor_id: e.target.value }))}>
                   <option value="">Sin proveedor</option>
-                  {proveedores.map(p => <option key={p.id} value={p.id}>{p.nombre}</option>)}
+                  {proveedoresParaSelect(proveedores, form.proveedor_id)
+                    .map(p => <option key={p.id} value={p.id}>{p.nombre}</option>)}
                 </select>
               </div>
             </div>
@@ -557,7 +558,8 @@ export default function Catalogo() {
             style={{ width: 150 }}
           >
             <option value="">Proveedores (Todos)</option>
-            {proveedores.map(p => <option key={p.id} value={p.id}>{p.nombre}</option>)}
+            {proveedoresParaSelect(proveedores, filtroProveedor)
+              .map(p => <option key={p.id} value={p.id}>{p.nombre}</option>)}
           </select>
           <select
             className={`input ${!showFiltrosMobile ? 'pos-hide-mobile' : ''}`}
