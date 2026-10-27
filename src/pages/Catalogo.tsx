@@ -8,6 +8,7 @@ import { Package, Plus, Search, Edit2, X, AlertTriangle, Tag, Hash, LayoutGrid, 
 import { invoke } from '../lib/invokeCompat';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { imprimirEtiquetas } from '../lib/imprimirEtiquetas';
+import { resolverCodigoEscaneado } from '../lib/codigoEscaneado';
 
 export default function Catalogo() {
   const {
@@ -27,6 +28,10 @@ export default function Catalogo() {
   const [showFiltrosMobile, setShowFiltrosMobile] = useState(false);
   const [vista, setVista] = useState<'grid' | 'lista'>('grid');
   const [localBusqueda, setLocalBusqueda] = useState(busqueda);
+  // Resultado de un escaneo (Enter en el buscador): los productos que
+  // corresponden al código leído, incluido el código largo de Alessia o el
+  // guion leído como apóstrofo. Se quita en cuanto se escribe en el buscador.
+  const [idsEscaneo, setIdsEscaneo] = useState<number[] | null>(null);
   const [confirmarEliminar, setConfirmarEliminar] = useState<Producto | null>(null);
   // Tras crear un producto nuevo, ofrecemos imprimir N etiquetas (N = stock
   // que se agregó). Si el usuario confirma, llamamos al motor de impresión
@@ -69,16 +74,24 @@ export default function Catalogo() {
 
   // Filtrar productos
   let listaFinal = productosFiltrados();
-  if (filtroCategoria) {
-    listaFinal = listaFinal.filter(p => p.categoria_id === filtroCategoria);
-  }
-  if (filtroProveedor) {
-    listaFinal = listaFinal.filter(p => p.proveedor_id === filtroProveedor);
-  }
-  if (filtroStock === 'bajo') {
-    listaFinal = listaFinal.filter(p => p.stock_actual <= p.stock_minimo && p.stock_actual > 0);
-  } else if (filtroStock === 'cero') {
-    listaFinal = listaFinal.filter(p => p.stock_actual <= 0);
+  if (idsEscaneo) {
+    // Lo escaneado se muestra aunque haya filtros puestos: se buscó esa pieza.
+    const todos = useProductStore.getState().productos;
+    listaFinal = idsEscaneo
+      .map(id => todos.find(p => p.id === id))
+      .filter((p): p is Producto => !!p);
+  } else {
+    if (filtroCategoria) {
+      listaFinal = listaFinal.filter(p => p.categoria_id === filtroCategoria);
+    }
+    if (filtroProveedor) {
+      listaFinal = listaFinal.filter(p => p.proveedor_id === filtroProveedor);
+    }
+    if (filtroStock === 'bajo') {
+      listaFinal = listaFinal.filter(p => p.stock_actual <= p.stock_minimo && p.stock_actual > 0);
+    } else if (filtroStock === 'cero') {
+      listaFinal = listaFinal.filter(p => p.stock_actual <= 0);
+    }
   }
 
   const fmt = (n: number) => `$${n.toFixed(2)}`;
@@ -518,8 +531,32 @@ export default function Catalogo() {
                 onChange={e => {
                   const v = e.target.value;
                   setLocalBusqueda(v);
+                  setIdsEscaneo(null);
                   if (debounceRef.current) clearTimeout(debounceRef.current);
                   debounceRef.current = setTimeout(() => setBusqueda(v), 150);
+                }}
+                onKeyDown={e => {
+                  // El lector termina cada código con Enter.
+                  if (e.key !== 'Enter') return;
+                  const raw = e.currentTarget.value;
+                  if (!raw.trim()) return;
+                  if (debounceRef.current) clearTimeout(debounceRef.current);
+                  const r = resolverCodigoEscaneado(raw, useProductStore.getState().productos);
+                  if (r.tipo === 'producto') {
+                    setIdsEscaneo([r.producto.id]);
+                    setLocalBusqueda(r.producto.codigo);
+                    setBusqueda('');
+                  } else if (r.tipo === 'varios') {
+                    setIdsEscaneo(r.candidatos.map(p => p.id));
+                    setLocalBusqueda(r.candidatos.map(p => p.codigo).join(' · '));
+                    setBusqueda('');
+                  } else {
+                    // No es un código conocido: búsqueda normal (con los
+                    // apóstrofos ya convertidos a guion).
+                    setIdsEscaneo(null);
+                    setLocalBusqueda(r.texto);
+                    setBusqueda(r.texto);
+                  }
                 }}
                 style={{ paddingLeft: 36, width: '100%' }}
               />
