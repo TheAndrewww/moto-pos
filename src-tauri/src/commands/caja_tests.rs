@@ -1201,3 +1201,69 @@ fn pc_nueva_sin_cortes_el_periodo_empieza_en_la_primera_apertura() {
     assert_eq!(a.resumen.dias_sin_cierre_count, 0);
     assert_eq!(a.resumen.impacto_total_estimado, 0.0);
 }
+
+// ─── PIN: solo en "Movimiento de caja → Retiro" ───────────
+// El dueño pidió que el corte (de turno o cierre) no pida PIN nunca; el PIN
+// del dueño queda solo para los retiros de caja de un empleado.
+
+const VENDEDOR: i64 = 2;
+
+fn alta_vendedor(db: &Connection) {
+    db.execute(
+        "INSERT INTO usuarios (id, nombre_completo, nombre_usuario, pin, password_hash, rol_id, activo) \
+         VALUES (2, 'Vendedor', 'vend', 'x', 'x', 2, 1)",
+        [],
+    ).unwrap();
+}
+
+#[test]
+fn corte_de_turno_de_vendedor_con_retiro_grande_no_pide_pin() {
+    let db = nueva_db();
+    alta_vendedor(&db);
+    abrir(&db, "2026-10-01 08:00:00", 2000.0, None).unwrap();
+    venta_efectivo(&db, "2026-10-01 10:00:00", 1000.0);
+
+    let datos = calcular_periodo(&db, "2026-10-01 14:00:00").unwrap();
+    let c = crear_corte_core(&db, NuevoCorte {
+        tipo: "PARCIAL".into(),
+        usuario_id: VENDEDOR,
+        fecha_inicio: datos.fecha_inicio.clone(),
+        fecha_fin: datos.fecha_fin.clone(),
+        datos,
+        efectivo_contado: 3000.0,
+        nota_diferencia: None,
+        fondo_siguiente: 3000.0,
+        denominaciones: None,
+        retiro: Some(RetiroCorte {
+            monto: 2500.0,
+            concepto: "Retiro por cambio de turno".into(),
+            pin_autorizacion: None,
+        }),
+    }, "2026-10-01 14:00:00").expect("el corte de turno ya no pide PIN");
+    assert_eq!(c.fondo_siguiente, 500.0);
+    let autorizado: Option<i64> = db.query_row(
+        "SELECT autorizado_por FROM movimientos_caja WHERE tipo = 'RETIRO' AND monto = 2500",
+        [], |r| r.get(0),
+    ).unwrap();
+    assert_eq!(autorizado, None);
+}
+
+#[test]
+fn movimiento_de_caja_pide_pin_solo_en_retiros() {
+    let db = nueva_db();
+    alta_vendedor(&db);
+    abrir(&db, "2026-10-01 08:00:00", 2000.0, None).unwrap();
+    let mov = |tipo: &str, monto: f64| crear_movimiento_core(&db, NuevoMovimiento {
+        tipo: tipo.into(),
+        usuario_id: VENDEDOR,
+        monto,
+        concepto: "prueba".into(),
+        autorizado_por: None,
+        pin_autorizacion: None,
+    }, "2026-10-01 10:00:00");
+
+    assert!(mov("ENTRADA", 900.0).is_ok(), "las entradas nunca piden PIN");
+    assert!(mov("RETIRO", 500.0).is_ok(), "retiro de hasta $500 sin PIN");
+    let e = mov("RETIRO", 600.0).unwrap_err();
+    assert!(e.contains("requieren PIN del dueño"), "{e}");
+}

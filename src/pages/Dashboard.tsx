@@ -199,9 +199,9 @@ export default function Dashboard() {
     { id: 'historial', label: 'Historial Ventas', icon: <History size={18} />, key: 'F7', visible: tienePermiso('ventas', 'ver') },
     { id: 'bitacora', label: 'Bitácora', icon: <ScrollText size={18} />, key: 'F9', visible: esAdmin },
     { id: 'clientes', label: 'Clientes', icon: <UserPlus size={18} />, key: '', visible: tienePermiso('ventas', 'crear') },
-    // Solo en la PC (Tauri): el server-remoto no tiene los comandos de alta de
-    // proveedores, así que en el POS web el formulario fallaría.
-    { id: 'proveedores', label: 'Proveedores', icon: <Building2 size={18} />, key: '', visible: esAdmin && isTauri() },
+    // Solo el dueño, en la PC y en la web (el servidor también da de alta y
+    // edita proveedores, y los baja a la PC en el siguiente sync).
+    { id: 'proveedores', label: 'Proveedores', icon: <Building2 size={18} />, key: '', visible: esAdmin },
     { id: 'usuarios', label: 'Usuarios', icon: <Users size={18} />, key: '', visible: esAdmin },
     { id: 'cortes', label: 'Cortes de Caja', icon: <DollarSign size={18} />, key: 'F11', visible: true },
     { id: 'reportes', label: 'Reportes', icon: <TrendingUp size={18} />, key: 'F10', visible: esAdmin },

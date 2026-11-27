@@ -1218,3 +1218,134 @@ async fn eliminar_venta_de_prueba_desde_la_web_se_borra_y_queda_pendiente() {
     sqlx::query("DELETE FROM solicitudes_eliminar_venta WHERE venta_uuid = $1").bind(&uuid_v).execute(&c.st.pool).await.unwrap();
     permiso(0).await;
 }
+
+// ─── Permisos de inventario y proveedores (2026-11-26) ──────────────────
+// El vendedor ve el inventario pero no lo modifica; solo da de alta un
+// producto nuevo desde Recepción, sin existencia. Los proveedores los da de
+// alta y renombra solo el dueño.
+
+#[tokio::test]
+async fn vendedor_ve_inventario_pero_solo_crea_desde_recepcion_sin_existencia() {
+    let Some(c) = ctx().await else { return };
+    let p = producto(&c, 10.0, 3.0).await;
+    let codigo_p: String = sqlx::query_scalar("SELECT codigo FROM productos WHERE id = $1")
+        .bind(p).fetch_one(&c.st.pool).await.unwrap();
+    let u = uuid::Uuid::now_v7().to_string();
+    let cod_nuevo = format!("REC-{}", &u[u.len() - 10..]);
+    let nuevo = |stock: f64| json!({"usuarioId": c.vendedor, "producto": {
+        "codigo": cod_nuevo, "nombre": "Pieza nueva de recepción", "precio_costo": 50.0,
+        "precio_venta": 80.0, "stock_actual": stock, "stock_minimo": 0.0}});
+
+    // Alta con existencia (la de Inventario) → no.
+    let e = rpc(&c, &c.tok_vendedor, "crear_producto", nuevo(5.0)).await.unwrap_err();
+    assert!(msg(e).contains("sin existencia"));
+    // Alta sin existencia (la de Recepción) → sí.
+    let creado = rpc(&c, &c.tok_vendedor, "crear_producto", nuevo(0.0)).await.unwrap();
+    let stock_nuevo: f64 = sqlx::query_scalar("SELECT stock_actual::float8 FROM productos WHERE id = $1")
+        .bind(creado["id"].as_i64().unwrap()).fetch_one(&c.st.pool).await.unwrap();
+    assert_eq!(stock_nuevo, 0.0);
+
+    // Editar, ajustar existencia y eliminar → 403, y nada cambia.
+    let e = rpc(&c, &c.tok_vendedor, "actualizar_producto", json!({"usuarioId": c.vendedor, "producto": {
+        "id": p, "codigo": codigo_p, "nombre": "cambiado por vendedor", "precio_costo": 1.0,
+        "precio_venta": 1.0, "stock_minimo": 0.0}})).await.unwrap_err();
+    assert!(matches!(e, ApiError::Forbidden), "{e:?}");
+    let e = rpc(&c, &c.tok_vendedor, "ajustar_stock",
+        json!({"productoId": p, "nuevoStock": 99.0, "motivo": "x", "usuarioId": c.vendedor}))
+        .await.unwrap_err();
+    assert!(matches!(e, ApiError::Forbidden), "{e:?}");
+    let e = rpc(&c, &c.tok_vendedor, "eliminar_producto",
+        json!({"productoId": p, "usuarioId": c.vendedor})).await.unwrap_err();
+    assert!(matches!(e, ApiError::Forbidden), "{e:?}");
+    let fila = sqlx::query("SELECT nombre, stock_actual::float8 AS s, deleted_at FROM productos WHERE id = $1")
+        .bind(p).fetch_one(&c.st.pool).await.unwrap();
+    assert_ne!(fila.get::<String, _>("nombre"), "cambiado por vendedor");
+    assert_eq!(fila.get::<f64, _>("s"), 3.0);
+    assert_eq!(fila.get::<Option<String>, _>("deleted_at"), None);
+
+    // Ver sí puede, y el dueño sigue pudiendo todo.
+    let lista = rpc(&c, &c.tok_vendedor, "listar_productos", json!({})).await.unwrap();
+    assert!(lista.as_array().unwrap().iter().any(|x| x["id"] == json!(p)));
+    rpc(&c, &c.tok_dueno, "ajustar_stock",
+        json!({"productoId": p, "nuevoStock": 4.0, "motivo": "conteo", "usuarioId": c.dueno}))
+        .await.unwrap();
+
+    // Los permisos que recibe la web al iniciar sesión ya no le dejan editar.
+    let permitido = |accion: &'static str| {
+        let pool = c.st.pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i32>(
+                "SELECT permitido FROM permisos WHERE rol_id = 2 AND modulo = 'inventario' AND accion = $1",
+            ).bind(accion).fetch_one(&pool).await.unwrap()
+        }
+    };
+    assert_eq!(permitido("ver").await, 1);
+    assert_eq!(permitido("crear").await, 0);
+    assert_eq!(permitido("editar").await, 0);
+    assert_eq!(permitido("eliminar").await, 0);
+}
+
+#[tokio::test]
+async fn proveedores_solo_el_dueno_los_da_de_alta_renombra_y_desactiva() {
+    let Some(c) = ctx().await else { return };
+    let u = uuid::Uuid::now_v7().to_string();
+    let nombre = format!("Prov prueba {}", &u[u.len() - 8..]);
+
+    let e = rpc(&c, &c.tok_vendedor, "crear_proveedor", json!({"nombre": nombre})).await.unwrap_err();
+    assert!(matches!(e, ApiError::Forbidden), "{e:?}");
+
+    let creado = rpc(&c, &c.tok_dueno, "crear_proveedor",
+        json!({"nombre": format!("  {nombre}  "), "contacto": "  ", "telefono": "462 000 0000"}))
+        .await.unwrap();
+    let id = creado["id"].as_i64().unwrap();
+    assert_eq!(creado["nombre"], json!(nombre), "sin espacios en los extremos");
+    assert_eq!(creado["contacto"], Value::Null, "texto vacío → NULL");
+    assert_eq!(creado["activo"], json!(true));
+
+    // El mismo nombre en otras mayúsculas → rechazado.
+    let e = rpc(&c, &c.tok_dueno, "crear_proveedor", json!({"nombre": nombre.to_uppercase()}))
+        .await.unwrap_err();
+    assert!(msg(e).contains("Ya existe"));
+
+    let uuid_p: String = sqlx::query_scalar("SELECT uuid FROM proveedores WHERE id = $1")
+        .bind(id).fetch_one(&c.st.pool).await.unwrap();
+    let cursores = |pool: sqlx::PgPool, uuid: String| async move {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*)::bigint FROM sync_cursor WHERE tabla = 'proveedores' AND uuid = $1",
+        ).bind(uuid).fetch_one(&pool).await.unwrap()
+    };
+    assert_eq!(cursores(c.st.pool.clone(), uuid_p.clone()).await, 1, "el alta baja a la PC");
+
+    // Renombrar: solo el dueño; baja a la PC y queda en la bitácora.
+    let nuevo_nombre = format!("{nombre} renombrado");
+    let renombrar = json!({"datos": {"id": id, "nombre": nuevo_nombre, "contacto": null,
+        "telefono": "462 111 1111", "email": null, "notas": null}});
+    let e = rpc(&c, &c.tok_vendedor, "actualizar_proveedor", renombrar.clone()).await.unwrap_err();
+    assert!(matches!(e, ApiError::Forbidden), "{e:?}");
+    rpc(&c, &c.tok_dueno, "actualizar_proveedor", renombrar).await.unwrap();
+    let guardado: String = sqlx::query_scalar("SELECT nombre FROM proveedores WHERE id = $1")
+        .bind(id).fetch_one(&c.st.pool).await.unwrap();
+    assert_eq!(guardado, nuevo_nombre);
+    assert_eq!(cursores(c.st.pool.clone(), uuid_p.clone()).await, 2);
+    let bitacora: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM audit_log WHERE tabla_afectada = 'proveedores' \
+         AND registro_id = $1 AND accion = 'PROVEEDOR_EDITADO' AND descripcion_legible LIKE '%→%'",
+    ).bind(id).fetch_one(&c.st.pool).await.unwrap();
+    assert_eq!(bitacora, 1);
+
+    // Renombrar a un nombre que ya usa otro proveedor → rechazado.
+    let otro = rpc(&c, &c.tok_dueno, "crear_proveedor", json!({"nombre": format!("{nombre} otro")}))
+        .await.unwrap();
+    let e = rpc(&c, &c.tok_dueno, "actualizar_proveedor",
+        json!({"datos": {"id": otro["id"], "nombre": nuevo_nombre.to_lowercase()}})).await.unwrap_err();
+    assert!(msg(e).contains("Ya existe otro"));
+
+    // Desactivar: la lista lo manda con activo = false (y se oculta en los menús).
+    let e = rpc(&c, &c.tok_vendedor, "toggle_proveedor_activo", json!({"id": id})).await.unwrap_err();
+    assert!(matches!(e, ApiError::Forbidden), "{e:?}");
+    rpc(&c, &c.tok_dueno, "toggle_proveedor_activo", json!({"id": id})).await.unwrap();
+    let lista = rpc(&c, &c.tok_vendedor, "listar_proveedores", json!({})).await.unwrap();
+    let fila = lista.as_array().unwrap().iter().find(|p| p["id"] == json!(id)).unwrap().clone();
+    assert_eq!(fila["activo"], json!(false));
+    assert_eq!(cursores(c.st.pool.clone(), uuid_p).await, 3);
+}

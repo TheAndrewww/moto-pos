@@ -44,8 +44,8 @@ export interface Proveedor {
  * viejo apunta a un proveedor que se desactivó, su nombre debe seguir
  * apareciendo en vez de dejar el campo en blanco.
  *
- * En el POS web `activo` llega sin valor (el RPC del servidor no lo manda), así
- * que solo se esconde cuando dice false y nunca se vacía la lista por error.
+ * Solo se esconde cuando `activo` dice false (un servidor viejo no lo manda):
+ * así nunca se vacía la lista por error.
  */
 export function proveedoresParaSelect(
   proveedores: Proveedor[],

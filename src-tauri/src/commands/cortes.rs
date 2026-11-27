@@ -171,6 +171,8 @@ pub struct DenominacionInput {
 pub struct RetiroCorte {
     pub monto: f64,
     pub concepto: String,
+    /// Ya no se usa: el corte no pide PIN. Se acepta por compatibilidad.
+    #[allow(dead_code)]
     pub pin_autorizacion: Option<String>,
 }
 
@@ -727,9 +729,10 @@ pub(crate) fn crear_corte_core(
                 if r.concepto.trim().is_empty() {
                     return Err("El concepto del retiro es obligatorio".to_string());
                 }
-                let autorizado = resolver_autorizacion_retiro(
-                    db, datos.usuario_id, monto, r.pin_autorizacion.as_deref(), None,
-                )?;
+                // Sin PIN: el dueño pidió que el corte no lo pida nunca. El
+                // PIN queda solo en "Movimiento de caja → Retiro".
+                // `pin_autorizacion` se acepta y se ignora (clientes viejos).
+                let autorizado: Option<i64> = None;
                 (round2(contado - monto), Some((monto, r.concepto.trim().to_string(), autorizado)))
             }
             _ => {

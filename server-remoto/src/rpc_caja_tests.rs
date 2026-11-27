@@ -551,22 +551,16 @@ async fn dia_sin_cerrar_no_pierde_ventas_y_la_apertura_documenta_el_faltante() {
 }
 
 #[tokio::test]
-async fn corte_de_turno_con_retiro_no_cuenta_doble_y_el_pin_de_vendedor_no_autoriza() {
+async fn corte_de_turno_con_retiro_no_cuenta_doble_y_no_pide_pin() {
     let Some(c) = ctx().await else { return };
     let (mut tx, p) = escenario(&c).await;
     abrir(&mut tx, &c, "2026-10-01 08:00:00", 2000.0, None).await.unwrap();
     venta_web(&mut tx, &c, p, "2026-10-01 10:00:00", 1000.0, "efectivo").await;
 
-    // Retiro grande hecho por un vendedor: sin PIN, o con el PIN de un
-    // vendedor, no se autoriza (y no se guarda nada).
+    // Retiro grande hecho por un vendedor SIN PIN: el corte ya no lo pide
+    // (el PIN queda solo en "Movimiento de caja → Retiro").
     let t = "2026-10-01 14:00:00";
-    let e = corte_con(&mut tx, c.vendedor, "PARCIAL", t, t, 3000.0, 3000.0, Some((2500.0, None))).await;
-    assert!(e.unwrap_err().contains("requieren PIN del dueño"));
-    let e = corte_con(&mut tx, c.vendedor, "PARCIAL", t, t, 3000.0, 3000.0, Some((2500.0, Some(PIN_VENDEDOR)))).await;
-    assert_eq!(e.unwrap_err(), "PIN del dueño incorrecto");
-    assert_eq!(escalar_i64(&mut tx, "SELECT COUNT(*)::bigint FROM cortes WHERE caja = 'web'").await, 0);
-
-    let k = corte_con(&mut tx, c.vendedor, "PARCIAL", t, t, 3000.0, 3000.0, Some((2500.0, Some(PIN_DUENO))))
+    let k = corte_con(&mut tx, c.vendedor, "PARCIAL", t, t, 3000.0, 3000.0, Some((2500.0, None)))
         .await
         .unwrap();
     assert_eq!(k.efectivo_esperado, 3000.0, "el retiro no altera el corte que lo origina");
@@ -579,7 +573,7 @@ async fn corte_de_turno_con_retiro_no_cuenta_doble_y_el_pin_de_vendedor_no_autor
     .await
     .unwrap();
     assert_eq!(r.get::<Option<i64>, _>("corte_id"), Some(k.id));
-    assert_eq!(r.get::<Option<i64>, _>("autorizado_por"), Some(c.dueno), "autoriza el dueño del PIN");
+    assert_eq!(r.get::<Option<i64>, _>("autorizado_por"), None, "sin PIN no hay quien autorice");
     assert_eq!(r.get::<i64, _>("usuario_id"), c.vendedor);
 
     venta_web(&mut tx, &c, p, "2026-10-01 16:00:00", 400.0, "efectivo").await;

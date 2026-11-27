@@ -63,8 +63,7 @@ const MULTIPLICADORES = [1.4, 1.5, 1.7] as const;
 type Vista = 'lista' | 'crear' | 'detalle';
 
 export default function Recepcion() {
-  const { productos, cargarTodo, proveedores } = useProductStore();
-  const { usuario } = useAuthStore();
+  const cargarTodo = useProductStore(s => s.cargarTodo);
 
   const [vista, setVista] = useState<Vista>('lista');
   const [recepciones, setRecepciones] = useState<RecepcionRow[]>([]);
@@ -97,471 +96,6 @@ export default function Recepcion() {
       setDetalle({ recep: r, items });
       setVista('detalle');
     } catch {}
-  };
-
-  // ─── Vista: CREAR ────────────────────────────────────────────
-
-  const VistaCrear = () => {
-    const [items, setItems] = useState<ItemForm[]>([]);
-    const [proveedorId, setProveedorId] = useState<number | ''>('');
-    const [ordenId, setOrdenId] = useState<number | ''>('');
-    const [ordenes, setOrdenes] = useState<OrdenPedido[]>([]);
-    const [notas, setNotas] = useState('');
-    const [guardando, setGuardando] = useState(false);
-    const [error, setError] = useState('');
-    const [flash, setFlash] = useState<{ nombre: string; cantidad: number } | null>(null);
-    const [buscarTexto, setBuscarTexto] = useState('');
-    // Escaneo que contiene varios códigos del inventario: se pregunta cuál es.
-    const [eleccionEscaneo, setEleccionEscaneo] = useState<{ escaneado: string; candidatos: Producto[] } | null>(null);
-    const [showCartMobile, setShowCartMobile] = useState(false);
-    const scanRef = useRef<HTMLInputElement>(null);
-
-    // Cargar órdenes enviadas / parciales
-    useEffect(() => {
-      (async () => {
-        try {
-          const enviadas = await invoke<OrdenPedido[]>('listar_ordenes_pedido', { estadoFiltro: 'enviada' });
-          const parciales = await invoke<OrdenPedido[]>('listar_ordenes_pedido', { estadoFiltro: 'recibida_parcial' });
-          setOrdenes([...enviadas, ...parciales]);
-        } catch {}
-      })();
-    }, []);
-
-    // Foco permanente en escaneo
-    useEffect(() => {
-      scanRef.current?.focus();
-    }, [items.length]);
-
-    // Al elegir orden: cargar detalle y pre-llenar items con cantidad pendiente
-    const cargarOrden = async (oid: number) => {
-      try {
-        const detalleOrden = await invoke<OrdenDetalle[]>('obtener_detalle_orden', { ordenId: oid });
-        const orden = ordenes.find(o => o.id === oid);
-        const nuevosItems: ItemForm[] = [];
-        for (const d of detalleOrden) {
-          const pendiente = Math.max(0, d.cantidad_pedida - d.cantidad_recibida);
-          if (pendiente <= 0) continue;
-          const prod = productos.find(p => p.id === d.producto_id);
-          if (!prod) continue;
-          nuevosItems.push({
-            producto: prod,
-            cantidad: pendiente,
-            precio_costo: d.precio_costo,
-            precio_venta: prod.precio_venta,    // sugerencia: precio actual
-            pedido_cantidad: pendiente,
-          });
-        }
-        setItems(nuevosItems);
-        // Auto-seleccionar proveedor de la orden
-        if (orden?.proveedor_nombre) {
-          const prov = proveedores.find(p => p.nombre === orden.proveedor_nombre);
-          if (prov) setProveedorId(prov.id);
-        }
-      } catch {}
-    };
-
-    const buscarResultados = useMemo(() => {
-      if (buscarTexto.length < 2) return [];
-      const q = buscarTexto.toLowerCase();
-      return productos.filter(p =>
-        p.nombre.toLowerCase().includes(q) ||
-        p.codigo.toLowerCase().includes(q)
-      ).slice(0, 15);
-    }, [buscarTexto, productos]);
-
-    const agregarProducto = useCallback((prod: Producto, cantidad = 1) => {
-      setItems(prev => {
-        const idx = prev.findIndex(i => i.producto.id === prod.id);
-        if (idx >= 0) {
-          const n = [...prev];
-          n[idx] = { ...n[idx], cantidad: n[idx].cantidad + cantidad };
-          return n;
-        }
-        return [...prev, {
-          producto: prod,
-          cantidad,
-          precio_costo: prod.precio_costo,
-          precio_venta: prod.precio_venta,    // default = precio actual (no cambia hasta que el usuario lo modifique)
-        }];
-      });
-      setFlash({ nombre: prod.nombre, cantidad });
-      setTimeout(() => setFlash(null), 1200);
-    }, []);
-
-
-    const totalCosto = items.reduce((a, i) => a + i.cantidad * i.precio_costo, 0);
-    const totalUnidades = items.reduce((a, i) => a + i.cantidad, 0);
-
-    const handleSubmit = async () => {
-      if (!usuario) return;
-      if (items.length === 0) return setError('Agrega al menos un producto');
-      setGuardando(true); setError('');
-      try {
-        await invoke('crear_recepcion', {
-          recepcion: {
-            usuario_id: usuario.id,
-            proveedor_id: proveedorId || null,
-            orden_id: ordenId || null,
-            notas: notas || null,
-            items: items.map(i => ({
-              producto_id: i.producto.id,
-              cantidad: i.cantidad,
-              precio_costo: i.precio_costo,
-              // Solo mandamos precio_venta si:
-              //   1. tiene costo (no se aplica a productos con costo 0 — regla del dueño)
-              //   2. el usuario lo modificó respecto al precio actual del producto
-              // Así no sobrescribimos accidentalmente productos legacy sin costo.
-              precio_venta:
-                i.precio_costo > 0 && i.precio_venta > 0 && i.precio_venta !== i.producto.precio_venta
-                  ? Math.ceil(i.precio_venta)   // garantía: siempre entero hacia arriba
-                  : null,
-            })),
-          },
-        });
-        await cargarDatos();
-        await cargarTodo();
-        setVista('lista');
-      } catch (err: any) {
-        setError(err?.toString() || 'Error al guardar recepción');
-      }
-      setGuardando(false);
-    };
-
-    return (
-      <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
-        {eleccionEscaneo && (
-          <ElegirProductoEscaneado
-            escaneado={eleccionEscaneo.escaneado}
-            candidatos={eleccionEscaneo.candidatos}
-            onElegir={(p) => {
-              agregarProducto(p);
-              setEleccionEscaneo(null);
-              setTimeout(() => scanRef.current?.focus(), 50);
-            }}
-            onCancelar={() => {
-              setEleccionEscaneo(null);
-              setTimeout(() => scanRef.current?.focus(), 50);
-            }}
-          />
-        )}
-        <div className="recepcion-subheader" style={{
-          padding: '10px 20px', borderBottom: '1px solid var(--color-border)',
-          background: 'var(--color-surface)', display: 'flex', alignItems: 'center', gap: 10,
-        }}>
-          <button className="btn btn-ghost btn-sm" onClick={() => setVista('lista')}>
-            <ArrowLeft size={16} /> Volver
-          </button>
-          <TruckIcon size={18} style={{ color: 'var(--color-primary)' }} />
-          <h2 style={{ fontSize: 16, fontWeight: 800 }}>Nueva Recepción</h2>
-          {ordenId && (
-            <span style={{
-              fontSize: 11, fontWeight: 700, padding: '3px 10px', borderRadius: 10,
-              background: 'rgba(108,117,246,0.12)', color: '#6c75f6',
-              display: 'flex', alignItems: 'center', gap: 4,
-            }}>
-              <ClipboardList size={11} /> Contra pedido #{ordenId}
-            </span>
-          )}
-        </div>
-
-        <div className="pos-pdv-grid" style={{ flex: 1, display: 'grid', gridTemplateColumns: '1fr 380px', minHeight: 0 }}>
-          {/* Izquierda — escaneo + lista */}
-          <div className="recepcion-col-left" style={{ display: 'flex', flexDirection: 'column', minHeight: 0, borderRight: '1px solid var(--color-border)' }}>
-            {/* Omni-Search */}
-            <div style={{ padding: '12px 16px', borderBottom: '1px solid var(--color-border)', background: 'var(--color-surface)', position: 'relative' }}>
-              <div style={{ display: 'flex', gap: 8 }}>
-                <div style={{ position: 'relative', flex: 1 }}>
-                  <Search size={16} style={{ position: 'absolute', left: 12, top: '50%', transform: 'translateY(-50%)', color: 'var(--color-text-dim)' }} />
-                  <input
-                    ref={scanRef}
-                    className="input mono"
-                    placeholder="Escanear o buscar..."
-                    value={buscarTexto}
-                    onChange={e => setBuscarTexto(e.target.value)}
-                    onKeyDown={e => {
-                      if (e.key === 'Enter') {
-                        const code = buscarTexto.trim();
-                        if (!code) return;
-                        // Código exacto, guion leído como apóstrofo o código del
-                        // inventario dentro de un código largo de proveedor (Alessia).
-                        const r = resolverCodigoEscaneado(buscarTexto, productos);
-                        if (r.tipo === 'producto') {
-                          agregarProducto(r.producto);
-                          setBuscarTexto('');
-                        } else if (r.tipo === 'varios') {
-                          setEleccionEscaneo({ escaneado: code, candidatos: r.candidatos });
-                          setBuscarTexto('');
-                        } else {
-                          setError(`Código no encontrado: ${r.texto}`);
-                          setTimeout(() => setError(''), 2500);
-                        }
-                      }
-                    }}
-                    style={{ paddingLeft: 36, paddingRight: 12, fontSize: 16, width: '100%' }}
-                    autoFocus
-                  />
-                </div>
-                <button
-                  className="btn btn-secondary"
-                  title="Escanear QR / Código usando la cámara"
-                  style={{ width: 44, padding: 0, flexShrink: 0, justifyContent: 'center' }}
-                  onClick={() => alert('Función de cámara no implementada en este demo. Esta acción abriría la cámara del dispositivo móvil.')}
-                >
-                  <QrCode size={20} />
-                </button>
-              </div>
-
-              {flash && (
-                <div style={{
-                  marginTop: 8, padding: '6px 10px', borderRadius: 6,
-                  background: 'rgba(34,179,120,0.15)', color: '#22b378',
-                  fontSize: 13, fontWeight: 600, textAlign: 'center',
-                  animation: 'fade-in 0.15s ease',
-                }}>
-                  + {flash.cantidad} · {flash.nombre}
-                </div>
-              )}
-              {error && !flash && (
-                <div style={{
-                  marginTop: 8, padding: '6px 10px', borderRadius: 6,
-                  background: 'rgba(220,53,69,0.12)', color: 'var(--color-danger)',
-                  fontSize: 12, textAlign: 'center',
-                }}>
-                  {error}
-                </div>
-              )}
-
-              {/* Sugerencias de búsqueda manual */}
-              {buscarResultados.length > 0 && buscarTexto.length >= 2 && !productos.find(p => p.codigo === buscarTexto.trim()) && (
-                <div className="card" style={{
-                  position: 'absolute', top: '100%', left: 16, right: 16, zIndex: 30,
-                  maxHeight: 300, overflow: 'auto', padding: 0, marginTop: 4,
-                  boxShadow: '0 8px 32px rgba(0,0,0,0.15)'
-                }}>
-                  {buscarResultados.map(p => (
-                    <button key={p.id}
-                      onClick={() => { agregarProducto(p); setBuscarTexto(''); scanRef.current?.focus(); }}
-                      style={{
-                        display: 'flex', justifyContent: 'space-between', width: '100%',
-                        padding: '10px 14px', border: 'none', background: 'transparent',
-                        color: 'var(--color-text)', cursor: 'pointer',
-                        borderBottom: '1px solid var(--color-border)',
-                        textAlign: 'left', fontSize: 13,
-                      }}
-                      onMouseEnter={e => (e.currentTarget.style.background = 'var(--color-surface-2)')}
-                      onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
-                    >
-                      <span style={{ fontWeight: 600 }}>{p.nombre}</span>
-                      <span className="mono" style={{ fontSize: 11, color: 'var(--color-text-dim)', textAlign: 'right' }}>{p.codigo}</span>
-                    </button>
-                  ))}
-                </div>
-              )}
-            </div>
-
-            {/* Lista de items escaneados */}
-            <div style={{ flex: 1, overflow: 'auto' }}>
-              {items.length === 0 ? (
-                <div style={{ padding: 40, textAlign: 'center', color: 'var(--color-text-dim)' }}>
-                  <PackagePlus size={48} strokeWidth={1.2} style={{ marginBottom: 12 }} />
-                  <p style={{ fontSize: 14, fontWeight: 600 }}>Escanea o busca productos para registrarlos</p>
-                  <p style={{ fontSize: 12 }}>Los productos se sumarán al stock cuando confirmes</p>
-                </div>
-              ) : (
-                <div style={{ display: 'flex', flexDirection: 'column' }}>
-                  {items.map((item, idx) => {
-                    const excede = item.pedido_cantidad !== undefined && item.cantidad > item.pedido_cantidad;
-                    const sinCosto = item.precio_costo <= 0;
-                    const aplicarMultiplicador = (factor: number) => {
-                      const n = [...items];
-                      n[idx] = { ...n[idx], precio_venta: Math.ceil(n[idx].precio_costo * factor) };
-                      setItems(n);
-                    };
-                    return (
-                      <div key={idx} className="recepcion-mobile-item" style={{
-                         padding: '12px 16px', borderBottom: '1px solid var(--color-border)', background: 'var(--color-surface)',
-                         display: 'flex', flexDirection: 'column', gap: 10
-                      }}>
-                        {/* Fila superior: Producto */}
-                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
-                           <div>
-                             <div style={{ fontWeight: 700, fontSize: 13, lineHeight: '1.3' }}>{item.producto.nombre}</div>
-                             <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 4 }}>
-                               <span className="mono" style={{ fontSize: 11, color: 'var(--color-text-dim)' }}>{item.producto.codigo}</span>
-                               <span style={{ fontSize: 10, fontWeight: 700, padding: '1px 6px', borderRadius: 8, background: item.producto.stock_actual <= item.producto.stock_minimo ? 'rgba(239, 68, 68, 0.15)' : 'rgba(148, 163, 184, 0.15)', color: item.producto.stock_actual <= item.producto.stock_minimo ? 'var(--color-danger)' : 'var(--color-text-muted)' }}>Stock: {item.producto.stock_actual}</span>
-                               {ordenId && <span className="mono" style={{ fontSize: 10, padding: '1px 6px', borderRadius: 8, background: 'rgba(108,117,246,0.12)', color: '#6c75f6', fontWeight: 600 }}>Pedido: {item.pedido_cantidad ?? '—'}</span>}
-                             </div>
-                           </div>
-                           <button className="btn btn-ghost btn-sm" style={{ padding: '6px', color: 'var(--color-danger)', marginLeft: 8 }} onClick={() => setItems(items.filter((_, i) => i !== idx))}>
-                             <Trash2 size={16} />
-                           </button>
-                        </div>
-                        
-                        {/* Fila Inferior: Controles */}
-                        <div style={{ display: 'flex', gap: '8px 12px', flexWrap: 'wrap', alignItems: 'flex-end' }}>
-                           
-                           {/* Cantidad */}
-                           <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                             <span style={{ fontSize: 10, fontWeight: 600, color: 'var(--color-text-muted)', textTransform: 'uppercase' }}>Cant.</span>
-                             <div style={{ display: 'flex', alignItems: 'center', background: 'var(--color-surface-2)', borderRadius: 6, padding: 2, border: '1px solid var(--color-border)' }}>
-                                <button className="btn btn-ghost btn-sm" style={{ padding: '6px', height: 'auto', borderRadius: 4 }} onClick={() => { const n = [...items]; const c = Math.max(1, n[idx].cantidad - 1); n[idx] = { ...n[idx], cantidad: c }; setItems(n); }}><Minus size={14} /></button>
-                                <input className="input mono" type="number" min={1} value={item.cantidad} style={{ width: 44, padding: 0, textAlign: 'center', fontSize: 14, background: 'transparent', border: 'none', fontWeight: 700 }} onChange={e => { const n = [...items]; n[idx] = { ...n[idx], cantidad: Number(e.target.value) || 1 }; setItems(n); }} />
-                                <button className="btn btn-ghost btn-sm" style={{ padding: '6px', height: 'auto', borderRadius: 4 }} onClick={() => { const n = [...items]; n[idx] = { ...n[idx], cantidad: n[idx].cantidad + 1 }; setItems(n); }}><PlusIcon size={14} /></button>
-                             </div>
-                           </div>
-
-                           {/* Costo */}
-                           <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                             <span style={{ fontSize: 10, fontWeight: 600, color: 'var(--color-text-muted)', textTransform: 'uppercase' }}>Costo U.</span>
-                             <div style={{ padding: 2, background: 'var(--color-surface)', borderRadius: 6, border: '1px solid var(--color-border)' }}>
-                               <input className="input mono" type="number" step="0.01" value={item.precio_costo} style={{ width: 70, padding: '6px', textAlign: 'right', fontSize: 13, border: 'none', background: 'transparent' }} onChange={e => { const n = [...items]; n[idx] = { ...n[idx], precio_costo: Number(e.target.value) || 0 }; setItems(n); }} />
-                             </div>
-                           </div>
-
-                           {/* Venta con Multiplicador en Select */}
-                           <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                               <span style={{ fontSize: 10, fontWeight: 600, color: 'var(--color-text-muted)', textTransform: 'uppercase' }}>Venta</span>
-                               <span style={{ fontSize: 9, color: 'var(--color-text-dim)' }}>${item.producto.precio_venta.toFixed(2)}</span>
-                             </div>
-                             <div style={{ display: 'flex', background: 'var(--color-surface)', borderRadius: 6, border: '1px solid var(--color-border)', overflow: 'hidden' }}>
-                               <input className="input mono" type="number" step="1" min={0} value={item.precio_venta} style={{ width: 66, padding: '6px', textAlign: 'right', fontSize: 13, border: 'none', background: 'transparent', borderRadius: 0 }} onChange={e => { const v = parseFloat(e.target.value); const entero = isNaN(v) ? 0 : Math.ceil(v); const n = [...items]; n[idx] = { ...n[idx], precio_venta: entero }; setItems(n); }} />
-                               <select 
-                                 disabled={sinCosto}
-                                 className="mono" 
-                                 title="Aplicar multiplicador de costo"
-                                 style={{ padding: '0 4px', border: 'none', borderLeft: '1px solid var(--color-border)', background: 'var(--color-surface-2)', width: 44, fontSize: 11, fontWeight: 700, color: 'var(--color-text)', cursor: sinCosto ? 'not-allowed' : 'pointer' }}
-                                 onChange={(e) => { 
-                                   if(e.target.value) aplicarMultiplicador(Number(e.target.value)); 
-                                   e.target.value = ''; 
-                                 }}
-                               >
-                                  <option value="">×?</option>
-                                  {MULTIPLICADORES.map(m => <option key={m} value={m}>×{m}</option>)}
-                               </select>
-                             </div>
-                           </div>
-
-                           {/* Totales */}
-                           <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginLeft: 'auto', textAlign: 'right' }}>
-                             <span style={{ fontSize: 10, fontWeight: 600, textTransform: 'uppercase', color: excede ? 'var(--color-warning)' : 'var(--color-text-dim)' }}>{excede ? 'Excede Pedido' : 'Subtotal'}</span>
-                             <span className="mono" style={{ fontSize: 15, fontWeight: 800, color: 'var(--color-primary)', padding: '4px 0' }}>{fmt(item.cantidad * item.precio_costo)}</span>
-                           </div>
-
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
-          </div>
-
-          {/* Derecha — resumen / metadatos */}
-          <div className={`pos-pdv-cart${showCartMobile ? ' open' : ''}`} style={{ display: 'flex', flexDirection: 'column', background: 'var(--color-surface)', minHeight: 0, minWidth: 0 }}>
-            {/* Header móvil con botón cerrar (sólo se ve en mobile via CSS) */}
-            <button
-              onClick={() => setShowCartMobile(false)}
-              aria-label="Cerrar confirmación"
-              className="pos-cart-close"
-              style={{
-                display: 'none', alignItems: 'center', gap: 8, padding: '10px 14px',
-                background: 'var(--color-surface-2)', border: 'none', borderBottom: '1px solid var(--color-border)',
-                cursor: 'pointer', fontSize: 14, fontWeight: 700, color: 'var(--color-text)',
-                justifyContent: 'space-between', width: '100%',
-              }}
-            >
-              <span>Confirmar Recepción</span>
-              <X size={18} />
-            </button>
-            <div style={{ padding: '14px 16px', display: 'flex', flexDirection: 'column', gap: 12, flex: 1, overflow: 'auto' }}>
-              <div>
-                <label style={labelStyle}>RECIBIR CONTRA PEDIDO (OPCIONAL)</label>
-                <select className="input" value={ordenId}
-                  onChange={e => {
-                    const val = e.target.value ? Number(e.target.value) : '';
-                    if (items.length > 0 && val !== ordenId) {
-                      if (!confirm('Cambiar el pedido vinculado reemplazará los items actuales. ¿Continuar?')) return;
-                      setItems([]);
-                    }
-                    setOrdenId(val);
-                    if (val) cargarOrden(val);
-                  }}>
-                  <option value="">Recepción libre (sin pedido previo)</option>
-                  {ordenes.map(o => (
-                    <option key={o.id} value={o.id}>
-                      #{o.id} · {o.proveedor_nombre || 'Sin proveedor'} · {o.total_items} items
-                    </option>
-                  ))}
-                </select>
-                {ordenId && (
-                  <p style={{ fontSize: 11, color: 'var(--color-text-dim)', marginTop: 4 }}>
-                    Las cantidades pendientes se pre-llenaron. Al confirmar, se marcará el pedido como recibido (total o parcial).
-                  </p>
-                )}
-              </div>
-
-              <div>
-                <label style={labelStyle}>PROVEEDOR</label>
-                <select className="input" value={proveedorId}
-                  onChange={e => setProveedorId(e.target.value ? Number(e.target.value) : '')}
-                  disabled={!!ordenId}>
-                  <option value="">Sin proveedor</option>
-                  {proveedoresParaSelect(proveedores, proveedorId)
-                    .map(p => <option key={p.id} value={p.id}>{p.nombre}</option>)}
-                </select>
-              </div>
-
-              <div>
-                <label style={labelStyle}>NOTAS (FACTURA, REMISIÓN…)</label>
-                <input className="input" placeholder="Ej. Factura #123 - 15 cajas" value={notas} onChange={e => setNotas(e.target.value)} />
-              </div>
-
-              {/* Totales */}
-              <div style={{ marginTop: 'auto', display: 'flex', flexDirection: 'column', gap: 6, padding: 12, background: 'var(--color-surface-2)', borderRadius: 8 }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12 }}>
-                  <span style={{ color: 'var(--color-text-muted)' }}>Productos</span>
-                  <span className="mono" style={{ fontWeight: 700 }}>{items.length}</span>
-                </div>
-                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12 }}>
-                  <span style={{ color: 'var(--color-text-muted)' }}>Unidades totales</span>
-                  <span className="mono" style={{ fontWeight: 700 }}>{totalUnidades}</span>
-                </div>
-                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 14, fontWeight: 700, marginTop: 4, paddingTop: 6, borderTop: '1px solid var(--color-border)' }}>
-                  <span style={{ color: 'var(--color-text-muted)' }}>Costo total</span>
-                  <span className="mono" style={{ color: 'var(--color-primary)', fontSize: 17 }}>{fmt(totalCosto)}</span>
-                </div>
-              </div>
-            </div>
-
-            {error && !flash && (
-              <p style={{ color: 'var(--color-danger)', fontSize: 12, padding: '0 16px 8px' }}>{error}</p>
-            )}
-
-            <div style={{ padding: '12px 16px', borderTop: '1px solid var(--color-border)' }}>
-              <button className="btn btn-success btn-lg" style={{ width: '100%', justifyContent: 'center' }}
-                disabled={guardando || items.length === 0} onClick={handleSubmit}>
-                <PackagePlus size={16} />
-                {guardando ? 'Guardando…' : `Confirmar Recepción (${totalUnidades} uds)`}
-              </button>
-            </div>
-          </div>
-        </div>
-
-        {/* ─── FAB para Revisar y Confirmar en Móvil ─── */}
-        <button
-          className="pos-fab pos-show-mobile-flex"
-          style={{ position: 'fixed', bottom: 20, right: 20, zIndex: 80 }}
-          onClick={() => setShowCartMobile(true)}
-          title="Revisar y Confirmar"
-        >
-          <PackagePlus size={24} />
-          {items.length > 0 && (
-            <span className="pos-fab-badge">{items.length}</span>
-          )}
-        </button>
-      </div>
-    );
   };
 
   // ─── Vista: DETALLE ──────────────────────────────────────────
@@ -640,7 +174,7 @@ export default function Recepcion() {
 
   // ─── Vista: LISTA ────────────────────────────────────────────
 
-  if (vista === 'crear') return <VistaCrear />;
+  if (vista === 'crear') return <NuevaRecepcion onVolver={() => setVista('lista')} onGuardada={cargarDatos} />;
   if (vista === 'detalle') return <VistaDetalle />;
 
   return (
@@ -733,6 +267,722 @@ export default function Recepcion() {
 }
 
 // ─── helpers ────────────────────────────────────────────────
+
+// ─── Vista: NUEVA RECEPCIÓN ────────────────────────────────────
+//
+// Componente de módulo (no definido dentro de `Recepcion`): si se definiera
+// adentro, cada cambio del store de productos (crear un producto nuevo, una
+// venta en otra pestaña, recargar el catálogo) crearía un componente nuevo y
+// React borraría lo ya escaneado.
+
+function NuevaRecepcion({ onVolver, onGuardada }: {
+  onVolver: () => void;
+  onGuardada: () => Promise<void>;
+}) {
+  const { productos, cargarTodo, proveedores } = useProductStore();
+  const { usuario } = useAuthStore();
+  const fmt = (n: number) => `$${n.toFixed(2)}`;
+
+  const [items, setItems] = useState<ItemForm[]>([]);
+  const [proveedorId, setProveedorId] = useState<number | ''>('');
+  const [ordenId, setOrdenId] = useState<number | ''>('');
+  const [ordenes, setOrdenes] = useState<OrdenPedido[]>([]);
+  const [notas, setNotas] = useState('');
+  const [guardando, setGuardando] = useState(false);
+  const [error, setError] = useState('');
+  const [flash, setFlash] = useState<{ nombre: string; cantidad: number } | null>(null);
+  const [buscarTexto, setBuscarTexto] = useState('');
+  // Escaneo que contiene varios códigos del inventario: se pregunta cuál es.
+  const [eleccionEscaneo, setEleccionEscaneo] = useState<{ escaneado: string; candidatos: Producto[] } | null>(null);
+  const [showCartMobile, setShowCartMobile] = useState(false);
+  // Código escaneado que no está en el inventario (se ofrece darlo de alta).
+  const [noEncontrado, setNoEncontrado] = useState<string | null>(null);
+  // Formulario de producto nuevo abierto ('' = abierto con el botón).
+  const [altaProducto, setAltaProducto] = useState<{ escaneado: string } | null>(null);
+  const scanRef = useRef<HTMLInputElement>(null);
+
+  // Cargar órdenes enviadas / parciales
+  useEffect(() => {
+    (async () => {
+      try {
+        const enviadas = await invoke<OrdenPedido[]>('listar_ordenes_pedido', { estadoFiltro: 'enviada' });
+        const parciales = await invoke<OrdenPedido[]>('listar_ordenes_pedido', { estadoFiltro: 'recibida_parcial' });
+        setOrdenes([...enviadas, ...parciales]);
+      } catch {}
+    })();
+  }, []);
+
+  // Foco permanente en escaneo
+  useEffect(() => {
+    scanRef.current?.focus();
+  }, [items.length]);
+
+  // Al elegir orden: cargar detalle y pre-llenar items con cantidad pendiente
+  const cargarOrden = async (oid: number) => {
+    try {
+      const detalleOrden = await invoke<OrdenDetalle[]>('obtener_detalle_orden', { ordenId: oid });
+      const orden = ordenes.find(o => o.id === oid);
+      const nuevosItems: ItemForm[] = [];
+      for (const d of detalleOrden) {
+        const pendiente = Math.max(0, d.cantidad_pedida - d.cantidad_recibida);
+        if (pendiente <= 0) continue;
+        const prod = productos.find(p => p.id === d.producto_id);
+        if (!prod) continue;
+        nuevosItems.push({
+          producto: prod,
+          cantidad: pendiente,
+          precio_costo: d.precio_costo,
+          precio_venta: prod.precio_venta,    // sugerencia: precio actual
+          pedido_cantidad: pendiente,
+        });
+      }
+      setItems(nuevosItems);
+      // Auto-seleccionar proveedor de la orden
+      if (orden?.proveedor_nombre) {
+        const prov = proveedores.find(p => p.nombre === orden.proveedor_nombre);
+        if (prov) setProveedorId(prov.id);
+      }
+    } catch {}
+  };
+
+  const buscarResultados = useMemo(() => {
+    if (buscarTexto.length < 2) return [];
+    const q = buscarTexto.toLowerCase();
+    return productos.filter(p =>
+      p.nombre.toLowerCase().includes(q) ||
+      p.codigo.toLowerCase().includes(q)
+    ).slice(0, 15);
+  }, [buscarTexto, productos]);
+
+  const agregarProducto = useCallback((prod: Producto, cantidad = 1) => {
+    setItems(prev => {
+      const idx = prev.findIndex(i => i.producto.id === prod.id);
+      if (idx >= 0) {
+        const n = [...prev];
+        n[idx] = { ...n[idx], cantidad: n[idx].cantidad + cantidad };
+        return n;
+      }
+      return [...prev, {
+        producto: prod,
+        cantidad,
+        precio_costo: prod.precio_costo,
+        precio_venta: prod.precio_venta,    // default = precio actual (no cambia hasta que el usuario lo modifique)
+      }];
+    });
+    setFlash({ nombre: prod.nombre, cantidad });
+    setTimeout(() => setFlash(null), 1200);
+  }, []);
+
+
+  const totalCosto = items.reduce((a, i) => a + i.cantidad * i.precio_costo, 0);
+  const totalUnidades = items.reduce((a, i) => a + i.cantidad, 0);
+
+  const handleSubmit = async () => {
+    if (!usuario) return;
+    if (items.length === 0) return setError('Agrega al menos un producto');
+    setGuardando(true); setError('');
+    try {
+      await invoke('crear_recepcion', {
+        recepcion: {
+          usuario_id: usuario.id,
+          proveedor_id: proveedorId || null,
+          orden_id: ordenId || null,
+          notas: notas || null,
+          items: items.map(i => ({
+            producto_id: i.producto.id,
+            cantidad: i.cantidad,
+            precio_costo: i.precio_costo,
+            // Solo mandamos precio_venta si:
+            //   1. tiene costo (no se aplica a productos con costo 0 — regla del dueño)
+            //   2. el usuario lo modificó respecto al precio actual del producto
+            // Así no sobrescribimos accidentalmente productos legacy sin costo.
+            precio_venta:
+              i.precio_costo > 0 && i.precio_venta > 0 && i.precio_venta !== i.producto.precio_venta
+                ? Math.ceil(i.precio_venta)   // garantía: siempre entero hacia arriba
+                : null,
+          })),
+        },
+      });
+      await onGuardada();
+      await cargarTodo();
+      onVolver();
+    } catch (err: any) {
+      setError(err?.toString() || 'Error al guardar recepción');
+    }
+    setGuardando(false);
+  };
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
+      {altaProducto && (
+        <ModalProductoNuevo
+          escaneado={altaProducto.escaneado}
+          proveedorInicial={proveedorId}
+          onCancelar={() => {
+            setAltaProducto(null);
+            setTimeout(() => scanRef.current?.focus(), 50);
+          }}
+          onCreado={(p, cantidad) => {
+            agregarProducto(p, cantidad);
+            setAltaProducto(null);
+            setNoEncontrado(null);
+            setTimeout(() => scanRef.current?.focus(), 50);
+          }}
+        />
+      )}
+      {eleccionEscaneo && (
+        <ElegirProductoEscaneado
+          escaneado={eleccionEscaneo.escaneado}
+          candidatos={eleccionEscaneo.candidatos}
+          onElegir={(p) => {
+            agregarProducto(p);
+            setEleccionEscaneo(null);
+            setTimeout(() => scanRef.current?.focus(), 50);
+          }}
+          onCancelar={() => {
+            setEleccionEscaneo(null);
+            setTimeout(() => scanRef.current?.focus(), 50);
+          }}
+        />
+      )}
+      <div className="recepcion-subheader" style={{
+        padding: '10px 20px', borderBottom: '1px solid var(--color-border)',
+        background: 'var(--color-surface)', display: 'flex', alignItems: 'center', gap: 10,
+      }}>
+        <button className="btn btn-ghost btn-sm" onClick={() => onVolver()}>
+          <ArrowLeft size={16} /> Volver
+        </button>
+        <TruckIcon size={18} style={{ color: 'var(--color-primary)' }} />
+        <h2 style={{ fontSize: 16, fontWeight: 800 }}>Nueva Recepción</h2>
+        {ordenId && (
+          <span style={{
+            fontSize: 11, fontWeight: 700, padding: '3px 10px', borderRadius: 10,
+            background: 'rgba(108,117,246,0.12)', color: '#6c75f6',
+            display: 'flex', alignItems: 'center', gap: 4,
+          }}>
+            <ClipboardList size={11} /> Contra pedido #{ordenId}
+          </span>
+        )}
+      </div>
+
+      <div className="pos-pdv-grid" style={{ flex: 1, display: 'grid', gridTemplateColumns: '1fr 380px', minHeight: 0 }}>
+        {/* Izquierda — escaneo + lista */}
+        <div className="recepcion-col-left" style={{ display: 'flex', flexDirection: 'column', minHeight: 0, borderRight: '1px solid var(--color-border)' }}>
+          {/* Omni-Search */}
+          <div style={{ padding: '12px 16px', borderBottom: '1px solid var(--color-border)', background: 'var(--color-surface)', position: 'relative' }}>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <div style={{ position: 'relative', flex: 1 }}>
+                <Search size={16} style={{ position: 'absolute', left: 12, top: '50%', transform: 'translateY(-50%)', color: 'var(--color-text-dim)' }} />
+                <input
+                  ref={scanRef}
+                  className="input mono"
+                  placeholder="Escanear o buscar..."
+                  value={buscarTexto}
+                  onChange={e => { setBuscarTexto(e.target.value); setNoEncontrado(null); }}
+                  onKeyDown={e => {
+                    if (e.key === 'Enter') {
+                      const code = buscarTexto.trim();
+                      if (!code) return;
+                      setNoEncontrado(null);
+                      // Código exacto, guion leído como apóstrofo o código del
+                      // inventario dentro de un código largo de proveedor (Alessia).
+                      const r = resolverCodigoEscaneado(buscarTexto, productos);
+                      if (r.tipo === 'producto') {
+                        agregarProducto(r.producto);
+                        setBuscarTexto('');
+                      } else if (r.tipo === 'varios') {
+                        setEleccionEscaneo({ escaneado: code, candidatos: r.candidatos });
+                        setBuscarTexto('');
+                      } else {
+                        // No existe: se ofrece darlo de alta aquí mismo.
+                        setNoEncontrado(r.texto);
+                        setBuscarTexto('');
+                      }
+                    }
+                  }}
+                  style={{ paddingLeft: 36, paddingRight: 12, fontSize: 16, width: '100%' }}
+                  autoFocus
+                />
+              </div>
+              <button
+                className="btn btn-secondary"
+                title="Dar de alta una pieza que no está en el inventario"
+                style={{ flexShrink: 0, gap: 6 }}
+                onClick={() => setAltaProducto({ escaneado: '' })}
+              >
+                <Plus size={16} /> Nuevo
+              </button>
+              <button
+                className="btn btn-secondary"
+                title="Escanear QR / Código usando la cámara"
+                style={{ width: 44, padding: 0, flexShrink: 0, justifyContent: 'center' }}
+                onClick={() => alert('Función de cámara no implementada en este demo. Esta acción abriría la cámara del dispositivo móvil.')}
+              >
+                <QrCode size={20} />
+              </button>
+            </div>
+
+            {flash && (
+              <div style={{
+                marginTop: 8, padding: '6px 10px', borderRadius: 6,
+                background: 'rgba(34,179,120,0.15)', color: '#22b378',
+                fontSize: 13, fontWeight: 600, textAlign: 'center',
+                animation: 'fade-in 0.15s ease',
+              }}>
+                + {flash.cantidad} · {flash.nombre}
+              </div>
+            )}
+            {error && !flash && (
+              <div style={{
+                marginTop: 8, padding: '6px 10px', borderRadius: 6,
+                background: 'rgba(220,53,69,0.12)', color: 'var(--color-danger)',
+                fontSize: 12, textAlign: 'center',
+              }}>
+                {error}
+              </div>
+            )}
+            {noEncontrado && !flash && (
+              <div style={{
+                marginTop: 8, padding: '8px 10px', borderRadius: 6,
+                background: 'rgba(220,53,69,0.10)', border: '1px solid rgba(220,53,69,0.25)',
+                display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap',
+              }}>
+                <span style={{ fontSize: 12, color: 'var(--color-danger)', flex: 1, minWidth: 160, wordBreak: 'break-word' }}>
+                  No está en el inventario: <strong className="mono">{noEncontrado}</strong>
+                </span>
+                <button className="btn btn-primary btn-sm" style={{ gap: 4 }}
+                  onClick={() => setAltaProducto({ escaneado: noEncontrado })}>
+                  <Plus size={14} /> Crear producto nuevo
+                </button>
+                <button className="btn btn-ghost btn-sm" aria-label="Descartar"
+                  onClick={() => { setNoEncontrado(null); scanRef.current?.focus(); }}>
+                  <X size={14} />
+                </button>
+              </div>
+            )}
+
+            {/* Sugerencias de búsqueda manual */}
+            {buscarResultados.length > 0 && buscarTexto.length >= 2 && !productos.find(p => p.codigo === buscarTexto.trim()) && (
+              <div className="card" style={{
+                position: 'absolute', top: '100%', left: 16, right: 16, zIndex: 30,
+                maxHeight: 300, overflow: 'auto', padding: 0, marginTop: 4,
+                boxShadow: '0 8px 32px rgba(0,0,0,0.15)'
+              }}>
+                {buscarResultados.map(p => (
+                  <button key={p.id}
+                    onClick={() => { agregarProducto(p); setBuscarTexto(''); scanRef.current?.focus(); }}
+                    style={{
+                      display: 'flex', justifyContent: 'space-between', width: '100%',
+                      padding: '10px 14px', border: 'none', background: 'transparent',
+                      color: 'var(--color-text)', cursor: 'pointer',
+                      borderBottom: '1px solid var(--color-border)',
+                      textAlign: 'left', fontSize: 13,
+                    }}
+                    onMouseEnter={e => (e.currentTarget.style.background = 'var(--color-surface-2)')}
+                    onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
+                  >
+                    <span style={{ fontWeight: 600 }}>{p.nombre}</span>
+                    <span className="mono" style={{ fontSize: 11, color: 'var(--color-text-dim)', textAlign: 'right' }}>{p.codigo}</span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Lista de items escaneados */}
+          <div style={{ flex: 1, overflow: 'auto' }}>
+            {items.length === 0 ? (
+              <div style={{ padding: 40, textAlign: 'center', color: 'var(--color-text-dim)' }}>
+                <PackagePlus size={48} strokeWidth={1.2} style={{ marginBottom: 12 }} />
+                <p style={{ fontSize: 14, fontWeight: 600 }}>Escanea o busca productos para registrarlos</p>
+                <p style={{ fontSize: 12 }}>Los productos se sumarán al stock cuando confirmes</p>
+              </div>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column' }}>
+                {items.map((item, idx) => {
+                  const excede = item.pedido_cantidad !== undefined && item.cantidad > item.pedido_cantidad;
+                  const sinCosto = item.precio_costo <= 0;
+                  const aplicarMultiplicador = (factor: number) => {
+                    const n = [...items];
+                    n[idx] = { ...n[idx], precio_venta: Math.ceil(n[idx].precio_costo * factor) };
+                    setItems(n);
+                  };
+                  return (
+                    <div key={idx} className="recepcion-mobile-item" style={{
+                       padding: '12px 16px', borderBottom: '1px solid var(--color-border)', background: 'var(--color-surface)',
+                       display: 'flex', flexDirection: 'column', gap: 10
+                    }}>
+                      {/* Fila superior: Producto */}
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+                         <div>
+                           <div style={{ fontWeight: 700, fontSize: 13, lineHeight: '1.3' }}>{item.producto.nombre}</div>
+                           <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 4 }}>
+                             <span className="mono" style={{ fontSize: 11, color: 'var(--color-text-dim)' }}>{item.producto.codigo}</span>
+                             <span style={{ fontSize: 10, fontWeight: 700, padding: '1px 6px', borderRadius: 8, background: item.producto.stock_actual <= item.producto.stock_minimo ? 'rgba(239, 68, 68, 0.15)' : 'rgba(148, 163, 184, 0.15)', color: item.producto.stock_actual <= item.producto.stock_minimo ? 'var(--color-danger)' : 'var(--color-text-muted)' }}>Stock: {item.producto.stock_actual}</span>
+                             {ordenId && <span className="mono" style={{ fontSize: 10, padding: '1px 6px', borderRadius: 8, background: 'rgba(108,117,246,0.12)', color: '#6c75f6', fontWeight: 600 }}>Pedido: {item.pedido_cantidad ?? '—'}</span>}
+                           </div>
+                         </div>
+                         <button className="btn btn-ghost btn-sm" style={{ padding: '6px', color: 'var(--color-danger)', marginLeft: 8 }} onClick={() => setItems(items.filter((_, i) => i !== idx))}>
+                           <Trash2 size={16} />
+                         </button>
+                      </div>
+                      
+                      {/* Fila Inferior: Controles */}
+                      <div style={{ display: 'flex', gap: '8px 12px', flexWrap: 'wrap', alignItems: 'flex-end' }}>
+                         
+                         {/* Cantidad */}
+                         <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                           <span style={{ fontSize: 10, fontWeight: 600, color: 'var(--color-text-muted)', textTransform: 'uppercase' }}>Cant.</span>
+                           <div style={{ display: 'flex', alignItems: 'center', background: 'var(--color-surface-2)', borderRadius: 6, padding: 2, border: '1px solid var(--color-border)' }}>
+                              <button className="btn btn-ghost btn-sm" style={{ padding: '6px', height: 'auto', borderRadius: 4 }} onClick={() => { const n = [...items]; const c = Math.max(1, n[idx].cantidad - 1); n[idx] = { ...n[idx], cantidad: c }; setItems(n); }}><Minus size={14} /></button>
+                              <input className="input mono" type="number" min={1} value={item.cantidad} style={{ width: 44, padding: 0, textAlign: 'center', fontSize: 14, background: 'transparent', border: 'none', fontWeight: 700 }} onChange={e => { const n = [...items]; n[idx] = { ...n[idx], cantidad: Number(e.target.value) || 1 }; setItems(n); }} />
+                              <button className="btn btn-ghost btn-sm" style={{ padding: '6px', height: 'auto', borderRadius: 4 }} onClick={() => { const n = [...items]; n[idx] = { ...n[idx], cantidad: n[idx].cantidad + 1 }; setItems(n); }}><PlusIcon size={14} /></button>
+                           </div>
+                         </div>
+
+                         {/* Costo */}
+                         <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                           <span style={{ fontSize: 10, fontWeight: 600, color: 'var(--color-text-muted)', textTransform: 'uppercase' }}>Costo U.</span>
+                           <div style={{ padding: 2, background: 'var(--color-surface)', borderRadius: 6, border: '1px solid var(--color-border)' }}>
+                             <input className="input mono" type="number" step="0.01" value={item.precio_costo} style={{ width: 70, padding: '6px', textAlign: 'right', fontSize: 13, border: 'none', background: 'transparent' }} onChange={e => { const n = [...items]; n[idx] = { ...n[idx], precio_costo: Number(e.target.value) || 0 }; setItems(n); }} />
+                           </div>
+                         </div>
+
+                         {/* Venta con Multiplicador en Select */}
+                         <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                             <span style={{ fontSize: 10, fontWeight: 600, color: 'var(--color-text-muted)', textTransform: 'uppercase' }}>Venta</span>
+                             <span style={{ fontSize: 9, color: 'var(--color-text-dim)' }}>${item.producto.precio_venta.toFixed(2)}</span>
+                           </div>
+                           <div style={{ display: 'flex', background: 'var(--color-surface)', borderRadius: 6, border: '1px solid var(--color-border)', overflow: 'hidden' }}>
+                             <input className="input mono" type="number" step="1" min={0} value={item.precio_venta} style={{ width: 66, padding: '6px', textAlign: 'right', fontSize: 13, border: 'none', background: 'transparent', borderRadius: 0 }} onChange={e => { const v = parseFloat(e.target.value); const entero = isNaN(v) ? 0 : Math.ceil(v); const n = [...items]; n[idx] = { ...n[idx], precio_venta: entero }; setItems(n); }} />
+                             <select 
+                               disabled={sinCosto}
+                               className="mono" 
+                               title="Aplicar multiplicador de costo"
+                               style={{ padding: '0 4px', border: 'none', borderLeft: '1px solid var(--color-border)', background: 'var(--color-surface-2)', width: 44, fontSize: 11, fontWeight: 700, color: 'var(--color-text)', cursor: sinCosto ? 'not-allowed' : 'pointer' }}
+                               onChange={(e) => { 
+                                 if(e.target.value) aplicarMultiplicador(Number(e.target.value)); 
+                                 e.target.value = ''; 
+                               }}
+                             >
+                                <option value="">×?</option>
+                                {MULTIPLICADORES.map(m => <option key={m} value={m}>×{m}</option>)}
+                             </select>
+                           </div>
+                         </div>
+
+                         {/* Totales */}
+                         <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginLeft: 'auto', textAlign: 'right' }}>
+                           <span style={{ fontSize: 10, fontWeight: 600, textTransform: 'uppercase', color: excede ? 'var(--color-warning)' : 'var(--color-text-dim)' }}>{excede ? 'Excede Pedido' : 'Subtotal'}</span>
+                           <span className="mono" style={{ fontSize: 15, fontWeight: 800, color: 'var(--color-primary)', padding: '4px 0' }}>{fmt(item.cantidad * item.precio_costo)}</span>
+                         </div>
+
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Derecha — resumen / metadatos */}
+        <div className={`pos-pdv-cart${showCartMobile ? ' open' : ''}`} style={{ display: 'flex', flexDirection: 'column', background: 'var(--color-surface)', minHeight: 0, minWidth: 0 }}>
+          {/* Header móvil con botón cerrar (sólo se ve en mobile via CSS) */}
+          <button
+            onClick={() => setShowCartMobile(false)}
+            aria-label="Cerrar confirmación"
+            className="pos-cart-close"
+            style={{
+              display: 'none', alignItems: 'center', gap: 8, padding: '10px 14px',
+              background: 'var(--color-surface-2)', border: 'none', borderBottom: '1px solid var(--color-border)',
+              cursor: 'pointer', fontSize: 14, fontWeight: 700, color: 'var(--color-text)',
+              justifyContent: 'space-between', width: '100%',
+            }}
+          >
+            <span>Confirmar Recepción</span>
+            <X size={18} />
+          </button>
+          <div style={{ padding: '14px 16px', display: 'flex', flexDirection: 'column', gap: 12, flex: 1, overflow: 'auto' }}>
+            <div>
+              <label style={labelStyle}>RECIBIR CONTRA PEDIDO (OPCIONAL)</label>
+              <select className="input" value={ordenId}
+                onChange={e => {
+                  const val = e.target.value ? Number(e.target.value) : '';
+                  if (items.length > 0 && val !== ordenId) {
+                    if (!confirm('Cambiar el pedido vinculado reemplazará los items actuales. ¿Continuar?')) return;
+                    setItems([]);
+                  }
+                  setOrdenId(val);
+                  if (val) cargarOrden(val);
+                }}>
+                <option value="">Recepción libre (sin pedido previo)</option>
+                {ordenes.map(o => (
+                  <option key={o.id} value={o.id}>
+                    #{o.id} · {o.proveedor_nombre || 'Sin proveedor'} · {o.total_items} items
+                  </option>
+                ))}
+              </select>
+              {ordenId && (
+                <p style={{ fontSize: 11, color: 'var(--color-text-dim)', marginTop: 4 }}>
+                  Las cantidades pendientes se pre-llenaron. Al confirmar, se marcará el pedido como recibido (total o parcial).
+                </p>
+              )}
+            </div>
+
+            <div>
+              <label style={labelStyle}>PROVEEDOR</label>
+              <select className="input" value={proveedorId}
+                onChange={e => setProveedorId(e.target.value ? Number(e.target.value) : '')}
+                disabled={!!ordenId}>
+                <option value="">Sin proveedor</option>
+                {proveedoresParaSelect(proveedores, proveedorId)
+                  .map(p => <option key={p.id} value={p.id}>{p.nombre}</option>)}
+              </select>
+            </div>
+
+            <div>
+              <label style={labelStyle}>NOTAS (FACTURA, REMISIÓN…)</label>
+              <input className="input" placeholder="Ej. Factura #123 - 15 cajas" value={notas} onChange={e => setNotas(e.target.value)} />
+            </div>
+
+            {/* Totales */}
+            <div style={{ marginTop: 'auto', display: 'flex', flexDirection: 'column', gap: 6, padding: 12, background: 'var(--color-surface-2)', borderRadius: 8 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12 }}>
+                <span style={{ color: 'var(--color-text-muted)' }}>Productos</span>
+                <span className="mono" style={{ fontWeight: 700 }}>{items.length}</span>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12 }}>
+                <span style={{ color: 'var(--color-text-muted)' }}>Unidades totales</span>
+                <span className="mono" style={{ fontWeight: 700 }}>{totalUnidades}</span>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 14, fontWeight: 700, marginTop: 4, paddingTop: 6, borderTop: '1px solid var(--color-border)' }}>
+                <span style={{ color: 'var(--color-text-muted)' }}>Costo total</span>
+                <span className="mono" style={{ color: 'var(--color-primary)', fontSize: 17 }}>{fmt(totalCosto)}</span>
+              </div>
+            </div>
+          </div>
+
+          {error && !flash && (
+            <p style={{ color: 'var(--color-danger)', fontSize: 12, padding: '0 16px 8px' }}>{error}</p>
+          )}
+
+          <div style={{ padding: '12px 16px', borderTop: '1px solid var(--color-border)' }}>
+            <button className="btn btn-success btn-lg" style={{ width: '100%', justifyContent: 'center' }}
+              disabled={guardando || items.length === 0} onClick={handleSubmit}>
+              <PackagePlus size={16} />
+              {guardando ? 'Guardando…' : `Confirmar Recepción (${totalUnidades} uds)`}
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* ─── FAB para Revisar y Confirmar en Móvil ─── */}
+      <button
+        className="pos-fab pos-show-mobile-flex"
+        style={{ position: 'fixed', bottom: 20, right: 20, zIndex: 80 }}
+        onClick={() => setShowCartMobile(true)}
+        title="Revisar y Confirmar"
+      >
+        <PackagePlus size={24} />
+        {items.length > 0 && (
+          <span className="pos-fab-badge">{items.length}</span>
+        )}
+      </button>
+    </div>
+  );
+}
+
+// ─── Producto nuevo desde Recepción ───────────────────────────
+//
+// Para la pieza que llega y todavía no existe en el inventario. Se crea SIN
+// existencia y entra a esta recepción con la cantidad que llegó: al confirmar,
+// la recepción suma la existencia y queda el registro (quién, cuándo, costo).
+// Así el vendedor da de alta lo que recibe aunque no pueda modificar el
+// Inventario (el servidor solo le deja crear desde aquí y con existencia 0).
+
+function ModalProductoNuevo({ escaneado, proveedorInicial, onCancelar, onCreado }: {
+  /** Lo que se escaneó y no se encontró ('' si se abrió con el botón). */
+  escaneado: string;
+  proveedorInicial: number | '';
+  onCancelar: () => void;
+  onCreado: (producto: Producto, cantidad: number) => void;
+}) {
+  const { categorias, proveedores, productos, crearProducto } = useProductStore();
+  const { usuario } = useAuthStore();
+
+  // Un código largo de proveedor (con espacios, p.ej. Alessia) no sirve como
+  // código: se muestra para que capturen solo la clave del producto.
+  const escaneadoLargo = escaneado.includes(' ');
+  const [nombre, setNombre] = useState('');
+  const [codigo, setCodigo] = useState(escaneadoLargo ? '' : escaneado);
+  const [codigoBarras, setCodigoBarras] = useState('');
+  const [categoriaId, setCategoriaId] = useState<number | ''>('');
+  const [proveedorId, setProveedorId] = useState<number | ''>(proveedorInicial);
+  const [costo, setCosto] = useState('');
+  const [venta, setVenta] = useState('');
+  const [stockMinimo, setStockMinimo] = useState('');
+  const [cantidad, setCantidad] = useState('1');
+  const [guardando, setGuardando] = useState(false);
+  const [error, setError] = useState('');
+
+  const costoNum = parseFloat(costo) || 0;
+  const ventaNum = Math.ceil(parseFloat(venta) || 0);   // regla del dueño: entero hacia arriba
+  const cantidadNum = parseFloat(cantidad) || 0;
+
+  const guardar = async () => {
+    if (!usuario || guardando) return;
+    const cod = codigo.trim();
+    if (!nombre.trim()) return setError('El nombre es obligatorio');
+    if (cod.includes(' ')) return setError('El código no lleva espacios: captura solo la clave del producto');
+    const repetido = cod && productos.find(p => p.codigo.toLowerCase() === cod.toLowerCase());
+    if (repetido) return setError(`Ya existe "${repetido.nombre}" con el código ${repetido.codigo}`);
+    if (costoNum < 0) return setError('El costo no puede ser negativo');
+    if (ventaNum <= 0) return setError('Captura el precio de venta');
+    if (cantidadNum <= 0) return setError('La cantidad que llegó debe ser mayor a 0');
+
+    setGuardando(true);
+    setError('');
+    try {
+      const creado = await crearProducto({
+        nombre: nombre.trim(),
+        codigo: cod || undefined,
+        descripcion: codigoBarras.trim() || undefined,
+        categoria_id: categoriaId || undefined,
+        proveedor_id: proveedorId || undefined,
+        precio_costo: costoNum,
+        precio_venta: ventaNum,
+        stock_actual: 0,   // la existencia la suma la recepción al confirmar
+        stock_minimo: parseFloat(stockMinimo) || 0,
+      }, usuario.id);
+      onCreado(creado, cantidadNum);
+    } catch (err: any) {
+      setError(err?.toString() || 'No se pudo crear el producto');
+      setGuardando(false);
+    }
+  };
+
+  const alEnter = (e: React.KeyboardEvent) => { if (e.key === 'Enter') { e.preventDefault(); guardar(); } };
+
+  return (
+    <div className="pos-modal-overlay" style={{
+      position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.55)',
+      display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 200,
+    }} onClick={onCancelar}>
+      <div className="card pos-modal-content animate-fade-in" style={{ width: 520, maxWidth: '100%', maxHeight: '90vh', overflow: 'auto', padding: 22 }}
+        onClick={e => e.stopPropagation()}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 4 }}>
+          <PackagePlus size={18} style={{ color: 'var(--color-primary)' }} />
+          <h3 style={{ fontSize: 16, fontWeight: 800, flex: 1 }}>Producto nuevo</h3>
+          <button className="btn btn-ghost btn-sm" onClick={onCancelar} aria-label="Cerrar"><X size={16} /></button>
+        </div>
+        <p style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 16 }}>
+          Se da de alta en el inventario y se agrega a esta recepción. La existencia se suma al confirmar la recepción.
+        </p>
+
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+          <div>
+            <label style={labelStyle}>Nombre *</label>
+            <input className="input" style={{ width: '100%' }} value={nombre} autoFocus
+              onChange={e => setNombre(e.target.value)} onKeyDown={alEnter}
+              placeholder="Ej. Balata delantera Italika FT150" />
+          </div>
+
+          <div className="pos-2col-grid" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+            <div>
+              <label style={labelStyle}>Código (vacío = MR-XXXXX)</label>
+              <input className="input mono" style={{ width: '100%' }} value={codigo}
+                onChange={e => setCodigo(e.target.value)} onKeyDown={alEnter}
+                placeholder="Escanear o escribir" />
+              {escaneadoLargo && (
+                <p style={{ fontSize: 11, color: 'var(--color-text-dim)', marginTop: 4, wordBreak: 'break-word' }}>
+                  Se escaneó: <span className="mono">{escaneado}</span>. Escribe solo la clave del producto.
+                </p>
+              )}
+            </div>
+            <div>
+              <label style={labelStyle}>Código de barras</label>
+              <input className="input mono" style={{ width: '100%' }} value={codigoBarras}
+                onChange={e => setCodigoBarras(e.target.value)} onKeyDown={alEnter}
+                placeholder="Opcional" />
+            </div>
+          </div>
+
+          <div className="pos-2col-grid" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+            <div>
+              <label style={labelStyle}>Categoría</label>
+              <select className="input" style={{ width: '100%' }} value={categoriaId}
+                onChange={e => setCategoriaId(e.target.value ? Number(e.target.value) : '')}>
+                <option value="">Sin categoría</option>
+                {categorias.map(c => <option key={c.id} value={c.id}>{c.nombre}</option>)}
+              </select>
+            </div>
+            <div>
+              <label style={labelStyle}>Proveedor</label>
+              <select className="input" style={{ width: '100%' }} value={proveedorId}
+                onChange={e => setProveedorId(e.target.value ? Number(e.target.value) : '')}>
+                <option value="">Sin proveedor</option>
+                {proveedoresParaSelect(proveedores, proveedorId)
+                  .map(p => <option key={p.id} value={p.id}>{p.nombre}</option>)}
+              </select>
+            </div>
+          </div>
+
+          <div style={{ background: 'var(--color-surface-2)', padding: 12, borderRadius: 10, display: 'flex', flexDirection: 'column', gap: 10 }}>
+            <div className="pos-2col-grid" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+              <div>
+                <label style={labelStyle}>Costo unitario</label>
+                <input className="input mono" style={{ width: '100%' }} type="number" step="0.01" min={0}
+                  value={costo} onChange={e => setCosto(e.target.value)} onKeyDown={alEnter} placeholder="$0.00" />
+              </div>
+              <div>
+                <label style={{ ...labelStyle, color: 'var(--color-primary)' }}>Precio de venta *</label>
+                <input className="input mono" style={{ width: '100%' }} type="number" step="1" min={0}
+                  value={venta} onChange={e => setVenta(e.target.value)} onKeyDown={alEnter} placeholder="$0" />
+              </div>
+            </div>
+            {/* Multiplicadores: venta = ceil(costo × factor); solo con costo. */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+              <span style={{ fontSize: 11, color: 'var(--color-text-muted)', fontWeight: 600 }}>Calcular venta:</span>
+              {MULTIPLICADORES.map(m => (
+                <button key={m} type="button" className="btn btn-ghost btn-sm"
+                  disabled={costoNum <= 0}
+                  title={costoNum <= 0 ? 'Captura primero el costo' : `Venta = costo × ${m} = $${Math.ceil(costoNum * m)}`}
+                  onClick={() => setVenta(String(Math.ceil(costoNum * m)))}
+                  style={{ padding: '4px 10px', fontSize: 12, fontWeight: 700, opacity: costoNum <= 0 ? 0.4 : 1 }}>
+                  ×{m}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="pos-2col-grid" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+            <div>
+              <label style={{ ...labelStyle, color: 'var(--color-success)' }}>Cantidad que llegó *</label>
+              <input className="input mono" style={{ width: '100%' }} type="number" step="1" min={1}
+                value={cantidad} onChange={e => setCantidad(e.target.value)} onKeyDown={alEnter} />
+            </div>
+            <div>
+              <label style={labelStyle}>Stock mínimo</label>
+              <input className="input mono" style={{ width: '100%' }} type="number" step="1" min={0}
+                value={stockMinimo} onChange={e => setStockMinimo(e.target.value)} onKeyDown={alEnter} placeholder="0" />
+            </div>
+          </div>
+
+          {error && <p style={{ fontSize: 12, fontWeight: 600, color: 'var(--color-danger)' }}>{error}</p>}
+
+          <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
+            <button className="btn btn-ghost" style={{ flex: 1 }} onClick={onCancelar}>Cancelar</button>
+            <button className="btn btn-primary" style={{ flex: 2, justifyContent: 'center' }} onClick={guardar} disabled={guardando}>
+              <Plus size={16} /> {guardando ? 'Creando…' : 'Crear y agregar a la recepción'}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 const labelStyle: React.CSSProperties = {
   fontSize: 11, fontWeight: 600, color: 'var(--color-text-muted)',

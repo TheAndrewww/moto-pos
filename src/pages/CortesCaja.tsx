@@ -1209,12 +1209,9 @@ function ModalCorteTurno({ onClose, onSuccess }: { onClose: () => void; onSucces
   const [montoRetiro, setMontoRetiro] = useState('');
   const [conceptoRetiro, setConceptoRetiro] = useState('Retiro por cambio de turno');
   const [notaDiferencia, setNotaDiferencia] = useState('');
-  const [pinDueno, setPinDueno] = useState('');
   const [error, setError] = useState('');
   const [aviso, setAviso] = useState('');
   const [guardando, setGuardando] = useState(false);
-
-  const esAdmin = usuario?.es_admin ?? false;
 
   // El período lo define el servidor (desde el último corte hasta ahora), en
   // escritorio y en la web; los parámetros se mandan por compatibilidad y se
@@ -1242,8 +1239,9 @@ function ModalCorteTurno({ onClose, onSuccess }: { onClose: () => void; onSucces
   const huboConteo = usarDenominaciones ? totalDenominaciones > 0 : efectivoContadoDirecto !== '';
   const requiereNota = huboConteo && diferencia !== 0;
 
+  // El corte de turno NO pide PIN (lo pidió el dueño): el PIN queda solo
+  // en "Movimiento de caja → Retiro".
   const numRetiro = round2(parseFloat(montoRetiro) || 0);
-  const requierePin = numRetiro > 500 && !esAdmin;
   const excedeRetiro = numRetiro > efectivoContado;
   
   const fondoSiguiente = round2(efectivoContado - numRetiro);
@@ -1254,7 +1252,6 @@ function ModalCorteTurno({ onClose, onSuccess }: { onClose: () => void; onSucces
     if (requiereNota && !notaDiferencia.trim()) { setError('La nota es obligatoria cuando hay diferencia de dinero'); return; }
     if (excedeRetiro) { setError('No puedes retirar más efectivo del que hay contado en caja'); return; }
     if (numRetiro > 0 && !conceptoRetiro.trim()) { setError('El concepto del retiro es obligatorio'); return; }
-    if (requierePin && pinDueno.length < 4) { setError('Ingresa el PIN del dueño para el retiro'); return; }
 
     const denominaciones: DenominacionInput[] | undefined = usarDenominaciones
       ? DENOMINACIONES
@@ -1270,7 +1267,7 @@ function ModalCorteTurno({ onClose, onSuccess }: { onClose: () => void; onSucces
     setError('');
     setAviso('');
     const retiro = numRetiro > 0
-      ? { monto: numRetiro, concepto: conceptoRetiro.trim(), pin_autorizacion: requierePin ? pinDueno : null }
+      ? { monto: numRetiro, concepto: conceptoRetiro.trim() }
       : null;
     try {
       // El retiro va DENTRO del corte (escritorio y web): se calcula el
@@ -1533,26 +1530,6 @@ function ModalCorteTurno({ onClose, onSuccess }: { onClose: () => void; onSucces
                 </span>
               </div>
 
-              {/* PIN del dueño si retiro > $500 y no admin */}
-              {requierePin && (
-                <div style={{
-                  padding: 12, background: 'rgba(245,158,11,0.1)',
-                  borderRadius: 8, border: '1px solid rgba(245,158,11,0.3)',
-                }}>
-                  <p style={{ fontSize: 12, color: 'var(--color-warning)', fontWeight: 600, marginBottom: 8 }}>
-                    Retiro mayor a $500 — Se requiere PIN del dueño
-                  </p>
-                  <input
-                    className="input mono"
-                    type="password"
-                    maxLength={4}
-                    placeholder="PIN (4 dígitos)"
-                    value={pinDueno}
-                    onChange={e => setPinDueno(e.target.value)}
-                    style={{ width: '100%', textAlign: 'center', letterSpacing: 8, fontSize: 20 }}
-                  />
-                </div>
-              )}
             </>
           )}
 

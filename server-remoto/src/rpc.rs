@@ -120,6 +120,53 @@ async fn usuario_de_sesion(state: &AppState, claims: &Claims) -> Result<SesionUs
     })
 }
 
+/// ¿El rol del usuario de la sesión tiene este permiso (tabla `permisos`)?
+/// El dueño (es_admin) tiene todo, igual que `tienePermiso` del frontend.
+async fn tiene_permiso(
+    state: &AppState,
+    sesion: &SesionUsuario,
+    modulo: &str,
+    accion: &str,
+) -> Result<bool, ApiError> {
+    if sesion.es_admin {
+        return Ok(true);
+    }
+    let permitido: Option<i32> = sqlx::query_scalar(
+        "SELECT p.permitido FROM permisos p JOIN usuarios u ON u.rol_id = p.rol_id \
+         WHERE u.id = $1 AND p.modulo = $2 AND p.accion = $3",
+    )
+    .bind(sesion.id)
+    .bind(modulo)
+    .bind(accion)
+    .fetch_optional(&state.pool)
+    .await?;
+    Ok(permitido.unwrap_or(0) != 0)
+}
+
+/// Usuario de la sesión, solo si su rol tiene el permiso; si no, 403
+/// ("No tienes permiso para esta acción." en la web).
+async fn exigir_permiso(
+    state: &AppState,
+    claims: &Claims,
+    modulo: &str,
+    accion: &str,
+) -> Result<SesionUsuario, ApiError> {
+    let sesion = usuario_de_sesion(state, claims).await?;
+    if !tiene_permiso(state, &sesion, modulo, accion).await? {
+        return Err(ApiError::Forbidden);
+    }
+    Ok(sesion)
+}
+
+/// Solo el dueño (roles.es_admin = 1).
+async fn exigir_admin(state: &AppState, claims: &Claims) -> Result<SesionUsuario, ApiError> {
+    let sesion = usuario_de_sesion(state, claims).await?;
+    if !sesion.es_admin {
+        return Err(ApiError::Forbidden);
+    }
+    Ok(sesion)
+}
+
 /// Avisa (sin fallar) si el navegador mandó un usuario_id distinto al de la
 /// sesión. Pasa con pestañas viejas tras cambiar de usuario.
 fn avisar_usuario_distinto(rpc: &str, body_usuario_id: i64, sesion: &SesionUsuario) {
@@ -188,6 +235,11 @@ pub async fn dispatch(
         "obtener_producto_por_codigo"   => obtener_producto_por_codigo(&state, &args).await?,
         "listar_categorias"             => listar_categorias(&state).await?,
         "listar_proveedores"            => listar_proveedores(&state).await?,
+        // Alta y edición de proveedores: solo el dueño (igual que el
+        // escritorio, donde la pantalla solo la ve el dueño).
+        "crear_proveedor"               => crear_proveedor(&state, &claims, args).await?,
+        "actualizar_proveedor"          => actualizar_proveedor(&state, &claims, args).await?,
+        "toggle_proveedor_activo"       => toggle_proveedor_activo(&state, &claims, &args).await?,
         "listar_clientes"               => listar_clientes(&state).await?,
         "crear_cliente"                 => crear_cliente(&state, &claims, args).await?,
         "actualizar_cliente"            => actualizar_cliente(&state, &claims, args).await?,
@@ -199,10 +251,13 @@ pub async fn dispatch(
         "listar_roles"                  => listar_roles(&state).await?,
 
         // ─── Productos (mutaciones) ──────────────────────────
-        "crear_producto"                => crear_producto(&state, args).await?,
-        "actualizar_producto"           => actualizar_producto(&state, args).await?,
-        "eliminar_producto"             => eliminar_producto(&state, &args).await?,
-        "ajustar_stock"                 => ajustar_stock(&state, &args).await?,
+        // El rol se revisa en el servidor (tabla `permisos`): el vendedor
+        // consulta el inventario pero no lo modifica; solo da de alta
+        // productos nuevos desde Recepción, sin existencia.
+        "crear_producto"                => crear_producto(&state, &claims, args).await?,
+        "actualizar_producto"           => actualizar_producto(&state, &claims, args).await?,
+        "eliminar_producto"             => eliminar_producto(&state, &claims, &args).await?,
+        "ajustar_stock"                 => ajustar_stock(&state, &claims, &args).await?,
         "generar_codigo_interno"        => generar_codigo_interno(&state).await?,
         "historial_precios_producto"    => historial_precios_producto(&state, &args).await?,
 
@@ -464,10 +519,27 @@ struct NuevoProductoIn {
     foto_url: Option<String>,
 }
 
-async fn crear_producto(state: &AppState, args: Value) -> Result<Value, ApiError> {
+async fn crear_producto(state: &AppState, claims: &Claims, args: Value) -> Result<Value, ApiError> {
     let a: NuevoProductoArgs = serde_json::from_value(args)
         .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
     let p = a.producto;
+
+    // Inventario (`inventario.crear`) o Recepción (`recepcion.crear`): desde
+    // Recepción el producto nace SIN existencia; la recepción que se está
+    // capturando es la que le suma lo que llegó (y queda registrada).
+    let sesion = usuario_de_sesion(state, claims).await?;
+    if !tiene_permiso(state, &sesion, "inventario", "crear").await? {
+        if !tiene_permiso(state, &sesion, "recepcion", "crear").await? {
+            return Err(ApiError::Forbidden);
+        }
+        if p.stock_actual.abs() > 1e-9 {
+            return Err(ApiError::BadRequest(
+                "Desde Recepción el producto nuevo se crea sin existencia: \
+                 la cantidad que llegó se suma al confirmar la recepción"
+                    .into(),
+            ));
+        }
+    }
     validar_numeros_producto(p.precio_costo, p.precio_venta, p.stock_minimo)?;
     validar_stock(p.stock_actual)?;
 
@@ -595,8 +667,9 @@ struct ActualizarProductoIn {
     foto_url: Option<String>,
 }
 
-async fn actualizar_producto(state: &AppState, args: Value) -> Result<Value, ApiError> {
+async fn actualizar_producto(state: &AppState, claims: &Claims, args: Value) -> Result<Value, ApiError> {
     use rust_decimal::prelude::ToPrimitive;
+    exigir_permiso(state, claims, "inventario", "editar").await?;
     let a: ActualizarProductoArgs = serde_json::from_value(args)
         .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
     let p = a.producto;
@@ -739,7 +812,8 @@ struct EliminarProductoArgs {
     usuario_id: i64,
 }
 
-async fn eliminar_producto(state: &AppState, args: &Value) -> Result<Value, ApiError> {
+async fn eliminar_producto(state: &AppState, claims: &Claims, args: &Value) -> Result<Value, ApiError> {
+    exigir_permiso(state, claims, "inventario", "eliminar").await?;
     let a: EliminarProductoArgs = serde_json::from_value(args.clone())
         .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
 
@@ -804,8 +878,9 @@ struct AjustarStockArgs {
     usuario_id: i64,
 }
 
-async fn ajustar_stock(state: &AppState, args: &Value) -> Result<Value, ApiError> {
+async fn ajustar_stock(state: &AppState, claims: &Claims, args: &Value) -> Result<Value, ApiError> {
     use rust_decimal::prelude::ToPrimitive;
+    exigir_permiso(state, claims, "inventario", "editar").await?;
     let a: AjustarStockArgs = serde_json::from_value(args.clone())
         .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
     if a.motivo.trim().is_empty() {
@@ -1119,7 +1194,7 @@ async fn listar_categorias(state: &AppState) -> Result<Value, ApiError> {
 
 async fn listar_proveedores(state: &AppState) -> Result<Value, ApiError> {
     let rows = sqlx::query(
-        "SELECT id, nombre, contacto, telefono, email, notas \
+        "SELECT id, nombre, contacto, telefono, email, notas, activo \
          FROM proveedores WHERE deleted_at IS NULL ORDER BY nombre",
     )
     .fetch_all(&state.pool)
@@ -1131,7 +1206,217 @@ async fn listar_proveedores(state: &AppState) -> Result<Value, ApiError> {
         "telefono": r.try_get::<Option<String>, _>("telefono").ok().flatten(),
         "email":    r.try_get::<Option<String>, _>("email").ok().flatten(),
         "notas":    r.try_get::<Option<String>, _>("notas").ok().flatten(),
+        "activo":   r.try_get::<i32, _>("activo").map(|v| v != 0).unwrap_or(true),
     })).collect::<Vec<_>>()))
+}
+
+// ─── Proveedores (alta / edición / activo) ─────────────────────────────
+//
+// Mismas reglas que el escritorio (commands/productos.rs): nombre
+// obligatorio y sin repetir comparando en mayúsculas y sin espacios en los
+// extremos (como el importador de catálogos), para no partir las compras de
+// un mismo proveedor en "Sufca" y "SUFCA". Cada cambio deja su renglón en
+// sync_cursor para que el escritorio lo jale y en la bitácora.
+
+#[derive(Deserialize)]
+struct ProveedorIn {
+    nombre: String,
+    #[serde(default)] contacto: Option<String>,
+    #[serde(default)] telefono: Option<String>,
+    #[serde(default)] email: Option<String>,
+    #[serde(default)] notas: Option<String>,
+}
+
+/// Texto opcional: vacío o solo espacios → NULL.
+fn opcional(v: &Option<String>) -> Option<String> {
+    v.as_deref().map(str::trim).filter(|t| !t.is_empty()).map(String::from)
+}
+
+async fn nombre_proveedor_ocupado(
+    conn: &mut sqlx::PgConnection,
+    nombre: &str,
+    excepto_id: Option<i64>,
+) -> Result<bool, ApiError> {
+    // Serializa altas/renombres simultáneos del mismo nombre (hasta el commit).
+    sqlx::query("SELECT pg_advisory_xact_lock(7301103, hashtext(UPPER(TRIM($1))))")
+        .bind(nombre)
+        .execute(&mut *conn)
+        .await?;
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM proveedores \
+          WHERE deleted_at IS NULL AND UPPER(TRIM(nombre)) = UPPER(TRIM($1)) \
+            AND ($2::bigint IS NULL OR id <> $2)",
+    )
+    .bind(nombre)
+    .bind(excepto_id)
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(n > 0)
+}
+
+async fn proveedor_a_sync_y_bitacora(
+    conn: &mut sqlx::PgConnection,
+    uuid: &str,
+    usuario_id: i64,
+    accion: &str,
+    proveedor_id: i64,
+    descripcion: String,
+) -> Result<(), ApiError> {
+    sqlx::query(
+        "INSERT INTO sync_cursor (tabla, uuid, sucursal_id, origen_device) \
+         VALUES ('proveedores', $1, 1, $2)",
+    )
+    .bind(uuid)
+    .bind(WEB_ORIGIN)
+    .execute(&mut *conn)
+    .await?;
+    let audit_sql = format!(
+        r#"INSERT INTO audit_log
+           (usuario_id, accion, tabla_afectada, registro_id,
+            descripcion_legible, origen, fecha)
+           VALUES ($1, $2, 'proveedores', $3, $4, 'WEB', {NOW_TEXT})"#
+    );
+    sqlx::query(&audit_sql)
+        .bind(usuario_id)
+        .bind(accion)
+        .bind(proveedor_id)
+        .bind(descripcion)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
+async fn crear_proveedor(state: &AppState, claims: &Claims, args: Value) -> Result<Value, ApiError> {
+    let sesion = exigir_admin(state, claims).await?;
+    let a: ProveedorIn = serde_json::from_value(args)
+        .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
+    let nombre = a.nombre.trim().to_string();
+    if nombre.is_empty() {
+        return Err(ApiError::BadRequest("El nombre del proveedor es obligatorio".into()));
+    }
+
+    let mut tx = state.pool.begin().await?;
+    if nombre_proveedor_ocupado(&mut tx, &nombre, None).await? {
+        return Err(ApiError::BadRequest(format!("Ya existe un proveedor llamado \"{nombre}\"")));
+    }
+    let uuid = uuid::Uuid::now_v7().to_string();
+    let ins_sql = format!(
+        r#"INSERT INTO proveedores (uuid, nombre, contacto, telefono, email, notas, activo,
+                                    created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, 1, {NOW_TEXT}, {NOW_TEXT})
+           RETURNING id"#
+    );
+    let (contacto, telefono, email, notas) =
+        (opcional(&a.contacto), opcional(&a.telefono), opcional(&a.email), opcional(&a.notas));
+    let id: i64 = sqlx::query_scalar(&ins_sql)
+        .bind(&uuid)
+        .bind(&nombre)
+        .bind(contacto.as_deref())
+        .bind(telefono.as_deref())
+        .bind(email.as_deref())
+        .bind(notas.as_deref())
+        .fetch_one(&mut *tx)
+        .await?;
+    proveedor_a_sync_y_bitacora(
+        &mut tx, &uuid, sesion.id, "PROVEEDOR_CREADO", id,
+        format!("Proveedor creado: {nombre}"),
+    )
+    .await?;
+    tx.commit().await?;
+
+    Ok(json!({
+        "id": id, "nombre": nombre, "contacto": contacto, "telefono": telefono,
+        "email": email, "notas": notas, "activo": true,
+    }))
+}
+
+async fn actualizar_proveedor(state: &AppState, claims: &Claims, args: Value) -> Result<Value, ApiError> {
+    #[derive(Deserialize)]
+    struct A { datos: ProveedorUpd }
+    #[derive(Deserialize)]
+    struct ProveedorUpd {
+        id: i64,
+        #[serde(flatten)]
+        campos: ProveedorIn,
+    }
+    let sesion = exigir_admin(state, claims).await?;
+    let a: A = serde_json::from_value(args)
+        .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
+    let id = a.datos.id;
+    let c = a.datos.campos;
+    let nombre = c.nombre.trim().to_string();
+    if nombre.is_empty() {
+        return Err(ApiError::BadRequest("El nombre del proveedor es obligatorio".into()));
+    }
+
+    let mut tx = state.pool.begin().await?;
+    let prev = sqlx::query(
+        "SELECT uuid, nombre FROM proveedores WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(ApiError::NotFound)?;
+    let uuid: String = prev.get("uuid");
+    let nombre_anterior: String = prev.get("nombre");
+    if nombre_proveedor_ocupado(&mut tx, &nombre, Some(id)).await? {
+        return Err(ApiError::BadRequest(format!("Ya existe otro proveedor llamado \"{nombre}\"")));
+    }
+
+    let upd_sql = format!(
+        r#"UPDATE proveedores SET
+               nombre = $1, contacto = $2, telefono = $3, email = $4, notas = $5,
+               updated_at = {NOW_TEXT}
+           WHERE id = $6 AND deleted_at IS NULL"#
+    );
+    sqlx::query(&upd_sql)
+        .bind(&nombre)
+        .bind(opcional(&c.contacto))
+        .bind(opcional(&c.telefono))
+        .bind(opcional(&c.email))
+        .bind(opcional(&c.notas))
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    let descr = if nombre_anterior.trim() == nombre {
+        format!("Proveedor editado: {nombre}")
+    } else {
+        format!("Proveedor renombrado: {} → {nombre}", nombre_anterior.trim())
+    };
+    proveedor_a_sync_y_bitacora(&mut tx, &uuid, sesion.id, "PROVEEDOR_EDITADO", id, descr).await?;
+    tx.commit().await?;
+    Ok(json!(true))
+}
+
+async fn toggle_proveedor_activo(state: &AppState, claims: &Claims, args: &Value) -> Result<Value, ApiError> {
+    #[derive(Deserialize)]
+    struct A { id: i64 }
+    let sesion = exigir_admin(state, claims).await?;
+    let a: A = serde_json::from_value(args.clone())
+        .map_err(|e| ApiError::BadRequest(format!("args inválidos: {}", e)))?;
+
+    let mut tx = state.pool.begin().await?;
+    let row = sqlx::query(
+        "SELECT uuid, nombre, activo FROM proveedores WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
+    )
+    .bind(a.id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(ApiError::NotFound)?;
+    let uuid: String = row.get("uuid");
+    let nombre: String = row.get("nombre");
+    let nuevo: i32 = if row.get::<i32, _>("activo") == 0 { 1 } else { 0 };
+
+    let upd_sql = format!("UPDATE proveedores SET activo = $1, updated_at = {NOW_TEXT} WHERE id = $2");
+    sqlx::query(&upd_sql).bind(nuevo).bind(a.id).execute(&mut *tx).await?;
+    let (accion, descr) = if nuevo == 1 {
+        ("PROVEEDOR_REACTIVADO", format!("Proveedor reactivado: {nombre}"))
+    } else {
+        ("PROVEEDOR_DESACTIVADO", format!("Proveedor desactivado: {nombre}"))
+    };
+    proveedor_a_sync_y_bitacora(&mut tx, &uuid, sesion.id, accion, a.id, descr).await?;
+    tx.commit().await?;
+    Ok(json!(true))
 }
 
 async fn listar_clientes(state: &AppState) -> Result<Value, ApiError> {
